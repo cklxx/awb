@@ -99,7 +99,7 @@ def wrap($n):
 ($w - 1) as $inner |
 
 reduce (. // [])[] as $e (
-  {goal:"", agents:{}, gorder:{}, gseen:[], tasks:{}, torder:[], news:[]};
+  {goal:"", agents:{}, gorder:{}, gseen:[], tasks:{}, torder:[], news:[], checks:{}};
   if   $e.t == "goal" then .goal = $e.text
   elif $e.t == "news" then .news += [{text:$e.text, time:($e.time // "")}]
   elif $e.t == "task" then
@@ -119,6 +119,12 @@ reduce (. // [])[] as $e (
       | .gorder[$g] = ((.gorder[$g] // []) + [$e.id])
       | (if (.gseen | index($g)) then . else .gseen += [$g] end)
     end
+  elif $e.t == "chk" then
+    (if (.checks[$e.id].run // "") != $e.run
+     then .checks[$e.id] = {id:$e.id, what:$e.what, run:$e.run, startEp:$e.ep, steps:[]} else . end)
+    | (.checks[$e.id].steps | map(.s) | index($e.step)) as $i
+    | if $i == null then .checks[$e.id].steps += [{s:$e.step, state:$e.state, ep0:$e.ep, ep1:null, note:""}]
+      else .checks[$e.id].steps[$i] += {state:$e.state, ep1:$e.ep, note:$e.note} end
   elif .agents[$e.id] == null then .
   elif $e.t == "now" then
     .agents[$e.id].current = {text:($e.text // ""), time:($e.time // ""), ep:($e.ep // 0)}
@@ -171,6 +177,21 @@ reduce (. // [])[] as $e (
          + "\($n) agents ◔\($c.running // 0) ▲\($c.blocked // 0) ✓\($c.done // 0) ✗\($c.failed // 0) ■\($c.dead // 0)"
      end)
     + "   " + $now) as $foot
+| ([$s.checks[]] | sort_by(-.startEp) | .[:3]) as $cks
+| (if ($cks | length) == 0 then [] else ["", $g + "验收" + $rs]
+   + [ $cks[] | .steps as $ss
+       | (if any($ss[]; .state == "fail") then ["✗",$r] elif any($ss[]; .state == "run") then ["◔",$cy]
+          else ["⊢",$g] end) as $ov
+       | ([$ss[] | (.ep1 // $nowep) - .ep0] | add // 0) as $el
+       | ([ $ss[] | ({"ok":["✓",$g],"fail":["✗",$r],"run":["◔",$cy]}[.state] // ["·",$dm]) as $i
+            | $i[1] + .s + " " + $i[0] + $rs
+              + (if .state == "run" then $dm + " " + (($nowep - .ep0) | sdur) + $rs else "" end) ]
+          | join($dm + " → " + $rs)) as $chain
+       | ([$ss[] | select(.state == "fail") | .note] | first // "") as $why
+       | "  " + $ov[1] + $ov[0] + $rs + " " + ((($s.agents[.id].name) // .id) | clip(10) | pad(10)) + " "
+         + $dm + (.what | clip(18) | pad(18)) + $rs + " " + $chain + $dm + "  " + ($el | sdur) + $rs
+       , (if $why != "" then "    " + $r + "└ " + ($why | clip($inner - 8)) + $rs else empty end) ]
+   end) as $chk
 | ({"todo":["○",$dm],"wip":["◔",$cy],"review":["◑",$cy],"blocked":["▲",$y],
     "done":["✓",$g],"drop":["–",$dm],"ask":["?",$y]}) as $TI
 | ([ kids($s.tasks; $s.torder; "")[] as $root | $s.tasks[$root] as $rt
@@ -183,7 +204,7 @@ reduce (. // [])[] as $e (
            + $dm + $ow + $rs ]
    ] | add // []) as $ttree
 | ([$top] + [$goal_lines[] | "│ " + .] + [($foot | clip($inner))] + [""]
-   + (if ($ttree | length) > 0 then $ttree + [""] else [] end)) as $head
+   + (if ($ttree | length) > 0 then $ttree + [""] else [] end) + (if ($chk | length) > 0 then $chk[1:] + [""] else [] end)) as $head
 
 | ([ $groups[] as $gr
     | [$gr.ids[] | $s.agents[.] | select(. != null)] as $as
@@ -252,6 +273,7 @@ else
      ] | add // [])
   + (if ($s.news | length) > 0 then ["", $g + "进展" + $rs]
        + [ $s.news[-5:] | reverse[] | "  ✓ " + $dm + .time[0:5] + $rs + " " + (.text | clip($bw - 12)) ] else [] end)
+  + $chk
   + ([ $s.agents[] | select(.status == "running" or .status == "blocked")
        | . + {idle:($nowep - .lastEp)} | select(.idle >= ($stale | tonumber)) ] | sort_by(-.idle) as $st
      | if ($st | length) > 0 then ["", $r + "久未更新（≥\(($stale | tonumber) / 60 | floor) 分钟）" + $rs]
@@ -292,6 +314,35 @@ render() {
     --arg g  "${ESC}[32m"  --arg cy "${ESC}[36m" --arg y "${ESC}[33m" \
     --arg r  "${ESC}[31m"  --arg dm "${ESC}[2m"  --arg rs "${ESC}[0m" \
     "$JQ_RENDER"
+}
+
+# nudge: paste a reminder into the pane of every agent silent >= AWB_STALE,
+# at most once per AWB_NUDGE_EVERY. Panes map: $AWB_DIR/panes, lines "ID PANE".
+nudge_once() {
+  [ -s "$AWB_DIR/panes" ] || return 0
+  now=$(date +%s)
+  { [ -s "$EV" ] && cat "$EV" || true; } | jq -R -s -r \
+    --argjson now "$now" --argjson stale "${AWB_STALE:-600}" --argjson every "${AWB_NUDGE_EVERY:-900}" '
+    rtrimstr("\n") | if . == "" then [] else split("\n") | map(fromjson? | select(type == "object")) end
+    | reduce .[] as $e ({};
+        if $e.id == null then .
+        elif $e.t == "nudge" then .[$e.id].nudged = $e.ep
+        elif $e.t == "status" then .[$e.id].last = $e.ep | .[$e.id].st = $e.status
+        elif ($e.t | IN("start","now","done")) then .[$e.id].last = $e.ep | .[$e.id].st = (.[$e.id].st // "running")
+        else . end)
+    | to_entries[]
+    | select((.value.st // "running") | IN("running","blocked"))
+    | select($now - (.value.last // $now) >= $stale)
+    | select($now - (.value.nudged // 0) >= $every)
+    | "\(.key) \((($now - .value.last) / 60) | floor)"' |
+  while read -r id mins; do
+    pane=$(awk -v i="$id" '$1 == i {print $2}' "$AWB_DIR/panes")
+    [ -n "$pane" ] && tm display-message -p -t "$pane" '#{pane_id}' >/dev/null 2>&1 || continue
+    msg="[看板自动提醒] 你（${id}）已 ${mins} 分钟没更新看板。请现在报一句结果：AWB_DIR=$AWB_DIR awb now $id \"<结果>\"；卡住用 awb block $id \"<原因>\"；做完用 awb finish $id \"<成果>\"。"
+    printf '%s' "$msg" | tm load-buffer -
+    tm paste-buffer -t "$pane"; sleep 1; tm send-keys -t "$pane" Enter
+    append '{t:"nudge",time:$time,ep:$ep,id:$id}' --arg id "$id"
+  done
 }
 
 watch() {
@@ -394,29 +445,57 @@ $(q "$BIN") _enter; $tui_cmd; exec $(q "$SHELL")"
   tm send-keys -t "$pane" Enter
 }
 
-# Lean 4 acceptance, run in DIR: lake build, no sorry/admit in sources, and the
-# main agent's ACCEPT.lean (statements the agent never edits) must typecheck
-# against the build using only the standard axioms (catches sorryAx, custom axioms,
-# native_decide).
+# one acceptance step for the board: step NAME run|ok|fail [NOTE]
+step() {
+  append '{t:"chk",time:$time,ep:$ep,id:$id,run:$run,what:$what,step:$s,state:$st,note:$n}' \
+    --arg id "$CHK_ID" --arg run "$CHK_RUN" --arg what "$CHK_WHAT" --arg s "$1" --arg st "$2" --arg n "${3:-}"
+}
+
+# run a step: stage NAME CMD... ; its output goes to the check log
+stage() {
+  _n=$1; shift; step "$_n" run
+  if "$@"; then step "$_n" ok; else step "$_n" fail "$(tail -1 "$CHK_LOG" | cut -c1-80)"; return 1; fi
+}
+
+# Lean 4 acceptance, run in DIR. The build is kernel-checked; ACCEPT.lean holds the
+# main agent's statements, which must typecheck against the build and use only the
+# standard axioms (#print axioms follows every dependency, so sorryAx, custom axioms
+# and native_decide in the agent's code are caught).
+# ponytail: theorems are found by regex, not by enumerating the environment
+# (`import Lean` costs ~4s per check); anything unrecognised fails closed.
+lean_sorry() {
+  ! grep -rnwE 'sorry|admit' --include='*.lean' --exclude-dir=.lake . || { echo "sorry/admit in sources"; return 1; }
+}
+lean_types() {
+  _t='^[[:space:]]*(@\[[^]]*\][[:space:]]*)*((private|protected|nonrec)[[:space:]]+)*theorem[[:space:]]+'
+  grep -qwE 'example|namespace|section|lemma' "$1" && { echo "ACCEPT: use top-level named theorems only"; return 1; }
+  _names=$(grep -E "$_t" "$1" | sed -E "s/$_t([^[:space:](:{]+).*/\4/")
+  [ -n "$_names" ] || { echo "ACCEPT.lean has no theorem"; return 1; }
+  [ "$(grep -cwE 'theorem' "$1")" = "$(printf '%s\n' "$_names" | wc -l | tr -d ' ')" ] \
+    || { echo "ACCEPT: unrecognised theorem syntax"; return 1; }
+  { cat "$1"; echo; printf '#print axioms %s\n' $_names; } > .awb-accept.lean
+  _rc=0; lake env lean .awb-accept.lean > .awb-accept.out 2>&1 || _rc=$?
+  rm -f .awb-accept.lean; cat .awb-accept.out
+  [ "$_rc" = 0 ] || { echo "acceptance statements do not typecheck"; return 1; }
+  ! grep -q "declaration uses 'sorry'" .awb-accept.out || { echo "sorry in ACCEPT"; return 1; }
+}
+lean_axioms() {
+  _bad=$(sed -n 's/.*depends on axioms: \[\(.*\)\].*/\1/p' .awb-accept.out | tr ',' '\n' \
+         | tr -d ' ' | grep -vxE 'propext|Classical\.choice|Quot\.sound' | sort -u | tr '\n' ' ')
+  rm -f .awb-accept.out
+  [ -z "$_bad" ] || { echo "non-standard axioms: $_bad"; return 1; }
+  echo "axioms ok"
+}
 lean_accept() (
   dir=$1; acc=${2:-}
   [ -z "$acc" ] || acc=$(cd "$(dirname "$acc")" && pwd)/$(basename "$acc")
   PATH=$HOME/.elan/bin:$PATH
   cd "$dir" || exit 1
-  lake build || exit 1
-  if grep -rnwE 'sorry|admit' --include='*.lean' --exclude-dir=.lake .; then
-    echo "sorry/admit in sources"; exit 1
-  fi
+  stage build lake build || exit 1
+  stage sorry lean_sorry || exit 1
   [ -n "$acc" ] || exit 0
-  f=.awb-accept.lean
-  { cat "$acc"; echo; sed -n 's/^theorem[[:space:]]*\([^[:space:](:{]*\).*/#print axioms \1/p' "$acc"; } > "$f"
-  rc=0; out=$(lake env lean "$f" 2>&1) || rc=$?; rm -f "$f"
-  printf '%s\n' "$out"
-  [ "$rc" = 0 ] || { echo "acceptance statements do not typecheck"; exit 1; }
-  printf '%s\n' "$out" | grep -q 'axioms' || { echo "ACCEPT.lean has no theorem"; exit 1; }
-  bad=$(printf '%s\n' "$out" | sed -n 's/.*depends on axioms: \[\(.*\)\].*/\1/p' | tr ',' '\n' \
-        | tr -d ' ' | grep -vxE 'propext|Classical\.choice|Quot\.sound' | sort -u | tr '\n' ' ')
-  [ -z "$bad" ] || { echo "non-standard axioms: $bad"; exit 1; }
+  stage types lean_types "$acc" || exit 1
+  stage axioms lean_axioms || exit 1
 )
 
 # acceptance gate: the check the main agent chose decides done, not the agent's claim
@@ -425,20 +504,22 @@ check() {
   id=$1; shift
   case $1 in
     --lean) what="lean ${3:+$(basename "$3")}"; set -- lean_accept "$2" "${3:-}" ;;
-    --) shift; what=$* ;;
+    --) shift; what=$*; set -- stage cmd "$@" ;;
     *) die "usage: $PROG check ID -- CMD... | $PROG check ID --lean DIR [ACCEPT.lean]" ;;
   esac
-  init_dir; log=$AWB_DIR/check-$id.log
-  rc=0; "$@" >"$log" 2>&1 || rc=$?
+  init_dir
+  CHK_ID=$id CHK_RUN=$(date +%s)$$ CHK_WHAT=$what CHK_LOG=$AWB_DIR/check-$id.log
+  export CHK_ID CHK_RUN CHK_WHAT CHK_LOG
+  rc=0; "$@" >"$CHK_LOG" 2>&1 || rc=$?
   if [ "$rc" = 0 ]; then
     append '{t:"done",time:$time,ep:$ep,id:$id,text:null,verified:true}' --arg id "$id"
     echo "accepted: $what"
   else
-    why=$(grep -v '^[[:space:]]*$' "$log" | tail -1 | cut -c1-120)
+    why=$(grep -v '^[[:space:]]*$' "$CHK_LOG" | tail -1 | cut -c1-120)
     [ -n "$why" ] || why="exit $rc"
     append '{t:"status",time:$time,ep:$ep,id:$id,status:"failed",reason:$r,gate:true}' \
       --arg id "$id" --arg r "验收未过($what): $why"
-    tail -40 "$log"; echo "rejected: $what (full log: $log)"; return 1
+    tail -40 "$CHK_LOG"; echo "rejected: $what (full log: $CHK_LOG)"; return 1
   fi
 }
 
@@ -473,6 +554,7 @@ $PROG — tmux agent workbench (events in .awb/events.jsonl)
                                     (AWB_TUI_CMD, default claude-db if on PATH else claude)
   $PROG start ID NAME [KIND] [GROUP]  register a non-pane / remote agent
   $PROG goal TEXT                   set the overall goal
+  $PROG nudge [--once]              remind silent agents in their pane ($AWB_DIR/panes: "ID PANE")
   $PROG news TEXT                   one progress line (board shows last 5)
                                     board view: AWB_VIEW=brief (default) | full
                                     AWB_STALE=SECS: list agents silent that long (default 600)
@@ -537,7 +619,7 @@ selftest() {
   ! "$BIN" status r1 bogus 2>/dev/null || die "selftest: bogus status accepted"
 
   if command -v tmux >/dev/null; then
-    boardpane=$(tmux -L "$S" new-session -d -s awb -n board -x 200 -y 50 -P -F '#{pane_id}' \
+    boardpane=$(tmux -L "$S" new-session -d -s awb -n board -x 200 -y 120 -P -F '#{pane_id}' \
       "AWB_VIEW=full AWB_DIR=$(q "$t") $(q "$BIN") watch")
     work=$(tmux -L "$S" split-window -v -t "$boardpane" -d -p 60 -P -F '#{pane_id}' "$SHELL")
     sleep 1
@@ -547,12 +629,12 @@ selftest() {
     printf '%s\n' "$work" > "$t/work-pane"
     tmux -L "$S" send-keys -t "$work" "export AWB_DIR=$(q "$t")" Enter
     tmux -L "$S" send-keys -t "$work" "$(q "$BIN") run z1 demo -- sleep 2" Enter
-    sleep 2
-    cap=$(tmux -L "$S" capture-pane -p -t "$boardpane")
-    printf '%s' "$cap" | grep -Fq "demo" || die "selftest: spawned agent not shown"
-    sleep 2
-    cap=$(tmux -L "$S" capture-pane -p -t "$boardpane")
-    printf '%s' "$cap" | grep -Fq "✓1" || die "selftest: exit 0 not marked done"
+    # poll the live board, capped at 10s per expectation
+    seen() { i=0; while [ $i -lt 20 ]; do
+      tmux -L "$S" capture-pane -p -t "$boardpane" | grep -Fq -- "$1" && return 0
+      sleep 0.5; i=$((i + 1)); done; return 1; }
+    seen "demo" || die "selftest: spawned agent not shown"
+    seen "✓1" || die "selftest: exit 0 not marked done"
   fi
   echo "selftest ok"
 }
@@ -573,6 +655,8 @@ case "$cmd" in
             case $2 in todo|wip|review|blocked|done|drop|ask) ;; *) die "state: todo|wip|review|blocked|done|drop|ask" ;; esac
             append '{t:"task",time:$time,ep:$ep,id:$id,state:$st,text:$text,parent:$par,owner:$own}' \
               --arg id "$1" --arg st "$2" --arg text "${3:-}" --arg par "${4:-}" --arg own "${5:-}" ;;
+  nudge)    init_dir; if [ "${1:-}" = "--once" ]; then nudge_once
+            else while :; do nudge_once; sleep "${AWB_NUDGE_POLL:-60}"; done; fi ;;
   news)     [ $# -ge 1 ] || die "usage: $PROG news TEXT"
             append '{t:"news",time:$time,ep:$ep,text:$text}' --arg text "$*" ;;
   goal)     [ $# -ge 1 ] || die "usage: $PROG goal TEXT"

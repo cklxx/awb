@@ -1,7 +1,18 @@
+<p align="center"><img src="docs/logo.svg" width="200" alt="awb"></p>
+
 # awb
 
 tmux agent workbench. A milestone board for many agents (claude, codex, any CLI), with
 an acceptance gate that decides when a milestone counts as done.
+
+The name is also the logo: `a` and `b` are the two lenses of a pair of glasses and `w` is
+the `ω` mouth, as in (・ω・). It watches your agents.
+
+![awb board](docs/board.png)
+
+The board above (`AWB_VIEW=full`, demo data) shows the task tree, the acceptance runs with
+each step, and per-group agents with their milestones; `⊢` marks a milestone that passed
+`awb check`.
 
 ## Model
 
@@ -68,6 +79,12 @@ Board knobs: `AWB_VIEW=brief|full` (default brief), `AWB_STALE=SECS` lists agent
 that long (default 600), `AWB_INTERVAL` refresh seconds (default 1).
 
 Keep acceptance files outside the agent's working directory so the agent cannot edit them.
+
+Each check shows on the board under 验收 as it runs: `build → sorry → types → axioms` for
+Lean (one `cmd` step otherwise), with a timer on the running step and the reason under a
+failed one. ACCEPT.lean must use top-level named `theorem`s; `example`, `lemma`,
+`namespace` or any unrecognised theorem syntax fails the check rather than being skipped.
+A warm Lean check of `model/` takes about 2s.
 
 Status: ◔ running · ✓ done · ▲ blocked · ✗ failed · ■ dead (pane gone).
 `tmux -S .awb/sock attach -t awb` attaches from another terminal.

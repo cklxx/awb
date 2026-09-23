@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 132" width="240" height="132" role="img" aria-label="awb">
+  <rect width="240" height="132" rx="24" fill="#1e1e2e"/>
+  <g fill="none" stroke="#cdd6f4" stroke-width="9" stroke-linecap="round">
+    <!-- a: left lens + stem -->
+    <circle cx="68" cy="58" r="28"/>
+    <path d="M96 30 V86"/>
+    <!-- b: right lens + tall stem (temple arm) -->
+    <circle cx="172" cy="58" r="28"/>
+    <path d="M144 12 V86"/>
+    <!-- bridge -->
+    <path d="M96 50 Q120 38 144 50" stroke-width="6"/>
+  </g>
+  <!-- w: the ω mouth -->
+  <path d="M100 104 q10 16 20 0 q10 16 20 0" fill="none" stroke="#f38ba8" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- lens glints -->
+  <g stroke="#ffffff" stroke-width="4" stroke-linecap="round" opacity=".75" fill="none">
+    <path d="M52 50 q4 -10 14 -12"/>
+    <path d="M156 50 q4 -10 14 -12"/>
+  </g>
+</svg>
