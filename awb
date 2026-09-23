@@ -141,8 +141,11 @@ reduce (. // [])[] as $e (
     | .agents[$e.id].lastEp = ($e.ep // .agents[$e.id].lastEp)
   elif $e.t == "done" then
     (.agents[$e.id]) as $a | ($e.ep // $a.lastEp) as $ep
-    | .agents[$e.id].done += [{text:((if $e.verified then "⊢ " else "" end) + ($e.text // $a.current.text // "milestone")),
-                               time:($e.time // ""), dur:([0, $ep - ($a.current.ep // $ep)] | max)}]
+    # a passing check with no open milestone verifies the last finished one
+    | (if $e.verified and $a.current == null and $e.text == null and ($a.done | length) > 0
+       then .agents[$e.id].done[-1].text |= (if startswith("⊢ ") then . else "⊢ " + . end)
+       else .agents[$e.id].done += [{text:((if $e.verified then "⊢ " else "" end) + ($e.text // $a.current.text // "milestone")),
+                                     time:($e.time // ""), dur:([0, $ep - ($a.current.ep // $ep)] | max)}] end)
     | .agents[$e.id].current = null
     | .agents[$e.id].lastEp = $ep
     | (if $e.verified then .agents[$e.id].gate = false
@@ -297,7 +300,9 @@ end
 '
 
 dims() {
-  if [ -n "${TMUX_PANE:-}" ]; then
+  if [ -n "${AWB_ROWS:-}" ] && [ -n "${AWB_COLS:-}" ]; then
+    echo "$AWB_COLS $AWB_ROWS"
+  elif [ -n "${TMUX_PANE:-}" ]; then
     tm display-message -p -t "$TMUX_PANE" '#{pane_width} #{pane_height}' 2>/dev/null
   else
     stty size 2>/dev/null | awk '{print $2, $1}'
@@ -463,6 +468,8 @@ pr() {
         (if .s[$e.step] == null then .o += [$e.step] else . end) | .s[$e.step] = $e.state)) as $st
     | (reduce $es[] as $e ({cur:null, ms:[]};
         if $e.t == "now" then .cur = $e.text
+        elif $e.t == "done" and $e.verified and .cur == null and $e.text == null and (.ms | length) > 0
+          then .ms[-1] |= (if startswith("⊢ ") then . else "⊢ " + . end)
         elif $e.t == "done" then .ms += [(if $e.verified then "⊢ " else "" end) + ($e.text // .cur // "milestone")] | .cur = null
         else . end) | .ms) as $ms
     | {pass: (($st.o | length) > 0 and all($st.s[]; . == "ok")),
@@ -670,7 +677,7 @@ selftest() {
   S=awbselftest$$
   cleanup() { tmux -L "$S" kill-server 2>/dev/null || true; rm -rf "$t"; }
   trap cleanup EXIT
-  export AWB_DIR=$t; EV=$t/events.jsonl
+  export AWB_DIR=$t AWB_COLS=160 AWB_ROWS=200; EV=$t/events.jsonl
 
   "$BIN" goal "SHIP THE WORKBENCH"
   "$BIN" start a1 claude agent backend
@@ -700,6 +707,10 @@ selftest() {
   "$BIN" check a1 -- true >/dev/null || die "selftest: passing check rejected"
   AWB_VIEW=full "$BIN" render | grep -Fq "⊢ gated" || die "selftest: verified milestone not marked"
   ! "$BIN" pr a2 2>/dev/null || die "selftest: pr opened without a passing check"
+  "$BIN" start v1 late; "$BIN" now v1 "shipped"; "$BIN" done v1; "$BIN" check v1 -- true >/dev/null
+  out=$(AWB_VIEW=full "$BIN" render)
+  printf '%s' "$out" | grep -Fq "⊢ shipped" || die "selftest: late check did not verify last milestone"
+  ! printf '%s' "$out" | grep -Fq "⊢ milestone" || die "selftest: late check added a phantom milestone"
   # regressions found by model/AwbModel.lean
   "$BIN" start g1 gatecase; "$BIN" check g1 -- false >/dev/null || true; "$BIN" status g1 done
   AWB_VIEW=full "$BIN" render | grep -q "✗ gatecase" || die "selftest: done overrode a rejected check"
