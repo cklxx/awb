@@ -15,26 +15,22 @@ description: tmux 多 agent 里程碑看板（awb）。当需要在 tmux 里同�
 curl -fsSL https://raw.githubusercontent.com/cklxx/awb/main/install.sh | sh
 ```
 
-## 对话式用法（推荐，只有 Claude 也能用）
+## 对话式用法：主控 + awb + sock（推荐，只有 Claude 也能用）
 
-用户只跟一个 Claude 对话，看板用来看；不需要单独的主控 agent，也不需要模型记得汇报。
+用户只跟一个 Claude 对话，这个 Claude 就是主控；看板用来看。不改任何 Claude 配置（没有 hooks），worker 也不需要懂 awb。
 
-```sh
-awb hooks            # 一次性：本项目 .claude/settings.local.json；所有项目用 awb hooks --global
-awb board            # 在当前 tmux pane 右侧开看板（不在 tmux 里就另开终端跑 awb watch）
-```
+你是被对话的 Claude 时，按这个协议做，不要让用户敲命令：
 
-之后正常对话。hooks 自动上报：
-- 会话启动 → 注册（ID 通过 SessionStart 输出告诉模型，模型可直接用它 `awb check` / `awb now`）；
-- 每条用户消息 → 当前里程碑（取第一行）；每轮结束 → 里程碑完成；
-- 模型用 Agent 工具开的 subagent → 自动出现在以会话名命名的组里，后台 subagent 完成时带上结果。
+1. 开看板：`awb board`（在你的 tmux pane 右侧开；不在 tmux 里就让用户另开终端跑 `awb watch`），`awb goal "<目标>"`。
+2. 开 worker：每个并行任务 `awb tui -g <组> <id> <名字>`。它会等 worker 的 Claude 就绪后输出 `<id> session: <会话名>`。
+   如果输出"answer the folder-trust prompt"，请用户去那个 pane 确认信任目录（awb 和你都不替用户做这个决定）。
+3. 派任务：先 `awb now <id> "<任务一句话>"`，再用 SendMessage(to: <会话名>, message: <任务>, notify_when_idle: true)。
+   消息走 Claude 自己的会话 socket，worker 正在忙也能送达。
+4. 收结果：worker 通常会直接回你一条消息；没回的话，它空闲时你也会收到 idle notice，里面带它最后一句汇报。收到任一个就 `awb done <id> "<结果一句话>"`；
+   需要验收的交付物用 `awb check <id> -- <命令>`，通过后 `awb pr <id>`；卡住就 `awb block <id> "<原因>"`。
+5. 你自己用 Agent 工具开的 subagent 也可以上板：开之前 `awb start <id> <名字>` + `awb now`，结果回来后 `awb done`。
 
-当用户在对话里要求"开几个 agent 并行做 X"时，你（被对话的 Claude）直接执行，不要让用户去敲命令：
-`awb goal "..."`，然后每个并行任务 `awb tui -g <组> <id> <名字> "<任务>"`（常驻、可继续对话）或 `awb run -g <组> <id> <名字> -- <命令>`（一次性）。
-它们会在当前 pane 旁边开出来，自带 `AWB_DIR` 和 agent ID，装了 hooks 就自动上板。
-交付物用 `awb check` 验收，通过后 `awb pr`。
-
-多块看板：每个项目目录一个 `.awb`；会话从 `AWB_DIR` 环境变量取看板（awb 启动的 agent 都带），没有就用 cwd 往上最近的 `.awb`，都没有则不上报。
+`awb peers` 随时查 agent 对应的会话名和 busy/idle。多块看板：每个项目目录一个 `.awb`，或用 `AWB_DIR` 指定。
 
 ## 快速开始（手动布局）
 
@@ -57,7 +53,7 @@ awb down
 | `awb task ID STATE [TEXT] [PARENT] [OWNER]` | 任务树节点，STATE：todo/wip/review/blocked/done/drop/ask；重发同 ID 即更新；ask = 需要人拍板 |
 | `awb news TEXT` | 一条进展动态，看板显示最近 5 条 |
 | `awb run [-g G] ID NAME -- CMD...` | 开 pane 跑命令；pane 异常关闭 → ■ dead |
-| `awb tui [-g G] ID NAME [TASK]` | 常驻 TUI，命令取 `AWB_TUI_CMD`（默认 claude-db，没有则 claude） |
+| `awb tui [-g G] ID NAME [TASK]` | 常驻 Claude worker（命令取 `AWB_TUI_CMD`，默认 claude-db，没有则 claude）；就绪后输出会话名 |
 | `awb start ID NAME [KIND] [G]` | 注册非 pane / 远端 agent |
 | `awb now ID MILESTONE` / `awb done ID [TEXT]` | 开始 / 完成一个里程碑（计时） |
 | `awb block ID REASON` / `awb unblock ID` | 阻塞 / 恢复 |
@@ -69,7 +65,6 @@ awb down
 | `awb peers` | agent 对应的 Claude 会话名与 busy/idle |
 | `awb stale` / `awb nudge` | 列出静默 ≥ `AWB_STALE` 秒的 agent / 循环提醒它们 |
 | `awb audit` / `awb state` | Lean 监控器报告协议违规（退出码 1 表示有）/ jq 折叠出的每个 agent 状态 |
-| `awb hooks [--global] [--remove]` | 安装/移除 Claude Code hooks，自动上报会话、消息、subagent |
 | `awb board` | 在当前 tmux pane 旁开看板，并把当前 pane 设为 tui/run 的分屏起点 |
 | `awb render` / `awb reset` | 一次性渲染（tmux 外可用）/ 清空事件 |
 | `awb skill` / `awb version` / `awb selftest` | 本手册 / 版本 / 端到端自检 |

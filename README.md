@@ -38,19 +38,22 @@ This installs `awb` (needs sh, tmux, jq) to `~/.local/bin` and the agent skill t
 symlink both instead. Agents without a skill mechanism (codex, ...) read the same manual
 with `awb skill`; `awb` itself points agents there.
 
-## Chat-driven (Claude only)
+## Chat-driven: main agent + awb + session socket
+
+You talk to one Claude, the main agent; the board is for watching. Nothing in Claude's
+configuration changes and workers need not know awb.
 
 ```sh
-awb hooks        # once per project (or --global): Claude Code hooks feed the board
-awb board        # board beside the current tmux pane
-claude           # just talk; ask it to start parallel workers and it runs awb tui / awb run
+awb board                 # board beside the main agent's tmux pane
+awb tui -g g w1 worker    # a Claude worker; prints "w1 session: <name>" once it is ready
 ```
 
-Hooks register the session (and tell the model its board ID), turn each prompt into the
-current milestone, close it when the turn ends, and put every subagent the model starts
-with its Agent tool on the board, finished with its result. No main agent and no reporting
-by the model are needed. Several boards coexist: a session uses `$AWB_DIR`, else the nearest
-`.awb` above its cwd, else reports nowhere.
+The main agent then marks `awb now w1 "<task>"`, sends the task with its SendMessage tool
+(`to: <name>`, `notify_when_idle: true`), which travels over Claude's own per-session socket
+and reaches the worker even mid-turn, and on the idle notice records `awb done w1 "<result>"`,
+or gates it with `awb check` / `awb pr`. The skill (`awb skill`) spells out this protocol.
+`tui` waits for the worker to register with Claude before typing anything; it never answers
+the folder-trust prompt, it asks you to. Several boards: one `.awb` per project, or `AWB_DIR`.
 
 ## Use
 
