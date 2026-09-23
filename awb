@@ -314,6 +314,16 @@ else
        + [ $st[] | "  " + (if .status == "blocked" then $y + "▲" else $r + " " end) + (.idle | sdur | lpad(6)) + $rs + "  " + (.name | pad(10)) + " "
            + $dm + ((if .status == "blocked" then "等：" + .reason elif .current then .current.text else .reason end) // "" | clip($bw - 24)) + $rs ]
        else [] end)
+  + ( ([ $diffs[] | {key:.id, value:.} ] | from_entries) as $df
+      | ([ $s.agents[] | select(.status == "running") ]
+           | map(. as $a | ($df[$a.id] // null) as $d
+                 | select($d != null and ($nowep - $d.ep) >= $frz)
+                 | $a + {frozen:($nowep - $d.ep)}) | sort_by(-.frozen)) as $fz
+      | (if ($fz | length) > 0
+           then ["", $y + "久未改动（≥\($frz / 60 | floor) 分钟，无代码提交）" + $rs]
+             + [ $fz[] | "  " + $y + "~" + $rs + (.frozen | sdur | lpad(6)) + $rs + "  "
+                   + (.name | pad(10)) + " " + $dm + "无改动" + $rs ]
+           else [] end))
   + ([ $s.torder[] | $s.tasks[.] | select(.state == "ask") ] as $asks
      | if ($asks | length) > 0 then ["", $y + "需要你拍板" + $rs]
        + [ $asks[] | $y + "  ? " + $rs + (.text | clip($bw - 6)) ] else [] end))
@@ -372,18 +382,91 @@ render() {
     live=null
   fi
   viol=; m=$(model_bin) && [ -s "$EV" ] && viol=$("$m" audit < "$EV" 2>/dev/null || true)
+  # working-tree fingerprints written by freeze_once: "ID HASH EP" (epoch of
+  # last change). Fed to render as data, never through the proven fold.
+  if [ -s "$AWB_DIR/diffs" ]; then
+    diffs=$(jq -Rn '[inputs | select(length > 0) | split(" ")
+             | {id:.[0], hash:.[1], ep:(.[2] | tonumber)}]' < "$AWB_DIR/diffs")
+  else diffs='[]'; fi
   events_json | jq -r --arg viol "$viol" \
     --argjson w "$cols" --argjson h "$rows" \
     --arg now "$(date +$TS_FMT)" --argjson nowep "$(date +%s)" \
     --arg prog "$PROG" --argjson live "$live" --arg view "${AWB_VIEW:-brief}" --arg stale "${AWB_STALE:-600}" \
+    --argjson diffs "$diffs" --argjson frz "${AWB_FROZEN:-900}" \
     --arg g  "${ESC}[32m"  --arg cy "${ESC}[36m" --arg y "${ESC}[33m" \
     --arg r  "${ESC}[31m"  --arg dm "${ESC}[2m"  --arg rs "${ESC}[0m" \
     "$JQ_RENDER"
 }
 
+# no-code-change detection: runs on the nudge loop's cadence AWB_NUDGE_POLL
+# (default 60 s). It fingerprints each agent's working tree and remembers the
+# epoch of its LAST change in $AWB_DIR/diffs ("ID HASH EP"). A running agent
+# unchanged for AWB_FROZEN seconds (default 900) is pasted at most ONE reminder
+# per AWB_NUDGE_EVERY (default 900 s, throttled via $AWB_DIR/fnudged, "ID EP")
+# — the 60 s poll cadence is not the reminder throttle. Blocked agents and
+# non-git dirs are skipped. Working dir: $AWB_DIR/panes column 3 if present,
+# else the live tmux pane path.
+freeze_once() {
+  init_dir
+  command -v git >/dev/null || return 0
+  lock "freeze"
+  now=$(date +%s); frz=${AWB_FROZEN:-900}; every=${AWB_NUDGE_EVERY:-900}
+  df=$AWB_DIR/diffs; nf=$AWB_DIR/fnudged
+  # status straight from the (read-only) event log. A milestone `done` event is
+  # NOT agent state: only `finish` emits status:"done", so the `done` event is
+  # ignored here and a runner between milestones stays running (a `now` after a
+  # real finish revives, mirroring nudge_once's fold).
+  statuses=$( { [ -s "$EV" ] && cat "$EV" || true; } | jq -R -s -r '
+    rtrimstr("\n") | if . == "" then [] else split("\n") | map(fromjson? | select(type == "object")) end
+    | reduce .[] as $e ({};
+        if $e.id == null then .
+        elif $e.t == "status" then .[$e.id] = $e.status
+        elif $e.t == "now" then (if .[$e.id] == "done" then .[$e.id] = "running" else . end)
+        else . end)
+    | to_entries[] | "\(.key) \(.value)"')
+  live=$(tm list-panes -a -F '#{pane_id}' 2>/dev/null || true)
+  tmp=$(mktemp "${df}.XXXXXX")
+  agent_panes | while read -r id pane; do
+    [ -n "$id" ] && [ -n "$pane" ] || continue
+    st=$(printf '%s\n' "$statuses" | awk -v i="$id" '$1 == i {print $2; exit}')
+    # only a start event -> running (empty); nudge only live runners, so skip
+    # every known non-running state and treat the rest as running.
+    case $st in blocked|done|failed) continue ;; esac
+    p=$(awk -v i="$id" 'index($0, i" ") == 1 && NF >= 3 {sub(/^[^ ]+ +[^ ]+ +/, ""); print; exit}' \
+        "$AWB_DIR/panes" 2>/dev/null)
+    if [ -z "$p" ]; then p=$(tm display-message -p -t "$pane" '#{pane_current_path}' 2>/dev/null || true); fi
+    [ -n "$p" ] || continue
+    if ! git -C "$p" rev-parse --git-dir >/dev/null 2>&1; then continue; fi
+    h=$({ git -C "$p" rev-parse HEAD; git -C "$p" status --porcelain; git -C "$p" diff HEAD; } 2>/dev/null \
+        | cksum | cut -d' ' -f1)
+    old=$(awk -v i="$id" '$1 == i {print $2" "$3; exit}' "$df" 2>/dev/null || true)
+    oldh=${old% *}; olde=${old#* }
+    if [ -n "$oldh" ] && [ "$oldh" = "$h" ]; then ep=$olde; else ep=$now; fi
+    printf '%s %s %s\n' "$id" "$h" "$ep" >> "$tmp"
+    age=$((now - ep))
+    if [ "$age" -lt "$frz" ]; then continue; fi
+    last=$(awk -v i="$id" '$1 == i {print $2; exit}' "$nf" 2>/dev/null || true)
+    if [ $((now - ${last:-0})) -lt "$every" ]; then continue; fi
+    mins=$((age / 60))
+    # tell() dies on a dead pane; a per-agent poll must not abort the whole
+    # round (that would drop every agent's fingerprint). Check liveness first.
+    if ! printf '%s\n' "$live" | grep -Fxq "$pane"; then continue; fi
+    if tell "$id" "[看板自动提醒] 你已 ${mins} 分钟没有代码改动。若在等远端作业，awb block $id \"等：<作业>\"；否则把任务切到一个能 30 分钟内提交的最小 commit 先交。" 2>/dev/null; then
+      printf '%s %s\n' "$id" "$now" >> "$nf"
+    fi
+  done
+  # drop stale ids, keep the just-seen set
+  if [ -s "$tmp" ]; then mv "$tmp" "$df"; else rm -f "$tmp"; fi
+  if [ -s "$nf" ]; then
+    awk 'NR==FNR {seen[$1]=1; next} ($1 in seen)' "$df" "$nf" > "$nf.new" && mv "$nf.new" "$nf"
+  fi
+  unlock "freeze"
+}
+
 # nudge: paste a reminder into the pane of every agent silent >= AWB_STALE,
 # at most once per AWB_NUDGE_EVERY. Panes map: $AWB_DIR/panes, lines "ID PANE".
 nudge_once() {
+  freeze_once
   [ -s "$AWB_DIR/panes" ] || return 0
   now=$(date +%s)
   { [ -s "$EV" ] && cat "$EV" || true; } | jq -R -s -r \
@@ -955,7 +1038,39 @@ selftest() {
     { printf '%s\n' "$cap" | grep -qx "told-A" && printf '%s\n' "$cap" | grep -qx "told-B"; } \
       || die "selftest: concurrent tells merged or lost"
     unset AWB_TMUX_SOCKET
+
+    # no-code-change detection drives the REAL freeze_once, not just render:
+    # (a) a milestone done without finish keeps the agent running+fingerprinted;
+    # (b) one dead pane must not abort the poll and drop the live agent's row.
+    fz=$t/fz; gf=$t/gitrepo; mkdir -p "$fz" "$gf"
+    ( cd "$gf" && git init -q && echo hi > f && git add -A \
+        && git -c user.email=a@b -c user.name=a commit -qm init )
+    fsock=$(tmux -L "$S" display-message -p '#{socket_path}')
+    pl=$(tmux -L "$S" new-window -d -P -F '#{pane_id}' "$SHELL")
+    pd=$(tmux -L "$S" new-window -d -P -F '#{pane_id}' "$SHELL")
+    tmux -L "$S" kill-pane -t "$pd"; sleep 0.5
+    AWB_DIR=$fz "$BIN" start zl liveagent >/dev/null
+    AWB_DIR=$fz "$BIN" now zl "t1" >/dev/null
+    AWB_DIR=$fz "$BIN" done zl >/dev/null          # milestone done, NO finish
+    AWB_DIR=$fz "$BIN" start zd deadagent >/dev/null
+    AWB_DIR=$fz "$BIN" now zd "t1" >/dev/null
+    printf 'zl %s %s\nzd %s %s\n' "$pl" "$gf" "$pd" "$gf" > "$fz/panes"
+    AWB_DIR=$fz AWB_TMUX_SOCKET=$fsock AWB_FROZEN=0 "$BIN" nudge --once
+    grep -q '^zl ' "$fz/diffs" || die "selftest: milestone done agent lost from freeze scan"
+    grep -q '^zd ' "$fz/diffs" || die "selftest: dead-pane agent row not written"
+    sleep 0.6
+    tmux -L "$S" capture-pane -p -t "$pl" | grep -Fq "没有代码改动" \
+      || die "selftest: live frozen agent not reminded past a dead pane"
   fi
+  "$BIN" start zf frozen; "$BIN" now zf "idle"
+  "$BIN" start zfb blk; "$BIN" now zfb "wait"; "$BIN" block zfb "remote job"
+  printf 'zf 1 %s\nzfb 1 %s\n' "$(($(date +%s) - 1000))" "$(($(date +%s) - 1000))" > "$t/diffs"
+  fr=$("$BIN" render)
+  printf '%s' "$fr" | grep -Fq "久未改动" || die "selftest: stale fingerprint not shown frozen"
+  printf '%s' "$fr" | grep -Fq "无改动" || die "selftest: frozen marker missing"
+  ! printf '%s' "$fr" | grep -Fq "blk" || die "selftest: blocked agent shown in frozen list"
+  printf 'zf 1 %s\nzfb 1 %s\n' "$(date +%s)" "$(date +%s)" > "$t/diffs"
+  ! "$BIN" render | grep -Fq "久未改动" || die "selftest: fresh fingerprint shown frozen"
   "$BIN" skill | grep -q "awb check" || die "selftest: skill manual not found"
   if m=$(model_bin); then
     "$BIN" audit | grep -q "^g1 done-while-check-rejected" || die "selftest: audit missed done after rejection"

@@ -94,7 +94,8 @@ awb down                                            # kill the session
 ```
 
 Board knobs: `AWB_VIEW=brief|full` (default brief), `AWB_STALE=SECS` lists agents silent
-that long (default 600), `AWB_INTERVAL` refresh seconds (default 1).
+that long (default 600), `AWB_INTERVAL` refresh seconds (default 1), `AWB_FROZEN=SECS`
+flags a running agent whose git working tree is unchanged that long (default 900).
 
 Keep acceptance files outside the agent's working directory so the agent cannot edit them.
 
@@ -117,6 +118,12 @@ awb stale                                             # agents silent >= AWB_STA
 awb nudge                                             # loop: remind silent agents every AWB_NUDGE_EVERY
 ```
 
+`awb nudge` (loop cadence `AWB_NUDGE_POLL`, default 60 s) also fingerprints each agent's
+git working tree (`.awb/diffs`): a running agent whose tree is unchanged for `AWB_FROZEN`
+seconds (default 900) is reminded at most once per `AWB_NUDGE_EVERY` (default 900 s — the
+60 s poll is not the throttle) to commit a minimal change or `awb block`; blocked agents and
+non-git directories are skipped.
+
 - `tell` works for any TUI agent (claude, codex, ...) and uses a named tmux buffer, so your
   own paste buffer is untouched. Claude queues it if a turn is running.
 - A rejected `awb check` tells the agent the reason automatically, unless the agent ran the
@@ -128,7 +135,8 @@ awb nudge                                             # loop: remind silent agen
   authenticated. MCP channels, the documented push route, are unavailable with a custom
   `ANTHROPIC_BASE_URL`.
 - Agents started outside awb (existing sessions) are mapped in `.awb/panes`, one
-  `ID PANE` per line; it overrides panes from start events.
+  `ID PANE` per line (an optional third column overrides the working directory used for
+  change detection); it overrides panes from start events.
 
 ## Contributing and releases
 
