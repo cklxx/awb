@@ -29,9 +29,12 @@ each step, and per-group agents with their milestones; `⊢` marks a milestone t
 ## Install
 
 ```sh
-ln -sf "$PWD/awb" ~/.local/bin/awb      # needs sh, tmux, jq
+curl -fsSL https://github.com/cklxx/awb/releases/latest/download/awb -o ~/.local/bin/awb
+chmod +x ~/.local/bin/awb                # needs sh, tmux, jq
 awb selftest
 ```
+
+From a clone: `ln -sf "$PWD/awb" ~/.local/bin/awb`.
 
 Lean 4 is optional: only `awb check --lean` and `model/` need it. Install it with
 [elan](https://github.com/leanprover/elan):
@@ -70,6 +73,7 @@ awb news "API merged"                        # board shows the last 5
 awb check a1 -- pytest -q ~/accept/test_a1.py       # any command, exit 0 = accepted
 awb check a1 --lean proj ~/accept/ACCEPT.lean       # Lean 4: build, no sorry, theorems typecheck
                                                     # with standard axioms only
+awb pr a1                                           # open a PR for a1's branch, only after a pass
 awb render                                          # one-shot render, works outside tmux
 awb reset                                           # clear all events
 awb down                                            # kill the session
@@ -111,6 +115,18 @@ awb nudge                                             # loop: remind silent agen
   `ANTHROPIC_BASE_URL`.
 - Agents started outside awb (existing sessions) are mapped in `.awb/panes`, one
   `ID PANE` per line; it overrides panes from start events.
+
+## Contributing and releases
+
+Changes land by PR. Fix on a branch, then gate and open the PR with awb itself:
+
+```sh
+awb check fix1 -- ./awb selftest     # the acceptance gate
+awb pr fix1                          # pushes the branch; refuses without a passing check
+```
+
+CI does not test; it only publishes: pushing a tag `vX.Y.Z` that matches `VERSION` in `awb`
+creates a GitHub release with `awb` attached.
 
 ## Formal model
 

@@ -5,6 +5,7 @@
 # agent process output.
 set -eu
 
+VERSION=0.0.1
 PROG=$(basename "$0")
 AWB_DIR=${AWB_DIR:-$PWD/.awb}
 EV=$AWB_DIR/events.jsonl
@@ -140,8 +141,11 @@ reduce (. // [])[] as $e (
     | .agents[$e.id].lastEp = ($e.ep // .agents[$e.id].lastEp)
   elif $e.t == "done" then
     (.agents[$e.id]) as $a | ($e.ep // $a.lastEp) as $ep
-    | .agents[$e.id].done += [{text:((if $e.verified then "⊢ " else "" end) + ($e.text // $a.current.text // "milestone")),
-                               time:($e.time // ""), dur:([0, $ep - ($a.current.ep // $ep)] | max)}]
+    # a passing check with no open milestone verifies the last finished one
+    | (if $e.verified and $a.current == null and $e.text == null and ($a.done | length) > 0
+       then .agents[$e.id].done[-1].text |= (if startswith("⊢ ") then . else "⊢ " + . end)
+       else .agents[$e.id].done += [{text:((if $e.verified then "⊢ " else "" end) + ($e.text // $a.current.text // "milestone")),
+                                     time:($e.time // ""), dur:([0, $ep - ($a.current.ep // $ep)] | max)}] end)
     | .agents[$e.id].current = null
     | .agents[$e.id].lastEp = $ep
     | (if $e.verified then .agents[$e.id].gate = false
@@ -296,7 +300,9 @@ end
 '
 
 dims() {
-  if [ -n "${TMUX_PANE:-}" ]; then
+  if [ -n "${AWB_ROWS:-}" ] && [ -n "${AWB_COLS:-}" ]; then
+    echo "$AWB_COLS $AWB_ROWS"
+  elif [ -n "${TMUX_PANE:-}" ]; then
     tm display-message -p -t "$TMUX_PANE" '#{pane_width} #{pane_height}' 2>/dev/null
   else
     stty size 2>/dev/null | awk '{print $2, $1}'
@@ -450,6 +456,37 @@ $(q "$BIN") _enter; $tui_cmd; exec $(q "$SHELL")"
 
 # ID PANE per agent: $AWB_DIR/panes ("ID PANE" lines, for agents started outside awb)
 # overrides the pane of the latest start event
+# open a PR for an agent's work from the current git checkout, only when the agent's
+# latest `awb check` passed; the body lists its milestones and that check's steps
+pr() {
+  [ $# -ge 1 ] || die "usage: $PROG pr ID [gh pr create args...]"
+  id=$1; shift; init_dir
+  info=$({ [ -s "$EV" ] && cat "$EV" || true; } | jq -R -s --arg id "$id" '
+    [split("\n")[] | fromjson? | select(type == "object" and .id == $id)] as $es
+    | ([$es[] | select(.t == "chk")] | group_by(.run) | sort_by(.[0].ep) | last // []) as $run
+    | ($run | reduce .[] as $e ({o:[], s:{}};
+        (if .s[$e.step] == null then .o += [$e.step] else . end) | .s[$e.step] = $e.state)) as $st
+    | (reduce $es[] as $e ({cur:null, ms:[]};
+        if $e.t == "now" then .cur = $e.text
+        elif $e.t == "done" and $e.verified and .cur == null and $e.text == null and (.ms | length) > 0
+          then .ms[-1] |= (if startswith("⊢ ") then . else "⊢ " + . end)
+        elif $e.t == "done" then .ms += [(if $e.verified then "⊢ " else "" end) + ($e.text // .cur // "milestone")] | .cur = null
+        else . end) | .ms) as $ms
+    | {pass: (($st.o | length) > 0 and all($st.s[]; . == "ok")),
+       name: ([$es[] | select(.t == "start") | .name] | first // $id),
+       title: ($ms | last // "" | ltrimstr("⊢ ")),
+       body: ("## Milestones\n" + ([$ms[] | "- " + .] | join("\n"))
+              + "\n\n## Acceptance\n`" + ($run[0].what // "") + "`: "
+              + ([$st.o[] | . + " " + (if $st.s[.] == "ok" then "✓" else "✗" end)] | join(" → ")))}')
+  [ "$(printf '%s' "$info" | jq -r .pass)" = true ] || die "$id has no passing awb check; run '$PROG check $id ...' first"
+  br=$(git rev-parse --abbrev-ref HEAD) || die "not a git checkout"
+  def=$(gh repo view --json defaultBranchRef -q .defaultBranchRef.name) || die "gh cannot see this repo"
+  [ "$br" != "$def" ] || die "on $def; commit the agent's work on a branch first"
+  git push -q -u origin HEAD
+  gh pr create --title "$(printf '%s' "$info" | jq -r '.name + ": " + .title')" \
+    --body "$(printf '%s' "$info" | jq -r .body)" "$@"
+}
+
 agent_panes() {
   { [ -s "$EV" ] && jq -r 'select(.t=="start" and (.pane // "") != "") | "\(.id) \(.pane)"' "$EV"
     [ -s "$AWB_DIR/panes" ] && awk 'NF >= 2 {print $1, $2}' "$AWB_DIR/panes"; } \
@@ -623,6 +660,8 @@ $PROG — tmux agent workbench (events in .awb/events.jsonl)
   $PROG tell ID MESSAGE             type a message into the agent's TUI pane (claude, codex, ...)
   $PROG peers                       agents that are Claude sessions: ID PANE SESSION STATUS
                                     (message them with SendMessage from a Claude main agent)
+  $PROG pr ID [gh args...]          push this branch and open a PR, only after a passing check
+  $PROG version
   $PROG check ID -- CMD...          acceptance gate: CMD exit 0 -> milestone done (⊢), else failed
   $PROG check ID --lean DIR [ACCEPT.lean]
                                     Lean 4 gate: lake build, no sorry, ACCEPT.lean theorems
@@ -638,7 +677,7 @@ selftest() {
   S=awbselftest$$
   cleanup() { tmux -L "$S" kill-server 2>/dev/null || true; rm -rf "$t"; }
   trap cleanup EXIT
-  export AWB_DIR=$t; EV=$t/events.jsonl
+  export AWB_DIR=$t AWB_COLS=160 AWB_ROWS=200; EV=$t/events.jsonl
 
   "$BIN" goal "SHIP THE WORKBENCH"
   "$BIN" start a1 claude agent backend
@@ -667,6 +706,11 @@ selftest() {
   AWB_VIEW=full "$BIN" render | grep -Fq "✗1" || die "selftest: rejected check not failed"
   "$BIN" check a1 -- true >/dev/null || die "selftest: passing check rejected"
   AWB_VIEW=full "$BIN" render | grep -Fq "⊢ gated" || die "selftest: verified milestone not marked"
+  ! "$BIN" pr a2 2>/dev/null || die "selftest: pr opened without a passing check"
+  "$BIN" start v1 late; "$BIN" now v1 "shipped"; "$BIN" done v1; "$BIN" check v1 -- true >/dev/null
+  out=$(AWB_VIEW=full "$BIN" render)
+  printf '%s' "$out" | grep -Fq "⊢ shipped" || die "selftest: late check did not verify last milestone"
+  ! printf '%s' "$out" | grep -Fq "⊢ milestone" || die "selftest: late check added a phantom milestone"
   # regressions found by model/AwbModel.lean
   "$BIN" start g1 gatecase; "$BIN" check g1 -- false >/dev/null || true; "$BIN" status g1 done
   AWB_VIEW=full "$BIN" render | grep -q "✗ gatecase" || die "selftest: done overrode a rejected check"
@@ -758,6 +802,8 @@ case "$cmd" in
   _enter)   _enter ;;
   _leave)   _leave "${1:-0}" ;;
   check)    check "$@" ;;
+  pr)       pr "$@" ;;
+  version|--version|-V) echo "$PROG $VERSION" ;;
   tell)     tell "$@" ;;
   peers)    peers ;;
   selftest) selftest ;;
