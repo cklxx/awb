@@ -148,6 +148,16 @@ proven model:
 | protocol audit | proven: the one-pass monitor reports nothing iff every event obeys the rules given its prefix (`audit_iff_clean`); corollary: every PR in a clean log followed a passing check | `model/Audit.lean` |
 | deliverables | `awb check` (tests, or Lean with kernel-checked theorems and standard axioms only) | `awb check` |
 | merge | `awb pr` refuses without a passing check or with audit violations, and logs the PR for the audit | `awb pr` |
+| concurrency (check, pr, tell vs the agent) | TLA+, model-checked with TLC: `*Old.cfg` reproduces the races of 0.0.5, `*Fixed.cfg` passes | `model/tla/` |
+
+Races TLC found in 0.0.5, now fixed and covered by selftest: a check that passed after the
+agent had started its next milestone verified that new milestone; two checks of one agent
+interleaved their events, so the audit flagged an honest pass; `awb pr` could open a PR while
+a new check was running; two concurrent `tell`s into one pane merged into one prompt or lost a
+message. Fixes: a per-agent lock around `check` and `pr`, a check verifies only the milestone
+it started on (otherwise it is rejected as stale), and `tell` uses a per-call buffer under a
+per-pane lock. Run TLC with
+`java -cp tla2tools.jar tlc2.TLC -config AwbCheckFixed.cfg -deadlock AwbCheck` in `model/tla/`.
 
 Audit rules, per agent: a verified milestone must follow a passing check (forged `verified`
 events are caught), a PR must follow a passing check, and `done` must not be claimed while a

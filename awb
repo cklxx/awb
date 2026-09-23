@@ -5,7 +5,7 @@
 # agent process output.
 set -eu
 
-VERSION=0.0.5
+VERSION=0.0.6
 PROG=$(basename "$0")
 AWB_DIR=${AWB_DIR:-$PWD/.awb}
 EV=$AWB_DIR/events.jsonl
@@ -512,11 +512,34 @@ $(q "$BIN") _enter; $tui_cmd; exec $(q "$SHELL")"
 
 # ID PANE per agent: $AWB_DIR/panes ("ID PANE" lines, for agents started outside awb)
 # overrides the pane of the latest start event
+# mutual exclusion under $AWB_DIR (mkdir is atomic). Waits up to AWB_LOCK_WAIT seconds;
+# a lock whose holder died is taken over. Released on exit. Races found in model/tla/.
+# ponytail: takeover reads the pid then removes the dir, so two takers can race after a crash
+lock() {
+  _l=$AWB_DIR/lock-$1; _n=0
+  until mkdir "$_l" 2>/dev/null; do
+    _o=$(cat "$_l/pid" 2>/dev/null || true)
+    if [ -n "$_o" ] && ! kill -0 "$_o" 2>/dev/null; then rm -rf "$_l"; continue; fi
+    _n=$((_n + 1)); [ $_n -le $((${AWB_LOCK_WAIT:-600} * 5)) ] || die "$1 is locked by pid ${_o:-?}"
+    sleep 0.2
+  done
+  echo $$ > "$_l/pid"
+  LOCKS="${LOCKS:-} $_l"; trap 'rm -rf $LOCKS' EXIT; trap 'exit 130' INT TERM
+}
+unlock() { rm -rf "$AWB_DIR/lock-$1"; }
+
+# the agent's open milestone ("EP TEXT" of its last `now`, if no `done` came after)
+open_ms() {
+  [ -s "$EV" ] || return 0
+  grep -F "\"id\":\"$1\"" "$EV" | grep -E '"t":"(now|done)"' | tail -1 | jq -r 'select(.t == "now") | "\(.ep) \(.text)"'
+}
+
 # open a PR for an agent's work from the current git checkout, only when the agent's
 # latest `awb check` passed; the body lists its milestones and that check's steps
 pr() {
   [ $# -ge 1 ] || die "usage: $PROG pr ID [gh pr create args...]"
   id=$1; shift; init_dir
+  lock "gate-$id"     # no check of this agent can interleave between the gate and the PR
   info=$({ [ -s "$EV" ] && cat "$EV" || true; } | jq -R -s --arg id "$id" '
     [split("\n")[] | fromjson? | select(type == "object" and .id == $id)] as $es
     | ([$es[] | select(.t == "chk")] | group_by(.run) | sort_by(.[0].ep) | last // []) as $run
@@ -585,10 +608,14 @@ tell() {
   _id=$1; shift; init_dir
   _p=$(agent_pane "$_id")
   [ -n "$_p" ] && tm list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qx "$_p" || die "$_id has no live pane"
-  printf '%s' "$*" | tm load-buffer -b awb-tell -
-  tm paste-buffer -p -d -b awb-tell -t "$_p"
+  # one tell per pane at a time, each with its own buffer: concurrent tells merged or lost
+  # messages otherwise (model/tla/AwbTell.tla)
+  lock "tell-$_p"
+  printf '%s' "$*" | tm load-buffer -b "awb-tell-$$" -
+  tm paste-buffer -p -d -b "awb-tell-$$" -t "$_p"
   sleep 0.5
   tm send-keys -t "$_p" Enter
+  unlock "tell-$_p"
 }
 
 # awb agents that are Claude Code sessions: ID PANE SESSION-NAME STATUS. A main Claude
@@ -675,9 +702,15 @@ check() {
     *) die "usage: $PROG check ID -- CMD... | $PROG check ID --lean DIR [ACCEPT.lean]" ;;
   esac
   init_dir
+  lock "gate-$id"     # one check or pr per agent at a time (model/tla/AwbCheck.tla)
+  ms=$(open_ms "$id")
   CHK_ID=$id CHK_RUN=$(date +%s)$$ CHK_WHAT=$what CHK_LOG=$AWB_DIR/check-$id.log
   export CHK_ID CHK_RUN CHK_WHAT CHK_LOG
   rc=0; "$@" >"$CHK_LOG" 2>&1 || rc=$?
+  # a pass verifies the milestone it started on; if the agent moved on meanwhile, it is stale
+  if [ "$rc" = 0 ] && [ "$(open_ms "$id")" != "$ms" ]; then
+    rc=97; echo "stale: milestone changed during the check (was: ${ms#* }); re-run the check" >> "$CHK_LOG"
+  fi
   if [ "$rc" = 0 ]; then
     append '{t:"done",time:$time,ep:$ep,id:$id,text:null,verified:true}' --arg id "$id"
     echo "accepted: $what"
@@ -804,6 +837,14 @@ selftest() {
   out=$(AWB_VIEW=full "$BIN" render)
   printf '%s' "$out" | grep -Fq "⊢ shipped" || die "selftest: late check did not verify last milestone"
   ! printf '%s' "$out" | grep -Fq "⊢ milestone" || die "selftest: late check added a phantom milestone"
+  # races found by model/tla (real concurrent processes)
+  "$BIN" start s1 stale; "$BIN" now s1 "m1"
+  "$BIN" check s1 -- sleep 1 >/dev/null 2>&1 & sleep 0.4; "$BIN" now s1 "m2"; wait
+  AWB_VIEW=full "$BIN" render | grep -q "✗ stale" || die "selftest: check verified a milestone started during it"
+  "$BIN" start p1 pair; "$BIN" now p1 "x"
+  "$BIN" check p1 -- sleep 1 >/dev/null & "$BIN" check p1 -- sleep 1 >/dev/null & wait
+  runs=$(jq -r 'select(.t == "chk" and .id == "p1") | .run' "$EV" | uniq | wc -l | tr -d ' ')
+  [ "$runs" = 2 ] || die "selftest: concurrent checks interleaved ($runs run segments)"
   # regressions found by model/AwbModel.lean
   "$BIN" start g1 gatecase; "$BIN" check g1 -- false >/dev/null || true; "$BIN" status g1 done
   AWB_VIEW=full "$BIN" render | grep -q "✗ gatecase" || die "selftest: done overrode a rejected check"
@@ -831,6 +872,13 @@ selftest() {
     AWB_TMUX_SOCKET=$(tmux -L "$S" display-message -p '#{socket_path}') "$BIN" tell z1 "echo told-\$((6*7))"
     i=0; until tmux -L "$S" capture-pane -p -t "$(agent_pane z1)" | grep -q told-42; do
       i=$((i + 1)); [ $i -lt 20 ] || die "selftest: tell not delivered"; sleep 0.5; done
+    # concurrent tells into one pane arrive as two separate commands
+    AWB_TMUX_SOCKET=$(tmux -L "$S" display-message -p '#{socket_path}'); export AWB_TMUX_SOCKET
+    "$BIN" tell z1 "echo told-A" & "$BIN" tell z1 "echo told-B" & wait
+    sleep 1; cap=$(tmux -L "$S" capture-pane -p -t "$(agent_pane z1)")
+    { printf '%s\n' "$cap" | grep -qx "told-A" && printf '%s\n' "$cap" | grep -qx "told-B"; } \
+      || die "selftest: concurrent tells merged or lost"
+    unset AWB_TMUX_SOCKET
   fi
   "$BIN" skill | grep -q "awb check" || die "selftest: skill manual not found"
   if m=$(model_bin); then
