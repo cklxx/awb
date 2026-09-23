@@ -5,7 +5,7 @@
 # agent process output.
 set -eu
 
-VERSION=0.0.1
+VERSION=0.0.2
 PROG=$(basename "$0")
 AWB_DIR=${AWB_DIR:-$PWD/.awb}
 EV=$AWB_DIR/events.jsonl
@@ -448,7 +448,7 @@ $(q "$BIN") _enter; $tui_cmd; exec $(q "$SHELL")"
   # first message: Chinese working rules + optional task.
   # paste via buffer — a plain Enter does not submit inside the claude TUI.
   task=$*
-  prompt="你好，你已注册到 awb 工作台（agent ID: ${id}，组: ${group}）。请始终用中文。工作规则：开始一个阶段先运行 awb now ${id} \"阶段名\"，完成运行 awb done ${id}；卡住运行 awb block ${id} \"原因\"，恢复运行 awb unblock ${id}；全部完成运行 awb finish ${id}。"
+  prompt="你好，你已注册到 awb 工作台（agent ID: ${id}，组: ${group}）。请始终用中文。工作规则：开始一个阶段先运行 awb now ${id} \"阶段名\"，完成运行 awb done ${id}；卡住运行 awb block ${id} \"原因\"，恢复运行 awb unblock ${id}；全部完成运行 awb finish ${id}。完整规则运行 awb skill 查看。"
   [ -n "${task}" ] && prompt="${prompt} 首个任务：${task}。先 awb now ${id} 再动手。"
   sleep 3
   tell "$id" "$prompt"
@@ -485,6 +485,17 @@ pr() {
   git push -q -u origin HEAD
   gh pr create --title "$(printf '%s' "$info" | jq -r '.name + ": " + .title')" \
     --body "$(printf '%s' "$info" | jq -r .body)" "$@"
+}
+
+# the agent manual: the skill next to the real script (clone), else the installed skill
+skill() {
+  _src=$(readlink "$BIN" 2>/dev/null || echo "$BIN")
+  for f in "$(cd "$(dirname "$BIN")" && cd "$(dirname "$_src")" && pwd)/skills/awb-workbench/SKILL.md" \
+           "${AWB_SKILL_DIR:-$HOME/.claude/skills}/awb-workbench/SKILL.md"; do
+    [ -f "$f" ] && { cat "$f"; return 0; }
+  done
+  echo "manual: https://github.com/cklxx/awb/blob/main/skills/awb-workbench/SKILL.md"
+  echo "install it: curl -fsSL https://raw.githubusercontent.com/cklxx/awb/main/install.sh | sh"
 }
 
 agent_panes() {
@@ -632,7 +643,8 @@ _leave() {
 
 usage() {
   cat <<EOF
-$PROG — tmux agent workbench (events in .awb/events.jsonl)
+$PROG $VERSION — tmux agent workbench (events in .awb/events.jsonl)
+Agents: read the operating manual with '$PROG skill' before driving the board.
 
   $PROG up                          tmux session: milestone board + work area
   $PROG down                        kill the session
@@ -661,7 +673,7 @@ $PROG — tmux agent workbench (events in .awb/events.jsonl)
   $PROG peers                       agents that are Claude sessions: ID PANE SESSION STATUS
                                     (message them with SendMessage from a Claude main agent)
   $PROG pr ID [gh args...]          push this branch and open a PR, only after a passing check
-  $PROG version
+  $PROG version | skill             version | the agent operating manual (SKILL.md)
   $PROG check ID -- CMD...          acceptance gate: CMD exit 0 -> milestone done (⊢), else failed
   $PROG check ID --lean DIR [ACCEPT.lean]
                                     Lean 4 gate: lake build, no sorry, ACCEPT.lean theorems
@@ -739,6 +751,7 @@ selftest() {
     i=0; until tmux -L "$S" capture-pane -p -t "$(agent_pane z1)" | grep -q told-42; do
       i=$((i + 1)); [ $i -lt 20 ] || die "selftest: tell not delivered"; sleep 0.5; done
   fi
+  "$BIN" skill | grep -q "awb check" || die "selftest: skill manual not found"
   echo "selftest ok"
 }
 
@@ -804,6 +817,7 @@ case "$cmd" in
   check)    check "$@" ;;
   pr)       pr "$@" ;;
   version|--version|-V) echo "$PROG $VERSION" ;;
+  skill)    skill ;;
   tell)     tell "$@" ;;
   peers)    peers ;;
   selftest) selftest ;;
