@@ -5,7 +5,7 @@
 # agent process output.
 set -eu
 
-VERSION=0.0.2
+VERSION=0.0.3
 PROG=$(basename "$0")
 AWB_DIR=${AWB_DIR:-$PWD/.awb}
 EV=$AWB_DIR/events.jsonl
@@ -45,7 +45,71 @@ tm() {
 
 BIN=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
 
-JQ_RENDER='
+# event fold: the state machine modelled and proven in model/AwbModel.lean;
+# `awb state` prints it for the differential test against the compiled model
+JQ_FOLD='
+def fold:
+reduce (. // [])[] as $e (
+  {goal:"", agents:{}, gorder:{}, gseen:[], tasks:{}, torder:[], news:[], checks:{}};
+  if   $e.t == "goal" then .goal = $e.text
+  elif $e.t == "news" then .news += [{text:$e.text, time:($e.time // "")}]
+  elif $e.t == "task" then
+    (if .tasks[$e.id] == null then .torder += [$e.id] else . end)
+    | .tasks[$e.id] = ((.tasks[$e.id] // {id:$e.id, state:"todo", text:$e.id, parent:"", owner:""})
+        + ({state:$e.state, text:$e.text, parent:$e.parent, owner:$e.owner}
+           | with_entries(select(.value != null and .value != ""))))
+  elif $e.t == "start" then
+    if .agents[$e.id] != null then
+      .agents[$e.id] += {status:"running", reason:"", endEp:null,
+                         pane:($e.pane // .agents[$e.id].pane), lastEp:($e.ep // .agents[$e.id].lastEp)}
+    else ($e.group // "default") as $g
+      | .agents[$e.id] = {id:$e.id, name:($e.name // $e.id), kind:($e.kind // "agent"),
+                          pane:($e.pane // ""), group:$g, status:"running",
+                          current:null, done:[], reason:"", gate:false,
+                          startEp:($e.ep // 0), lastEp:($e.ep // 0), endEp:null}
+      | .gorder[$g] = ((.gorder[$g] // []) + [$e.id])
+      | (if (.gseen | index($g)) then . else .gseen += [$g] end)
+    end
+  elif $e.t == "chk" then
+    (if (.checks[$e.id].run // "") != $e.run
+     then .checks[$e.id] = {id:$e.id, what:$e.what, run:$e.run, startEp:$e.ep, steps:[]} else . end)
+    | (.checks[$e.id].steps | map(.s) | index($e.step)) as $i
+    | if $i == null then .checks[$e.id].steps += [{s:$e.step, state:$e.state, ep0:$e.ep, ep1:null, note:""}]
+      else .checks[$e.id].steps[$i] += {state:$e.state, ep1:$e.ep, note:$e.note} end
+  elif .agents[$e.id] == null then .
+  elif $e.t == "now" then
+    (if .agents[$e.id].status == "done" then .agents[$e.id].status = "running" | .agents[$e.id].endEp = null | .agents[$e.id].reason = "" else . end)
+    | .agents[$e.id].current = {text:($e.text // ""), time:($e.time // ""), ep:($e.ep // 0)}
+    | .agents[$e.id] += {status:"running", reason:"", endEp:null}
+    | .agents[$e.id].lastEp = ($e.ep // .agents[$e.id].lastEp)
+  elif $e.t == "done" then
+    (.agents[$e.id]) as $a | ($e.ep // $a.lastEp) as $ep
+    # a passing check with no open milestone verifies the last finished one
+    | (if $e.verified and $a.current == null and $e.text == null and ($a.done | length) > 0
+       then .agents[$e.id].done[-1].text |= (if startswith("⊢ ") then . else "⊢ " + . end)
+       else .agents[$e.id].done += [{text:((if $e.verified then "⊢ " else "" end) + ($e.text // $a.current.text // "milestone")),
+                                     time:($e.time // ""), dur:([0, $ep - ($a.current.ep // $ep)] | max)}] end)
+    | .agents[$e.id].current = null
+    | .agents[$e.id].lastEp = $ep
+    | (if $e.verified then .agents[$e.id].gate = false
+         | (if .agents[$e.id].status == "failed"
+            then .agents[$e.id] += {status:"running", reason:"", endEp:null} else . end)
+       else . end)
+  elif $e.t == "status" and (($e.status // "running") | IN("running","blocked","failed","done") | not) then .
+  elif $e.t == "status" and $e.status == "done" and .agents[$e.id].gate then
+    .agents[$e.id] += {status:"failed", endEp:($e.ep // 0)}
+  elif $e.t == "status" then
+    .agents[$e.id].gate = (.agents[$e.id].gate or ($e.gate == true))
+    | .agents[$e.id].status = ($e.status // "running")
+    | .agents[$e.id].reason = ($e.reason // "")
+    | .agents[$e.id].lastEp = ($e.ep // .agents[$e.id].lastEp)
+    | (if ($e.status == "done" or $e.status == "failed") then .agents[$e.id].endEp = ($e.ep // 0)
+       elif ($e.status == "running" or $e.status == "blocked") then .agents[$e.id].endEp = null
+       else . end)
+  else . end);
+'
+
+JQ_RENDER=$JQ_FOLD'
 def wide($c):
   ($c >= 4352 and $c <= 4447) or ($c >= 11904 and $c <= 42191)
   or ($c >= 44032 and $c <= 55203) or ($c >= 63744 and $c <= 64255)
@@ -106,64 +170,7 @@ def wrap($n):
 ($h   | if . < 12 then 12 elif . > 200 then 200 else . end) as $h |
 ($w - 1) as $inner |
 
-reduce (. // [])[] as $e (
-  {goal:"", agents:{}, gorder:{}, gseen:[], tasks:{}, torder:[], news:[], checks:{}};
-  if   $e.t == "goal" then .goal = $e.text
-  elif $e.t == "news" then .news += [{text:$e.text, time:($e.time // "")}]
-  elif $e.t == "task" then
-    (if .tasks[$e.id] == null then .torder += [$e.id] else . end)
-    | .tasks[$e.id] = ((.tasks[$e.id] // {id:$e.id, state:"todo", text:$e.id, parent:"", owner:""})
-        + ({state:$e.state, text:$e.text, parent:$e.parent, owner:$e.owner}
-           | with_entries(select(.value != null and .value != ""))))
-  elif $e.t == "start" then
-    if .agents[$e.id] != null then
-      .agents[$e.id] += {status:"running", reason:"", endEp:null,
-                         pane:($e.pane // .agents[$e.id].pane), lastEp:($e.ep // .agents[$e.id].lastEp)}
-    else ($e.group // "default") as $g
-      | .agents[$e.id] = {id:$e.id, name:($e.name // $e.id), kind:($e.kind // "agent"),
-                          pane:($e.pane // ""), group:$g, status:"running",
-                          current:null, done:[], reason:"", gate:false,
-                          startEp:($e.ep // 0), lastEp:($e.ep // 0), endEp:null}
-      | .gorder[$g] = ((.gorder[$g] // []) + [$e.id])
-      | (if (.gseen | index($g)) then . else .gseen += [$g] end)
-    end
-  elif $e.t == "chk" then
-    (if (.checks[$e.id].run // "") != $e.run
-     then .checks[$e.id] = {id:$e.id, what:$e.what, run:$e.run, startEp:$e.ep, steps:[]} else . end)
-    | (.checks[$e.id].steps | map(.s) | index($e.step)) as $i
-    | if $i == null then .checks[$e.id].steps += [{s:$e.step, state:$e.state, ep0:$e.ep, ep1:null, note:""}]
-      else .checks[$e.id].steps[$i] += {state:$e.state, ep1:$e.ep, note:$e.note} end
-  elif .agents[$e.id] == null then .
-  elif $e.t == "now" then
-    (if .agents[$e.id].status == "done" then .agents[$e.id].status = "running" | .agents[$e.id].endEp = null | .agents[$e.id].reason = "" else . end)
-    | .agents[$e.id].current = {text:($e.text // ""), time:($e.time // ""), ep:($e.ep // 0)}
-    | .agents[$e.id] += {status:"running", reason:"", endEp:null}
-    | .agents[$e.id].lastEp = ($e.ep // .agents[$e.id].lastEp)
-  elif $e.t == "done" then
-    (.agents[$e.id]) as $a | ($e.ep // $a.lastEp) as $ep
-    # a passing check with no open milestone verifies the last finished one
-    | (if $e.verified and $a.current == null and $e.text == null and ($a.done | length) > 0
-       then .agents[$e.id].done[-1].text |= (if startswith("⊢ ") then . else "⊢ " + . end)
-       else .agents[$e.id].done += [{text:((if $e.verified then "⊢ " else "" end) + ($e.text // $a.current.text // "milestone")),
-                                     time:($e.time // ""), dur:([0, $ep - ($a.current.ep // $ep)] | max)}] end)
-    | .agents[$e.id].current = null
-    | .agents[$e.id].lastEp = $ep
-    | (if $e.verified then .agents[$e.id].gate = false
-         | (if .agents[$e.id].status == "failed"
-            then .agents[$e.id] += {status:"running", reason:"", endEp:null} else . end)
-       else . end)
-  elif $e.t == "status" and (($e.status // "running") | IN("running","blocked","failed","done") | not) then .
-  elif $e.t == "status" and $e.status == "done" and .agents[$e.id].gate then
-    .agents[$e.id] += {status:"failed", endEp:($e.ep // 0)}
-  elif $e.t == "status" then
-    .agents[$e.id].gate = (.agents[$e.id].gate or ($e.gate == true))
-    | .agents[$e.id].status = ($e.status // "running")
-    | .agents[$e.id].reason = ($e.reason // "")
-    | .agents[$e.id].lastEp = ($e.ep // .agents[$e.id].lastEp)
-    | (if ($e.status == "done" or $e.status == "failed") then .agents[$e.id].endEp = ($e.ep // 0)
-       elif ($e.status == "running" or $e.status == "blocked") then .agents[$e.id].endEp = null
-       else . end)
-  else . end)
+fold
 
 # pane closed without a finish/fail event -> dead (empty pane = remote agent)
 | .agents |= map_values(
@@ -204,6 +211,12 @@ reduce (. // [])[] as $e (
          + $dm + (.what | clip(18) | pad(18)) + $rs + " " + $chain + $dm + "  " + ($el | sdur) + $rs
        , (if $why != "" then "    " + $r + "└ " + ($why | clip($inner - 8)) + $rs else empty end) ]
    end) as $chk
+| ($viol | split("\n") | map(select(. != "") | split(" "))) as $vs
+| ($chk + (if ($vs | length) == 0 then [] else ["", $r + "审计违规（Lean 监控）" + $rs]
+    + [ $vs[] | "  " + $r + "✗ " + $rs + ((($s.agents[.[0]].name) // .[0]) | clip(10) | pad(10)) + " "
+        + ({"verified-without-passing-check":"验收标记前没有通过的验收（疑似伪造）",
+            "pr-without-passing-check":"没有通过的验收就开了 PR",
+            "done-while-check-rejected":"验收被拒后仍报完成"}[.[1]] // .[1]) ] end)) as $chk
 | ({"todo":["○",$dm],"wip":["◔",$cy],"review":["◑",$cy],"blocked":["▲",$y],
     "done":["✓",$g],"drop":["–",$dm],"ask":["?",$y]}) as $TI
 | ([ kids($s.tasks; $s.torder; "")[] as $root | $s.tasks[$root] as $rt
@@ -309,6 +322,37 @@ dims() {
   fi || echo "80 24"
 }
 
+# the log as a JSON array, tolerating a half-appended line from a concurrent writer
+events_json() {
+  { [ -s "$EV" ] && cat "$EV" || true; } | jq -R -s \
+    'rtrimstr("\n") | if . == "" then [] else split("\n")
+       | map(fromjson? | select(type == "object" and has("t"))) end'
+}
+
+# directory of the real script (through the install symlink): clone root
+src_dir() { cd "$(dirname "$BIN")" && cd "$(dirname "$(readlink "$BIN" 2>/dev/null || echo "$BIN")")" && pwd; }
+
+# compiled Lean model (model/Main.lean), built with: cd model && lake build
+model_bin() {
+  _m=${AWB_MODEL:-$(src_dir)/model/.lake/build/bin/awbmodel}
+  [ -x "$_m" ] && printf %s "$_m"
+}
+
+# per-agent state from the jq fold, same format as `awbmodel fold`
+state() {
+  init_dir
+  events_json | jq -r "$JQ_FOLD"' fold | .agents | to_entries | sort_by(.key)[] | .value as $a
+    | "\(.key) \($a.status) \($a.gate // false) \($a.endEp // "-") \(($a.done | last | .dur) // 0) \($a.done | length)"'
+}
+
+# protocol violations found by the verified Lean monitor (model/Audit.lean)
+audit() {
+  init_dir
+  m=$(model_bin) || die "audit needs the Lean model: (cd $(src_dir)/model && lake build)"
+  [ -s "$EV" ] || return 0
+  "$m" audit < "$EV"
+}
+
 render() {
   set -- $(dims)
   cols=${1:-80}; rows=${2:-24}
@@ -317,11 +361,8 @@ render() {
   else
     live='[]'
   fi
-  # tolerate a half-appended line from a concurrent writer
-  { [ -s "$EV" ] && cat "$EV" || true; } | jq -R -s \
-    'rtrimstr("\n") | if . == "" then [] else split("\n")
-       | map(fromjson? | select(type == "object" and has("t"))) end' \
-  | jq -r \
+  viol=; m=$(model_bin) && [ -s "$EV" ] && viol=$("$m" audit < "$EV" 2>/dev/null || true)
+  events_json | jq -r --arg viol "$viol" \
     --argjson w "$cols" --argjson h "$rows" \
     --arg now "$(date +$TS_FMT)" --argjson nowep "$(date +%s)" \
     --arg prog "$PROG" --argjson live "$live" --arg view "${AWB_VIEW:-brief}" --arg stale "${AWB_STALE:-600}" \
@@ -479,18 +520,23 @@ pr() {
               + "\n\n## Acceptance\n`" + ($run[0].what // "") + "`: "
               + ([$st.o[] | . + " " + (if $st.s[.] == "ok" then "✓" else "✗" end)] | join(" → ")))}')
   [ "$(printf '%s' "$info" | jq -r .pass)" = true ] || die "$id has no passing awb check; run '$PROG check $id ...' first"
+  if m=$(model_bin); then
+    v=$("$m" audit < "$EV" | awk -v i="$id" '$1 == i {print $2}' | sort -u | tr '\n' ' ')
+    [ -z "$v" ] || die "audit: $id has protocol violations: $v"
+  fi
   br=$(git rev-parse --abbrev-ref HEAD) || die "not a git checkout"
   def=$(gh repo view --json defaultBranchRef -q .defaultBranchRef.name) || die "gh cannot see this repo"
   [ "$br" != "$def" ] || die "on $def; commit the agent's work on a branch first"
   git push -q -u origin HEAD
-  gh pr create --title "$(printf '%s' "$info" | jq -r '.name + ": " + .title')" \
-    --body "$(printf '%s' "$info" | jq -r .body)" "$@"
+  url=$(gh pr create --title "$(printf '%s' "$info" | jq -r '.name + ": " + .title')" \
+    --body "$(printf '%s' "$info" | jq -r .body)" "$@") || return 1
+  echo "$url"
+  append '{t:"pr",time:$time,ep:$ep,id:$id,url:$u}' --arg id "$id" --arg u "$url"
 }
 
 # the agent manual: the skill next to the real script (clone), else the installed skill
 skill() {
-  _src=$(readlink "$BIN" 2>/dev/null || echo "$BIN")
-  for f in "$(cd "$(dirname "$BIN")" && cd "$(dirname "$_src")" && pwd)/skills/awb-workbench/SKILL.md" \
+  for f in "$(src_dir)/skills/awb-workbench/SKILL.md" \
            "${AWB_SKILL_DIR:-$HOME/.claude/skills}/awb-workbench/SKILL.md"; do
     [ -f "$f" ] && { cat "$f"; return 0; }
   done
@@ -673,6 +719,7 @@ Agents: read the operating manual with '$PROG skill' before driving the board.
   $PROG peers                       agents that are Claude sessions: ID PANE SESSION STATUS
                                     (message them with SendMessage from a Claude main agent)
   $PROG pr ID [gh args...]          push this branch and open a PR, only after a passing check
+  $PROG state | audit               jq fold per agent | protocol violations (Lean monitor)
   $PROG version | skill             version | the agent operating manual (SKILL.md)
   $PROG check ID -- CMD...          acceptance gate: CMD exit 0 -> milestone done (⊢), else failed
   $PROG check ID --lean DIR [ACCEPT.lean]
@@ -752,6 +799,19 @@ selftest() {
       i=$((i + 1)); [ $i -lt 20 ] || die "selftest: tell not delivered"; sleep 0.5; done
   fi
   "$BIN" skill | grep -q "awb check" || die "selftest: skill manual not found"
+  if m=$(model_bin); then
+    "$BIN" audit | grep -q "^g1 done-while-check-rejected" || die "selftest: audit missed done after rejection"
+    # differential test: jq fold (awb state) vs the proven Lean fold on random logs
+    mkdir -p "$t/diff"; n=0
+    while [ $n -lt "${AWB_DIFF_N:-200}" ]; do
+      n=$((n + 1))
+      "$m" gen $n 80 > "$t/diff/events.jsonl"
+      a=$(AWB_DIR=$t/diff "$BIN" state); b=$("$m" fold < "$t/diff/events.jsonl")
+      [ "$a" = "$b" ] || { printf 'jq:\n%s\nlean:\n%s\n' "$a" "$b" >&2; die "selftest: jq fold != Lean model (awbmodel gen $n 80)"; }
+    done
+  else
+    echo "selftest: Lean model not built, skipped audit and differential test (cd model && lake build)" >&2
+  fi
   echo "selftest ok"
 }
 
@@ -816,6 +876,8 @@ case "$cmd" in
   _leave)   _leave "${1:-0}" ;;
   check)    check "$@" ;;
   pr)       pr "$@" ;;
+  state)    state ;;
+  audit)    audit ;;
   version|--version|-V) echo "$PROG $VERSION" ;;
   skill)    skill ;;
   tell)     tell "$@" ;;

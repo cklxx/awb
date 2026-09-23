@@ -1,5 +1,10 @@
 name = "awbmodel"
-defaultTargets = ["AwbModel"]
+defaultTargets = ["AwbModel", "awbmodel"]
 
 [[lean_lib]]
 name = "AwbModel"
+roots = ["AwbModel", "Audit"]
+
+[[lean_exe]]
+name = "awbmodel"
+root = "Main"
