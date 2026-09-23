@@ -28,10 +28,17 @@ append() {
 
 q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 
+# tmux socket; unix socket paths are capped near 104 bytes, deep dirs fall back to /tmp
+sock_path() {
+  _s=$AWB_DIR/sock
+  [ ${#_s} -lt 100 ] || _s=/tmp/awb-$(id -u)-$(printf %s "$AWB_DIR" | cksum | cut -d' ' -f1).sock
+  printf %s "$_s"
+}
+
 # talk to the awb server even when called outside its tmux (main agent, nested sessions)
 tm() {
   if [ -n "${AWB_TMUX_SOCKET:-}" ] && [ -S "$AWB_TMUX_SOCKET" ]; then tmux -S "$AWB_TMUX_SOCKET" "$@"
-  elif [ -S "$AWB_DIR/sock" ]; then tmux -S "$AWB_DIR/sock" "$@"
+  elif [ -S "$(sock_path)" ]; then tmux -S "$(sock_path)" "$@"
   else tmux "$@"; fi
 }
 
@@ -127,7 +134,8 @@ reduce (. // [])[] as $e (
       else .checks[$e.id].steps[$i] += {state:$e.state, ep1:$e.ep, note:$e.note} end
   elif .agents[$e.id] == null then .
   elif $e.t == "now" then
-    .agents[$e.id].current = {text:($e.text // ""), time:($e.time // ""), ep:($e.ep // 0)}
+    (if .agents[$e.id].status == "done" then .agents[$e.id].status = "running" | .agents[$e.id].endEp = null | .agents[$e.id].reason = "" else . end)
+    | .agents[$e.id].current = {text:($e.text // ""), time:($e.time // ""), ep:($e.ep // 0)}
     | .agents[$e.id] += {status:"running", reason:"", endEp:null}
     | .agents[$e.id].lastEp = ($e.ep // .agents[$e.id].lastEp)
   elif $e.t == "done" then
@@ -277,8 +285,8 @@ else
   + ([ $s.agents[] | select(.status == "running" or .status == "blocked")
        | . + {idle:($nowep - .lastEp)} | select(.idle >= ($stale | tonumber)) ] | sort_by(-.idle) as $st
      | if ($st | length) > 0 then ["", $r + "久未更新（≥\(($stale | tonumber) / 60 | floor) 分钟）" + $rs]
-       + [ $st[] | "  " + $r + (.idle | sdur | lpad(7)) + $rs + "  " + (.name | pad(10)) + " "
-           + $dm + ((if .current then .current.text else .reason end) // "" | clip($bw - 24)) + $rs ]
+       + [ $st[] | "  " + (if .status == "blocked" then $y + "▲" else $r + " " end) + (.idle | sdur | lpad(6)) + $rs + "  " + (.name | pad(10)) + " "
+           + $dm + ((if .status == "blocked" then "等：" + .reason elif .current then .current.text else .reason end) // "" | clip($bw - 24)) + $rs ]
        else [] end)
   + ([ $s.torder[] | $s.tasks[.] | select(.state == "ask") ] as $asks
      | if ($asks | length) > 0 then ["", $y + "需要你拍板" + $rs]
@@ -298,7 +306,7 @@ dims() {
 render() {
   set -- $(dims)
   cols=${1:-80}; rows=${2:-24}
-  if [ -n "${TMUX_PANE:-}${TMUX:-}" ] || [ -S "$AWB_DIR/sock" ]; then
+  if [ -n "${TMUX_PANE:-}${TMUX:-}" ] || [ -S "$(sock_path)" ]; then
     live=$(tm list-panes -a -F '#{pane_id}' 2>/dev/null | jq -Rn '[inputs]')
   else
     live='[]'
@@ -328,19 +336,17 @@ nudge_once() {
         if $e.id == null then .
         elif $e.t == "nudge" then .[$e.id].nudged = $e.ep
         elif $e.t == "status" then .[$e.id].last = $e.ep | .[$e.id].st = $e.status
-        elif ($e.t | IN("start","now","done")) then .[$e.id].last = $e.ep | .[$e.id].st = (.[$e.id].st // "running")
+        elif $e.t == "now" then .[$e.id].last = $e.ep | .[$e.id].st = (if .[$e.id].st == "done" then "running" else (.[$e.id].st // "running") end)
+        elif ($e.t | IN("start","done")) then .[$e.id].last = $e.ep | .[$e.id].st = (.[$e.id].st // "running")
         else . end)
     | to_entries[]
-    | select((.value.st // "running") | IN("running","blocked"))
+    | select((.value.st // "running") == "running")
     | select($now - (.value.last // $now) >= $stale)
     | select($now - (.value.nudged // 0) >= $every)
     | "\(.key) \((($now - .value.last) / 60) | floor)"' |
   while read -r id mins; do
-    pane=$(awk -v i="$id" '$1 == i {print $2}' "$AWB_DIR/panes")
-    [ -n "$pane" ] && tm display-message -p -t "$pane" '#{pane_id}' >/dev/null 2>&1 || continue
     msg="[看板自动提醒] 你（${id}）已 ${mins} 分钟没更新看板。请现在报一句结果：AWB_DIR=$AWB_DIR awb now $id \"<结果>\"；卡住用 awb block $id \"<原因>\"；做完用 awb finish $id \"<成果>\"。"
-    printf '%s' "$msg" | tm load-buffer -
-    tm paste-buffer -t "$pane"; sleep 1; tm send-keys -t "$pane" Enter
+    tell "$id" "$msg" 2>/dev/null || continue
     append '{t:"nudge",time:$time,ep:$ep,id:$id}' --arg id "$id"
   done
 }
@@ -362,7 +368,7 @@ watch() {
 up() {
   command -v tmux >/dev/null || die "tmux not installed"
   init_dir
-  SOCK="$AWB_DIR/sock"
+  SOCK=$(sock_path)
   if [ -S "$SOCK" ] && tmux -S "$SOCK" has-session -t awb 2>/dev/null; then
     exec tmux -S "$SOCK" attach-session -t awb
   fi
@@ -393,11 +399,11 @@ run() {
   [ $# -ge 1 ] || die "usage: $PROG run [-g GROUP] ID NAME -- CMD..."
   case $id in *[!A-Za-z0-9_-]* ) die "id must match [A-Za-z0-9_-] (got: $id)";; esac
   init_dir
-  work=$(cat "$AWB_DIR/work-pane" 2>/dev/null) || die "run '$PROG up' first"
+  work=$(cat "$AWB_DIR/work-pane" 2>/dev/null) && [ -n "$work" ] || die "run '$PROG up' first"
   tm list-panes -t "$work" >/dev/null 2>&1 || die "work pane $work gone; restart with '$PROG up'"
   kind=$(basename -- "$1")
   cmdq=$(for a in "$@"; do printf '%s ' "$(q "$a")"; done)
-  sock=${AWB_TMUX_SOCKET:-$AWB_DIR/sock}
+  sock=${AWB_TMUX_SOCKET:-$(sock_path)}
   inner="AWB_DIR=$(q "$AWB_DIR") AWB_TMUX_SOCKET=$(q "$sock") AWB_GROUP=$(q "$group") \
 AWB_AGENT_ID=$(q "$id") AWB_AGENT_NAME=$(q "$name") AWB_AGENT_KIND=$(q "$kind") \
 $(q "$BIN") _enter; rc=0; $cmdq || rc=\$?; \
@@ -419,11 +425,11 @@ tui() {
   id=$1; name=$2; shift 2
   case $id in *[!A-Za-z0-9_-]* ) die "id must match [A-Za-z0-9_-] (got: $id)";; esac
   init_dir
-  work=$(cat "$AWB_DIR/work-pane" 2>/dev/null) || die "run '$PROG up' first"
+  work=$(cat "$AWB_DIR/work-pane" 2>/dev/null) && [ -n "$work" ] || die "run '$PROG up' first"
   tm list-panes -t "$work" >/dev/null 2>&1 || die "work pane gone; restart with '$PROG up'"
   tui_cmd=${AWB_TUI_CMD:-$(command -v claude-db >/dev/null && echo claude-db || echo claude)}
   command -v "${tui_cmd%% *}" >/dev/null || die "$tui_cmd not on PATH (set AWB_TUI_CMD)"
-  sock=${AWB_TMUX_SOCKET:-$AWB_DIR/sock}
+  sock=${AWB_TMUX_SOCKET:-$(sock_path)}
   # resident TUI: register, run interactive claude, drop to shell on exit (pane stays)
   inner="AWB_DIR=$(q "$AWB_DIR") AWB_TMUX_SOCKET=$(q "$sock") AWB_GROUP=$(q "$group") \
 AWB_AGENT_ID=$(q "$id") AWB_AGENT_NAME=$(q "$name") AWB_AGENT_KIND=claude \
@@ -436,13 +442,54 @@ $(q "$BIN") _enter; $tui_cmd; exec $(q "$SHELL")"
   # first message: Chinese working rules + optional task.
   # paste via buffer — a plain Enter does not submit inside the claude TUI.
   task=$*
-  prompt="你好，你已注册到 awb 工作台（agent ID: $id，组: $group）。请始终用中文。工作规则：开始一个阶段先运行 awb now $id \"阶段名\"，完成运行 awb done $id；卡住运行 awb block $id \"原因\"，恢复运行 awb unblock $id；全部完成运行 awb finish $id。"
-  [ -n "$task" ] && prompt="$prompt 首个任务：$task。先 awb now $id 再动手。"
+  prompt="你好，你已注册到 awb 工作台（agent ID: ${id}，组: ${group}）。请始终用中文。工作规则：开始一个阶段先运行 awb now ${id} \"阶段名\"，完成运行 awb done ${id}；卡住运行 awb block ${id} \"原因\"，恢复运行 awb unblock ${id}；全部完成运行 awb finish ${id}。"
+  [ -n "${task}" ] && prompt="${prompt} 首个任务：${task}。先 awb now ${id} 再动手。"
   sleep 3
-  printf '%s' "$prompt" | tm load-buffer -
-  tm paste-buffer -t "$pane"
-  sleep 1
-  tm send-keys -t "$pane" Enter
+  tell "$id" "$prompt"
+}
+
+# ID PANE per agent: $AWB_DIR/panes ("ID PANE" lines, for agents started outside awb)
+# overrides the pane of the latest start event
+agent_panes() {
+  { [ -s "$EV" ] && jq -r 'select(.t=="start" and (.pane // "") != "") | "\(.id) \(.pane)"' "$EV"
+    [ -s "$AWB_DIR/panes" ] && awk 'NF >= 2 {print $1, $2}' "$AWB_DIR/panes"; } \
+  | awk '{ p[$1] = $2; if (!($1 in o)) o[$1] = NR } END { for (i in p) print o[i], i, p[i] }' \
+  | sort -n | cut -d' ' -f2-
+}
+agent_pane() { agent_panes | awk -v i="$1" '$1 == i {print $2}'; }
+
+# type a message into an agent's TUI (claude, codex, any): a named buffer, then Enter.
+# Claude queues it if a turn is running. Plain send-keys Enter does not submit in claude.
+tell() {
+  [ $# -ge 2 ] || die "usage: $PROG tell ID MESSAGE"
+  _id=$1; shift; init_dir
+  _p=$(agent_pane "$_id")
+  [ -n "$_p" ] && tm list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qx "$_p" || die "$_id has no live pane"
+  printf '%s' "$*" | tm load-buffer -b awb-tell -
+  tm paste-buffer -d -b awb-tell -t "$_p"
+  sleep 0.5
+  tm send-keys -t "$_p" Enter
+}
+
+# awb agents that are Claude Code sessions: ID PANE SESSION-NAME STATUS. A main Claude
+# agent messages them over Claude's own session socket with SendMessage(to: SESSION-NAME).
+peers() {
+  init_dir
+  # per file: a registry entry being rewritten must not hide the others
+  _reg=$(for f in "$HOME"/.claude/sessions/*.json; do
+           jq -c '{tmux:(.tmux // ""), name, status, pid}' "$f" 2>/dev/null || true; done | jq -cs .)
+  # pane ids are unique per tmux server; the registry keeps the session a pane started in
+  # (panes move), so match the session name only on awb's own server, where ids collide
+  strict=0; { [ -n "${AWB_TMUX_SOCKET:-}" ] || [ -S "$(sock_path)" ]; } && strict=1
+  agent_panes | while read -r id pane; do
+      sess=$(tm display-message -p -t "$pane" '#{session_name}' 2>/dev/null) || { echo "$id $pane - gone"; continue; }
+      hit=$(printf '%s' "$_reg" | jq -r --arg s "$sess:" --arg p ".$pane" \
+            --argjson strict "$strict" \
+            '.[] | select((.tmux | endswith($p)) and ($strict == 0 or (.tmux | startswith($s))))
+             | "\(.pid) \(.name) \(.status)"' \
+            | while read -r pid n st; do kill -0 "$pid" 2>/dev/null && echo "$n $st"; done | head -1)
+      echo "$id $pane ${hit:-- not-claude}"
+    done
 }
 
 # one acceptance step for the board: step NAME run|ok|fail [NOTE]
@@ -519,6 +566,11 @@ check() {
     [ -n "$why" ] || why="exit $rc"
     append '{t:"status",time:$time,ep:$ep,id:$id,status:"failed",reason:$r,gate:true}' \
       --arg id "$id" --arg r "验收未过($what): $why"
+    # tell the agent, unless the agent ran the check itself and already sees the output
+    if [ "${AWB_NOTIFY:-1}" = 1 ] && [ "$(agent_pane "$id")" != "${TMUX_PANE:-}" ]; then
+      tell "${id}" "awb 验收未过（${what}）：${why}。完整日志：${CHK_LOG}。修复后重新验收：awb check ${id} ..." 2>/dev/null \
+        && echo "notified $id" || true
+    fi
     tail -40 "$CHK_LOG"; echo "rejected: $what (full log: $CHK_LOG)"; return 1
   fi
 }
@@ -554,6 +606,7 @@ $PROG — tmux agent workbench (events in .awb/events.jsonl)
                                     (AWB_TUI_CMD, default claude-db if on PATH else claude)
   $PROG start ID NAME [KIND] [GROUP]  register a non-pane / remote agent
   $PROG goal TEXT                   set the overall goal
+  $PROG stale                       print "ID MINUTES" for running agents silent >= AWB_STALE
   $PROG nudge [--once]              remind silent agents in their pane ($AWB_DIR/panes: "ID PANE")
   $PROG news TEXT                   one progress line (board shows last 5)
                                     board view: AWB_VIEW=brief (default) | full
@@ -567,6 +620,9 @@ $PROG — tmux agent workbench (events in .awb/events.jsonl)
   $PROG unblock ID                  back to running
   $PROG fail ID REASON
   $PROG finish ID [NOTE]            close milestone + mark done
+  $PROG tell ID MESSAGE             type a message into the agent's TUI pane (claude, codex, ...)
+  $PROG peers                       agents that are Claude sessions: ID PANE SESSION STATUS
+                                    (message them with SendMessage from a Claude main agent)
   $PROG check ID -- CMD...          acceptance gate: CMD exit 0 -> milestone done (⊢), else failed
   $PROG check ID --lean DIR [ACCEPT.lean]
                                     Lean 4 gate: lake build, no sorry, ACCEPT.lean theorems
@@ -582,7 +638,7 @@ selftest() {
   S=awbselftest$$
   cleanup() { tmux -L "$S" kill-server 2>/dev/null || true; rm -rf "$t"; }
   trap cleanup EXIT
-  export AWB_DIR=$t
+  export AWB_DIR=$t; EV=$t/events.jsonl
 
   "$BIN" goal "SHIP THE WORKBENCH"
   "$BIN" start a1 claude agent backend
@@ -635,6 +691,9 @@ selftest() {
       sleep 0.5; i=$((i + 1)); done; return 1; }
     seen "demo" || die "selftest: spawned agent not shown"
     seen "✓1" || die "selftest: exit 0 not marked done"
+    AWB_TMUX_SOCKET=$(tmux -L "$S" display-message -p '#{socket_path}') "$BIN" tell z1 "echo told-\$((6*7))"
+    i=0; until tmux -L "$S" capture-pane -p -t "$(agent_pane z1)" | grep -q told-42; do
+      i=$((i + 1)); [ $i -lt 20 ] || die "selftest: tell not delivered"; sleep 0.5; done
   fi
   echo "selftest ok"
 }
@@ -655,6 +714,17 @@ case "$cmd" in
             case $2 in todo|wip|review|blocked|done|drop|ask) ;; *) die "state: todo|wip|review|blocked|done|drop|ask" ;; esac
             append '{t:"task",time:$time,ep:$ep,id:$id,state:$st,text:$text,parent:$par,owner:$own}' \
               --arg id "$1" --arg st "$2" --arg text "${3:-}" --arg par "${4:-}" --arg own "${5:-}" ;;
+  stale)    init_dir; now=$(date +%s)
+            { [ -s "$EV" ] && cat "$EV" || true; } | jq -R -s -r --argjson now "$now" --argjson stale "${AWB_STALE:-600}" '
+              rtrimstr("\n") | if . == "" then [] else split("\n") | map(fromjson? | select(type == "object")) end
+              | reduce .[] as $e ({};
+                  if $e.id == null or $e.t == "nudge" then .
+                  elif $e.t == "status" then .[$e.id].last = $e.ep | .[$e.id].st = $e.status
+                  elif $e.t == "now" then .[$e.id].last = $e.ep | .[$e.id].st = (if .[$e.id].st == "done" then "running" else (.[$e.id].st // "running") end)
+                  elif ($e.t | IN("start","done")) then .[$e.id].last = $e.ep | .[$e.id].st = (.[$e.id].st // "running")
+                  else . end)
+              | to_entries[] | select(.value.st == "running" and $now - .value.last >= $stale)
+              | "\(.key) \((($now - .value.last) / 60) | floor)"' ;;
   nudge)    init_dir; if [ "${1:-}" = "--once" ]; then nudge_once
             else while :; do nudge_once; sleep "${AWB_NUDGE_POLL:-60}"; done; fi ;;
   news)     [ $# -ge 1 ] || die "usage: $PROG news TEXT"
@@ -688,6 +758,8 @@ case "$cmd" in
   _enter)   _enter ;;
   _leave)   _leave "${1:-0}" ;;
   check)    check "$@" ;;
+  tell)     tell "$@" ;;
+  peers)    peers ;;
   selftest) selftest ;;
   ""|-h|--help|help) usage ;;
   *) usage; die "unknown command: $cmd" ;;

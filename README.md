@@ -87,7 +87,30 @@ failed one. ACCEPT.lean must use top-level named `theorem`s; `example`, `lemma`,
 A warm Lean check of `model/` takes about 2s.
 
 Status: ◔ running · ✓ done · ▲ blocked · ✗ failed · ■ dead (pane gone).
-`tmux -S .awb/sock attach -t awb` attaches from another terminal.
+`tmux -S .awb/sock attach -t awb` attaches from another terminal (for a deep project path the
+socket is `/tmp/awb-UID-HASH.sock`, since unix socket paths are limited to about 104 bytes).
+
+## Notify agents
+
+```sh
+awb tell a1 "rebase on main, then re-run the check"   # typed into the agent's TUI pane + Enter
+awb peers                                             # ID PANE CLAUDE-SESSION STATUS
+awb stale                                             # agents silent >= AWB_STALE seconds
+awb nudge                                             # loop: remind silent agents every AWB_NUDGE_EVERY
+```
+
+- `tell` works for any TUI agent (claude, codex, ...) and uses a named tmux buffer, so your
+  own paste buffer is untouched. Claude queues it if a turn is running.
+- A rejected `awb check` tells the agent the reason automatically, unless the agent ran the
+  check from its own pane (`AWB_NOTIFY=0` turns this off).
+- For Claude agents, `peers` maps each agent to its Claude Code session name via
+  `~/.claude/sessions`. A main agent that is itself a Claude session can then message them with
+  its `SendMessage` tool, which goes over Claude's own per-session socket and reaches the agent
+  even mid-turn. awb does not speak that socket protocol itself: it is internal, versioned and
+  authenticated. MCP channels, the documented push route, are unavailable with a custom
+  `ANTHROPIC_BASE_URL`.
+- Agents started outside awb (existing sessions) are mapped in `.awb/panes`, one
+  `ID PANE` per line; it overrides panes from start events.
 
 ## Formal model
 
