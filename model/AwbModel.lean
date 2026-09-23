@@ -10,7 +10,7 @@ inductive St | running | blocked | failed | done | other
 inductive Ev
   | start
   | now (ep : Int)
-  | done (ep : Int) (verified : Bool)
+  | done (ep : Int) (verified : Bool) (hasText : Bool := false)
   | status (s : St) (ep : Int)   -- block/unblock/fail/finish/_leave/`awb status`
   | reject (ep : Int)             -- `awb check` failed
   deriving Repr
@@ -21,9 +21,10 @@ structure A where
   endEp : Option Int
   gate  : Bool         -- a rejected check is pending
   dur   : Int          -- duration of the last closed milestone
+  nd    : Nat          -- closed milestones
   deriving Repr
 
-def A.init : A := ⟨.running, none, none, false, 0⟩
+def A.init : A := ⟨.running, none, none, false, 0, 0⟩
 
 def terminal : St → Bool
   | .done | .failed => true
@@ -40,7 +41,7 @@ def endOf (s : St) (ep : Int) (old : Option Int) : Option Int :=
 def stepOld (a : A) : Ev → A
   | .start => a                                            -- re-start of a known id ignored
   | .now ep => { a with cur := some ep }
-  | .done ep v =>
+  | .done ep v _ =>
       let a := { a with dur := ep - a.cur.getD ep, cur := none }
       if v && a.st == .failed then { a with st := .running, endEp := none } else a
   | .status s ep => { a with st := s, endEp := endOf s ep a.endEp }
@@ -58,15 +59,17 @@ example : (runOld [.start, .status .failed 3, .now 4]).st = .failed := by decide
 example : let a := runOld [.start, .status .done 3, .status .other 4]
           terminal a.st = false ∧ a.endEp.isSome := by decide
 -- Bug 5: out-of-order epochs (concurrent appends, second resolution) give negative durations.
-example : (runOld [.start, .now 10, .done 9 false]).dur < 0 := by decide
+example : (runOld [.start, .now 10, .done 9 false false]).dur < 0 := by decide
 
 /-! ## Fixed fold -/
 
 def step (a : A) : Ev → A
   | .start => { a with st := .running, endEp := none }
   | .now ep => { a with cur := some ep, st := .running, endEp := none }
-  | .done ep v =>
-      let a := { a with dur := max 0 (ep - a.cur.getD ep), cur := none }
+  | .done ep v t =>
+      -- a passing check with no open milestone verifies the last closed one (no new entry)
+      let a := if v && a.cur.isNone && 0 < a.nd && !t then a
+               else { a with dur := max 0 (ep - a.cur.getD ep), cur := none, nd := a.nd + 1 }
       if v then
         if a.st == .failed then { a with gate := false, st := .running, endEp := none }
         else { a with gate := false }
@@ -92,8 +95,9 @@ theorem inv_step (a : A) (e : Ev) (h : Good a) : Good (step a e) := by
   cases e with
   | start => exact ⟨by simp [step, terminal], by simp [step], by simp [step], h4⟩
   | now ep => exact ⟨by simp [step, terminal], by simp [step], by simp [step], h4⟩
-  | done ep v =>
-      cases v <;> cases hs : a.st <;> simp_all [step, terminal, Good, Int.le_max_left]
+  | done ep v t =>
+      cases v <;> simp only [step] <;> (repeat' split) <;> cases hs : a.st <;>
+        simp_all [terminal, Good, Int.le_max_left]
   | status s ep =>
       refine ⟨?_, ?_, ?_, ?_⟩ <;> cases s <;> cases hg : a.gate <;>
         simp_all [step, terminal, endOf]

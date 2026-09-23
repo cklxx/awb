@@ -15,6 +15,12 @@ else
   curl -fsSL "$url/awb" -o "$bin/awb.tmp" && chmod +x "$bin/awb.tmp" && mv "$bin/awb.tmp" "$bin/awb"
   rm -f "$skill/SKILL.md"; curl -fsSL "$url/SKILL.md" -o "$skill/SKILL.md"
 fi
+# optional: the compiled Lean model enables `awb audit` and the differential selftest
+if [ -f "$here/model/lakefile.toml" ]; then
+  lake=$(command -v lake || echo "$HOME/.elan/bin/lake")
+  if [ -x "$lake" ]; then (cd "$here/model" && "$lake" build -q) && echo "built Lean model: awb audit enabled"
+  else echo "no Lean (elan): awb audit disabled"; fi
+fi
 for c in tmux jq; do command -v "$c" >/dev/null || echo "missing: $c (required)"; done
 case ":$PATH:" in *":$bin:"*) ;; *) echo "add to PATH: $bin" ;; esac
 echo "installed $("$bin/awb" version) -> $bin/awb"

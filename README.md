@@ -119,21 +119,32 @@ awb pr fix1                          # pushes the branch; refuses without a pass
 CI does not test; it only publishes: pushing a tag `vX.Y.Z` that matches `VERSION` in `awb`
 creates a GitHub release with `awb` attached.
 
-## Formal model
+## Verification chain
 
-`model/AwbModel.lean` models the per-agent fold. It reproduces five bugs of the earlier
-fold as checked counterexamples (a rejected check overwritten by `done`, re-run id stuck
-in `done`, `now` after `fail` stuck in `failed`, unknown status freezing duration, negative
-durations) and proves that the current fold keeps these invariants for every event sequence:
+Every link from the event log to a merged PR is either proven in Lean or tested against the
+proven model:
 
-- duration is frozen iff the agent is done or failed;
-- no `done` while a rejected check is pending;
-- only known states;
-- durations are non-negative.
+| link | how | where |
+|---|---|---|
+| status fold (events → agent state) | proven: duration frozen iff ended, no `done` while a check is rejected, only known states, non-negative durations | `model/AwbModel.lean` |
+| jq fold in `awb` = Lean fold | differential test on random logs (`awb selftest`, 200 logs; 1000 run clean) | `awb state` vs `awbmodel fold` |
+| protocol audit | proven: the one-pass monitor reports nothing iff every event obeys the rules given its prefix (`audit_iff_clean`); corollary: every PR in a clean log followed a passing check | `model/Audit.lean` |
+| deliverables | `awb check` (tests, or Lean with kernel-checked theorems and standard axioms only) | `awb check` |
+| merge | `awb pr` refuses without a passing check or with audit violations, and logs the PR for the audit | `awb pr` |
+
+Audit rules, per agent: a verified milestone must follow a passing check (forged `verified`
+events are caught), a PR must follow a passing check, and `done` must not be claimed while a
+check is rejected. Violations show on the board under 审计违规 and via `awb audit`.
+
+`model/Main.lean` compiles the proven fold and monitor into `awbmodel`, which `awb` finds at
+`model/.lake/build/bin/awbmodel` (or `AWB_MODEL`); `./install.sh` in a clone builds it when
+Lean is installed. Without it, `awb audit` is unavailable and selftest skips the
+differential test. Proofs are checked with:
 
 ```sh
 awb check model --lean model model/Accept.lean
 ```
 
-The jq fold in `awb` is kept in step with `step` in the model by hand; `awb selftest`
-covers the same regressions.
+Limits: events are appended by agents, so the audit flags a forged `verified` event but
+cannot stop an agent that also forges the check events; the jq fold is tested against the
+model, not proven.
