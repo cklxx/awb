@@ -26,6 +26,12 @@ plain `done`s); the full view tags an unverified finished milestone with a dim `
 - An agent's own `done` is a claim. `awb check` runs a check the main agent chose; only a
   passing check marks the milestone verified (`⊢`), and a rejected check blocks `done`
   until a later check passes.
+- `awb metric NAME VALUE TARGET [NOTE]` is a render-only single indicator: the latest event
+  shows under GOAL in the brief view as `NAME VALUE / TARGET ▕bar▏pct% NOTE`. It has no id
+  and is ignored by the proven fold/audit — the fold drops any unknown event whose id is not
+  a string (or whose agent is absent), matching the Lean parser's `_ => none` (a fixed
+  unknown-event differential case pins this) — and render reads it from the same piped event
+  array, so it never changes agent state and the log is read once per redraw.
 
 ## Install
 
@@ -82,6 +88,7 @@ awb fail  a2 "tests red"
 awb task t1 wip "build API"                  # STATE todo|wip|review|blocked|done|drop|ask
 awb task t2 todo "auth" t1 a1                # [TEXT] [PARENT] [OWNER]; re-issue to update
 awb news "API merged"                        # board shows the last 5
+awb metric tps 32 40 "V100 target"      # brief: one value/target bar under GOAL
 
 # acceptance
 awb check a1 -- pytest -q ~/accept/test_a1.py       # any command, exit 0 = accepted
