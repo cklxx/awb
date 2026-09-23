@@ -284,7 +284,9 @@ else
    | ([$s.tasks[] | select(.state == "ask")] | length) as $na
    | "╰─ 总进度 " + bar($tp.d; $tp.t; 20) + " \($tp.d)/\($tp.t)"
      + (if $na > 0 then "  · 需要你拍板 \($na) 件" else "" end) + "   " + $now) as $bfoot
-  | ([$top] + [$goal_lines[] | "│ " + .] + [($bfoot | clip($bw))] + [""]
+  | ("   agent \($n) 个：◔ 在做 \($c.running // 0) · ▲ 等待 \($c.blocked // 0) · ✓ 完成 \($c.done // 0)"
+     + (if (($c.failed // 0) + ($c.dead // 0)) > 0 then " · ✗ \(($c.failed // 0) + ($c.dead // 0))" else "" end)) as $bagents
+  | ([$top] + [$goal_lines[] | "│ " + .] + [($bfoot | clip($bw)), ($dm + ($bagents | clip($bw)) + $rs)] + [""]
   + ([ kids($s.tasks; $s.torder; "")[] as $root | $s.tasks[$root] as $rt
        | prog($s.tasks; leaves($s.tasks; $s.torder; $root)) as $rp
        | [$cy + "■ " + ($rt.text | clip($bw - 25) | pad($bw - 25)) + $rs + " " + bar($rp.d; $rp.t; 12) + $dm + " \($rp.d)/\($rp.t)" + $rs]
@@ -820,7 +822,7 @@ selftest() {
   "$BIN" task l1 done "" r
   out=$(AWB_VIEW=full "$BIN" render)
   brief=$("$BIN" render)
-  for s in "■ root" "进度" ; do printf "%s" "$brief" | grep -Fq -- "$s" || die "selftest: brief missing $s"; done
+  for s in "■ root" "进度" "agent 2 个" ; do printf "%s" "$brief" | grep -Fq -- "$s" || die "selftest: brief missing $s"; done
   for s in "SHIP THE WORKBENCH" "✓ wire event log" "▸ render board" \
            "▲ waiting on review" "2 agents" "✓0" "◔1" "▲1" "◆ backend" "◆ frontend" "■ root" "├─ ✓ leaf" "└─ ◔ open" "1/2 任务"; do
     printf '%s' "$out" | grep -Fq -- "$s" || die "selftest: missing '$s'"
