@@ -48,7 +48,7 @@ card() {
     columns:[{tag:"column", width:"weighted", weight:1, padding:"8px 10px", elements:[{tag:"markdown", content:$md}]}]};
   . as $s
   | ($s.need | map(select(.kind == "fail")) | length) as $nfail
-  | {"done":"✓","wip":"◔","review":"◑","blocked":"▲","todo":"○"} as $TI
+  | {"done":"✓","wip":"◔","review":"◑","blocked":"▲","todo":"○","unknown":"?"} as $TI
   | {schema:"2.0",
      config:{update_multi:true, width_mode:"fill", summary:{content:$s.headline}},
      header:{
