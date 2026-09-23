@@ -30,13 +30,22 @@ type commands:
    worker's Claude is ready and prints `<id> session: <session name>`. If it prints "answer the
    folder-trust prompt", ask the user to confirm trust in that pane; neither awb nor you makes
    that decision for them.
-3. Dispatch: `awb now <id> "<task in one line>"`, then SendMessage(to: <session name>,
-   message: <task>, notify_when_idle: true). It travels over Claude's own session socket and
-   reaches the worker even mid-turn.
-4. Results: the worker usually replies with a message; otherwise the idle notice carries its
-   last report. On either, `awb done <id> "<result in one line>"`. Gate deliverables with
-   `awb check <id> -- <command>` and open the PR with `awb pr <id>` once it passes; record a
-   blocker with `awb block <id> "<reason>"`.
+3. Dispatch: `msg=$(awb send <id> "<task in one line>")`, then SendMessage(to: <session name>,
+   message: <msg>, notify_when_idle: true). The message carries a key `[awb <id>#<key>]` the
+   worker's reply must echo. awb allows one open task per worker; send the next one after the
+   reply. The message travels over Claude's own session socket and arrives even mid-turn.
+4. Results:
+   - A reply starting with `[awb <id>#<key>]` → `awb reply <id> <key> "<result in one line>"`.
+     A reply with another key is stale or duplicate; awb ignores it.
+   - An idle notice → `awb idle <id>`. The first time it prints an ask; SendMessage it (again
+     with notify_when_idle). The second time it marks the task blocked: tell the user, since the
+     worker's session is probably holding your message for its user's approval.
+   - The worker exited → `awb fail <id> "exited"`.
+   - Gate deliverables with `awb check <id> -- <command>`, then `awb pr <id>`.
+   - After a restart or compaction, `awb pending` lists open tasks with their keys and the
+     workers' session status; continue with `awb idle` for each.
+   Never mark a task done from an idle notice alone: TLC found that this marks undone work done
+   (`model/tla/AwbLoop.tla`).
 5. Subagents you start with your Agent tool can be on the board too: `awb start <id> <name>`
    and `awb now` before starting, `awb done` when the result comes back.
 
@@ -72,6 +81,8 @@ socket is `/tmp/awb-UID-HASH.sock`).
 | `awb fail ID REASON` / `awb finish ID [NOTE]` | failed / close the last milestone and mark done |
 | `awb check ID -- CMD...` | acceptance gate: CMD exits 0 → milestone verified (`⊢`); else the agent turns ✗ with the reason on the board, log in `.awb/check-ID.log` |
 | `awb check ID --lean DIR [ACCEPT.lean]` | Lean 4 gate: `lake build`, no sorry/admit in sources, ACCEPT.lean theorems typecheck against the build with standard axioms only |
+| `awb send ID TASK` / `awb reply ID KEY [RESULT]` | open a keyed task and print the message to send / close it when the reply echoes the key |
+| `awb idle ID` / `awb pending` | on an idle notice: print an ask once, then mark blocked / open tasks with keys and worker status |
 | `awb pr ID [gh args]` | push the current branch and open a PR; refused unless the agent's latest check passed; the body lists milestones and check steps |
 | `awb tell ID MSG` | type a message into the agent's TUI pane and press Enter (claude/codex; Claude queues it when busy) |
 | `awb peers` | each agent's Claude session name and busy/idle |
