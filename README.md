@@ -48,10 +48,15 @@ awb board                 # board beside the main agent's tmux pane
 awb tui -g g w1 worker    # a Claude worker; prints "w1 session: <name>" once it is ready
 ```
 
-The main agent then marks `awb now w1 "<task>"`, sends the task with its SendMessage tool
+The main agent dispatches with `msg=$(awb send w1 "<task>")` and its SendMessage tool
 (`to: <name>`, `notify_when_idle: true`), which travels over Claude's own per-session socket
-and reaches the worker even mid-turn, and on the idle notice records `awb done w1 "<result>"`,
-or gates it with `awb check` / `awb pr`. The skill (`awb skill`) spells out this protocol.
+and reaches the worker even mid-turn. The message carries a key; the worker's reply echoes it
+and the main records `awb reply w1 <key> "<result>"`. On an idle notice without a reply,
+`awb idle w1` asks once and then marks the task blocked for the user. One open task per
+worker; `awb pending` recovers open tasks after a restart. `model/tla/AwbLoop.tla` shows why:
+with the earlier protocol TLC finds a reply closing the wrong task, a held message counted as
+done, and a task lost; the keyed protocol passes both "done only for done work" and "every
+task ends done or blocked". The skill (`awb skill`) spells out this protocol.
 `tui` waits for the worker to register with Claude before typing anything; it never answers
 the folder-trust prompt, it asks you to. Several boards: one `.awb` per project, or `AWB_DIR`.
 
@@ -150,6 +155,7 @@ proven model:
 | protocol audit | proven: the one-pass monitor reports nothing iff every event obeys the rules given its prefix (`audit_iff_clean`); corollary: every PR in a clean log followed a passing check | `model/Audit.lean` |
 | deliverables | `awb check` (tests, or Lean with kernel-checked theorems and standard axioms only) | `awb check` |
 | merge | `awb pr` refuses without a passing check or with audit violations, and logs the PR for the audit | `awb pr` |
+| dispatch/report loop (main ↔ worker) | TLA+ with liveness: no false done, no lost task | `model/tla/AwbLoop.tla` |
 | concurrency (check, pr, tell vs the agent) | TLA+, model-checked with TLC: `*Old.cfg` reproduces the races of 0.0.5, `*Fixed.cfg` passes | `model/tla/` |
 
 Races TLC found in 0.0.5, now fixed and covered by selftest: a check that passed after the

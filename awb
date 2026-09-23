@@ -536,6 +536,52 @@ open_ms() {
   grep -F "\"id\":\"$1\"" "$EV" | grep -E '"t":"(now|done)"' | tail -1 | jq -r 'select(.t == "now") | "\(.ep) \(.text)"'
 }
 
+# dispatch/report loop with a worker over the session socket (model/tla/AwbLoop.tla):
+# one open task per worker, each with a key its reply must echo; an idle notice never closes a
+# task: the first makes the main ask once, the second marks the task blocked for the user.
+open_key() {
+  [ -s "$EV" ] || return 0
+  grep -F "\"id\":\"$1\"" "$EV" | grep -E '"t":"(now|done)"' | tail -1 | jq -r 'select(.t == "now") | .key // empty'
+}
+send() {
+  [ $# -ge 2 ] || die "usage: $PROG send ID TASK   (prints the message to SendMessage)"
+  id=$1; shift; init_dir
+  k=$(open_key "$id"); [ -z "$k" ] || die "$id already has open task #$k; wait for its reply (or: $PROG idle $id)"
+  k=$(date +%s | tail -c 5)$(printf %02d $(( $$ % 100 )))
+  append '{t:"now",time:$time,ep:$ep,id:$id,text:$x,key:$k}' --arg id "$id" --arg x "$*" --arg k "$k"
+  printf '[awb %s#%s] %s\n做完后回复一行：以 [awb %s#%s] 开头，写结果（做不了也照此格式说明原因）。\n' "$id" "$k" "$*" "$id" "$k"
+}
+reply() {
+  [ $# -ge 2 ] || die "usage: $PROG reply ID KEY [RESULT]"
+  id=$1; k=$2; shift 2; init_dir
+  [ "$(open_key "$id")" = "$k" ] || die "no open task #$k for $id (stale or duplicate reply): ignored"
+  append '{t:"done",time:$time,ep:$ep,id:$id,text:(if $x == "" then null else $x end),key:$k}' \
+    --arg id "$id" --arg x "$*" --arg k "$k"
+  echo "closed $id #$k"
+}
+idle() {
+  [ $# -ge 1 ] || die "usage: $PROG idle ID"
+  id=$1; init_dir
+  k=$(open_key "$id"); [ -n "$k" ] || { echo "$id: no open task"; return 0; }
+  if grep -F "\"id\":\"$id\"" "$EV" | grep -F '"t":"ask"' | grep -qF "\"key\":\"$k\""; then
+    append '{t:"status",time:$time,ep:$ep,id:$id,status:"blocked",reason:$r}' --arg id "$id" \
+      --arg r "空闲两次仍未汇报 #${k}：消息可能在对方会话里等用户批准，请用户去看"
+    echo "blocked $id #$k: tell the user (the worker's session may be holding the message for approval)"
+  else
+    append '{t:"ask",time:$time,ep:$ep,id:$id,key:$k}' --arg id "$id" --arg k "$k"
+    printf '[awb %s#%s] 请汇报这个任务的结果：以 [awb %s#%s] 开头回复一行。\n' "$id" "$k" "$id" "$k"
+  fi
+}
+pending() {
+  init_dir
+  st=$(peers)
+  for id in $(agent_panes | cut -d' ' -f1; [ -s "$EV" ] && jq -r 'select(.t == "start") | .id' "$EV"); do echo "$id"; done | awk '!s[$0]++' |
+  while read -r id; do
+    k=$(open_key "$id"); [ -n "$k" ] || continue
+    printf '%s #%s %s\n' "$id" "$k" "$(printf '%s\n' "$st" | awk -v i="$id" '$1 == i {print $3, $4}')"
+  done
+}
+
 # open a PR for an agent's work from the current git checkout, only when the agent's
 # latest `awb check` passed; the body lists its milestones and that check's steps
 pr() {
@@ -756,8 +802,8 @@ Agents: read the operating manual with '$PROG skill' before driving the board.
 Chat-driven: you talk to one Claude (the main agent); it keeps the board and runs workers:
   $PROG board                       board beside the main agent's tmux pane
   $PROG tui ID NAME                 start a Claude worker; prints its session name
-  then SendMessage(to: <session>, message: task, notify_when_idle: true) over Claude's
-  session socket, '$PROG now ID task' on dispatch, '$PROG done ID "<result>"' on the idle notice.
+  msg=$($PROG send ID "task"); SendMessage(to: <session>, message: $msg, notify_when_idle: true);
+  on a reply "[awb ID#KEY] ...": $PROG reply ID KEY "result"; on an idle notice: $PROG idle ID.
   Several boards: one .awb per project dir, or \$AWB_DIR.
 
   $PROG up                          tmux session: milestone board + work area
@@ -786,6 +832,10 @@ Chat-driven: you talk to one Claude (the main agent); it keeps the board and run
   $PROG tell ID MESSAGE             type a message into the agent's TUI pane (claude, codex, ...)
   $PROG peers                       agents that are Claude sessions: ID PANE SESSION STATUS
                                     (message them with SendMessage from a Claude main agent)
+  $PROG send ID TASK                open a keyed task; prints the message for SendMessage
+  $PROG reply ID KEY [RESULT]       close the task whose key the worker's reply echoes
+  $PROG idle ID                     on an idle notice: prints an ask once, then marks blocked
+  $PROG pending                     open tasks with keys and worker session/status
   $PROG pr ID [gh args...]          push this branch and open a PR, only after a passing check
   $PROG board                       split a board pane beside the current tmux pane
   $PROG state | audit               jq fold per agent | protocol violations (Lean monitor)
@@ -839,6 +889,19 @@ selftest() {
   out=$(AWB_VIEW=full "$BIN" render)
   printf '%s' "$out" | grep -Fq "⊢ shipped" || die "selftest: late check did not verify last milestone"
   ! printf '%s' "$out" | grep -Fq "⊢ milestone" || die "selftest: late check added a phantom milestone"
+  # bash 3.2 swallows a following non-ASCII byte into an unbraced variable name: brace them
+  ! LC_ALL=C grep -nE '[$][A-Za-z_][A-Za-z0-9_]*[^ -~]' "$BIN" >&2 || die "selftest: unbraced \$var before non-ASCII text"
+  # dispatch/report loop (model/tla/AwbLoop.tla)
+  "$BIN" start w9 worker
+  m=$("$BIN" send w9 "count files"); k=$(printf '%s' "$m" | sed -n '1s/^\[awb w9#\([0-9]*\)\].*/\1/p')
+  [ -n "$k" ] || die "selftest: send printed no key"
+  ! "$BIN" send w9 "second task" 2>/dev/null || die "selftest: second open task accepted"
+  ! "$BIN" reply w9 000 "wrong" 2>/dev/null || die "selftest: reply with a wrong key closed a task"
+  "$BIN" idle w9 | grep -q "请汇报" || die "selftest: first idle did not ask"
+  "$BIN" reply w9 "$k" "12 files" >/dev/null
+  AWB_VIEW=full "$BIN" render | grep -q "✓ 12 files" || die "selftest: keyed reply did not close the task"
+  m=$("$BIN" send w9 "held one"); "$BIN" idle w9 >/dev/null; "$BIN" idle w9 | grep -q "^blocked" \
+    || die "selftest: second silent idle did not block"
   # races found by model/tla (real concurrent processes)
   "$BIN" start s1 stale; "$BIN" now s1 "m1"
   "$BIN" check s1 -- sleep 1 >/dev/null 2>&1 & sleep 0.4; "$BIN" now s1 "m2"; wait
@@ -960,6 +1023,10 @@ case "$cmd" in
   _leave)   _leave "${1:-0}" ;;
   check)    check "$@" ;;
   pr)       pr "$@" ;;
+  send)     send "$@" ;;
+  reply)    reply "$@" ;;
+  idle)     idle "$@" ;;
+  pending)  pending ;;
   state)    state ;;
   board)    board ;;
   audit)    audit ;;
