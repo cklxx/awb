@@ -284,7 +284,7 @@ else
    | ([$s.tasks[] | select(.state == "ask")] | length) as $na
    | "╰─ 总进度 " + bar($tp.d; $tp.t; 20) + " \($tp.d)/\($tp.t)"
      + (if $na > 0 then "  · 需要你拍板 \($na) 件" else "" end) + "   " + $now) as $bfoot
-  | ("   agent \($n) 个：◔ 在做 \($c.running // 0) · ▲ 等待 \($c.blocked // 0) · ✓ 完成 \($c.done // 0)"
+  | ("   agent \($n) 个：◔ 在做 \($c.running // 0) · ▲ 等待 \($c.blocked // 0) · ○ 空闲 \($c.done // 0)"
      + (if (($c.failed // 0) + ($c.dead // 0)) > 0 then " · ✗ \(($c.failed // 0) + ($c.dead // 0))" else "" end)) as $bagents
   | ([$top] + [$goal_lines[] | "│ " + .] + [($bfoot | clip($bw)), ($dm + ($bagents | clip($bw)) + $rs)] + [""]
   + ([ kids($s.tasks; $s.torder; "")[] as $root | $s.tasks[$root] as $rt
