@@ -12,7 +12,8 @@ the `ω` mouth, as in (・ω・). It watches your agents.
 
 The board above (`AWB_VIEW=full`, demo data) shows the task tree, the acceptance runs with
 each step, and per-group agents with their milestones; `⊢` marks a milestone that passed
-`awb check`.
+`awb check`. The brief footer counts `里程碑 已核 M / 自报 K` (verified `⊢` milestones vs
+plain `done`s); the full view tags an unverified finished milestone with a dim `自报`.
 
 ## Model
 

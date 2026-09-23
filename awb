@@ -260,8 +260,12 @@ fold
       + [ range(0; $nc) as $j | $ch[$j] as $c
           | ($ind + (if $j == $nc - 1 then "└─ " else "├─ " end)) as $pre
           | if $c.k == "done" then
-              $g + $pre + "✓ " + ($c.text | clip($inner - 26) | pad($inner - 26)) + $dm
-              + ((($c.dur // null) | sdur) | lpad(6)) + " " + $c.time + $rs
+              (($c.text | startswith("⊢ ")) | not) as $unv
+              | $g + $pre + "✓ "
+              + ($c.text | clip($inner - (if $unv then 32 else 26 end))
+                         | pad($inner - (if $unv then 32 else 26 end)))
+              + (if $unv then $dm + " 自报 " + $rs else "" end)
+              + $dm + ((($c.dur // null) | sdur) | lpad(6)) + " " + $c.time + $rs
             elif $c.k == "cur" then
               $cy + $pre + "▸ " + ($c.text | clip($inner - 26) | pad($inner - 26))
               + ((($nowep - $c.ep) | sdur) | lpad(6)) + " 进行" + $rs
@@ -286,7 +290,10 @@ else
      + (if $na > 0 then "  · 需要你拍板 \($na) 件" else "" end) + "   " + $now) as $bfoot
   | ("   agent \($n) 个：◔ 在做 \($c.running // 0) · ▲ 等待 \($c.blocked // 0) · ○ 空闲 \($c.done // 0)"
      + (if (($c.failed // 0) + ($c.dead // 0)) > 0 then " · ✗ \(($c.failed // 0) + ($c.dead // 0))" else "" end)) as $bagents
-  | ([$top] + [$goal_lines[] | "│ " + .] + [($bfoot | clip($bw)), ($dm + ($bagents | clip($bw)) + $rs)] + [""]
+  | ([$s.agents[].done[]? | .text // ""]) as $mdone
+  | ([$mdone[] | select(startswith("⊢ "))] | length) as $mver
+  | ("   里程碑 已核 \($mver) / 自报 \(( $mdone | length) - $mver)") as $bmil
+  | ([$top] + [$goal_lines[] | "│ " + .] + [($bfoot | clip($bw)), ($dm + ($bagents | clip($bw)) + $rs), ($dm + ($bmil | clip($bw)) + $rs)] + [""]
   + ([ kids($s.tasks; $s.torder; "")[] as $root | $s.tasks[$root] as $rt
        | prog($s.tasks; leaves($s.tasks; $s.torder; $root)) as $rp
        | [$cy + "■ " + ($rt.text | clip($bw - 25) | pad($bw - 25)) + $rs + " " + bar($rp.d; $rp.t; 12) + $dm + " \($rp.d)/\($rp.t)" + $rs]
@@ -878,12 +885,16 @@ selftest() {
     printf '%s' "$out" | grep -Fq -- "$s" || die "selftest: missing '$s'"
   done
   printf '%s' "$out" | grep -Eq '1s| [0-9]:[0-9][0-9]' || die "selftest: no durations"
+  # verified vs self-reported milestones: a1 has one done, none verified yet
+  printf '%s' "$brief" | grep -Fq "里程碑 已核 0 / 自报 1" || die "selftest: brief milestone verify/self count wrong"
+  printf '%s' "$out" | grep -F "✓ wire event log" | grep -Fq "自报" || die "selftest: unverified done not marked 自报"
 
   "$BIN" now a1 "gated"
   ! "$BIN" check a1 -- false >/dev/null || die "selftest: failing check accepted"
   AWB_VIEW=full "$BIN" render | grep -Fq "✗1" || die "selftest: rejected check not failed"
   "$BIN" check a1 -- true >/dev/null || die "selftest: passing check rejected"
   AWB_VIEW=full "$BIN" render | grep -Fq "⊢ gated" || die "selftest: verified milestone not marked"
+  ! AWB_VIEW=full "$BIN" render | grep -F "⊢ gated" | grep -Fq "自报" || die "selftest: verified milestone wrongly marked 自报"
   ! "$BIN" pr a2 2>/dev/null || die "selftest: pr opened without a passing check"
   "$BIN" start v1 late; "$BIN" now v1 "shipped"; "$BIN" done v1; "$BIN" check v1 -- true >/dev/null
   out=$(AWB_VIEW=full "$BIN" render)
