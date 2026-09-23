@@ -1,0 +1,5 @@
+name = "awbmodel"
+defaultTargets = ["AwbModel"]
+
+[[lean_lib]]
+name = "AwbModel"

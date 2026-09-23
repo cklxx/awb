@@ -1,0 +1,610 @@
+#!/bin/sh
+# awb — tmux agent workbench.
+# Source of truth: .awb/events.jsonl (append-only). Any agent that can exec a
+# process can drive the board; the renderer shows goals and milestones, never
+# agent process output.
+set -eu
+
+PROG=$(basename "$0")
+AWB_DIR=${AWB_DIR:-$PWD/.awb}
+EV=$AWB_DIR/events.jsonl
+TS_FMT=%H:%M:%S
+ESC=$(printf '\033')
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+
+init_dir() {
+  mkdir -p "$AWB_DIR" || die "cannot create $AWB_DIR"
+  AWB_DIR=$(cd "$AWB_DIR" && pwd)
+  EV=$AWB_DIR/events.jsonl
+}
+
+# append '<jq filter>' [jq args...] — $time (clock) and $ep (epoch) available
+append() {
+  init_dir
+  _f=$1; shift
+  jq -cn --arg time "$(date +$TS_FMT)" --argjson ep "$(date +%s)" "$_f" "$@" >> "$EV"
+}
+
+q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+# talk to the awb server even when called outside its tmux (main agent, nested sessions)
+tm() {
+  if [ -n "${AWB_TMUX_SOCKET:-}" ] && [ -S "$AWB_TMUX_SOCKET" ]; then tmux -S "$AWB_TMUX_SOCKET" "$@"
+  elif [ -S "$AWB_DIR/sock" ]; then tmux -S "$AWB_DIR/sock" "$@"
+  else tmux "$@"; fi
+}
+
+BIN=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+
+JQ_RENDER='
+def wide($c):
+  ($c >= 4352 and $c <= 4447) or ($c >= 11904 and $c <= 42191)
+  or ($c >= 44032 and $c <= 55203) or ($c >= 63744 and $c <= 64255)
+  or ($c >= 65072 and $c <= 65103) or ($c >= 65280 and $c <= 65376)
+  or ($c >= 65504 and $c <= 65510) or ($c >= 131072 and $c <= 262141);
+def cw($c): if wide($c) then 2 else 1 end;
+def dwidth: [explode[] | cw(.)] | add // 0;
+def clip($n):
+  (gsub("[[:cntrl:]]"; " ")) as $s
+  | if $n <= 0 then ""
+    elif ($s | dwidth) <= $n then $s
+    else ([($s | explode[]) as $c | {c:$c, w:cw($c)}]
+          | reduce .[] as $x ({a:[], w:0};
+              if .w + $x.w > ($n - 1) then .
+              else .a += [$x.c] | .w += $x.w end)
+          | (.a | implode) + "…")
+    end;
+def pad($n):
+  . as $s | ($n - ($s | dwidth)) as $slack
+  | if $slack <= 0 then $s else $s + (" " * $slack) end;
+def pad2: if . < 10 then "0" + tostring else tostring end;
+def hms:
+  (.) as $s | ($s / 3600 | floor) as $h
+  | (($s % 3600) / 60 | floor) as $m | ($s % 60 | floor) as $sc
+  | if $h > 0 then "\($h):\($m|pad2):\($sc|pad2)" else "\($m):\($sc|pad2)" end;
+def dur: (if . == null then "--:--" else hms end) as $t
+  | (" " * (8 - (($t|length) | if . > 8 then 8 else . end))) + $t;
+def sdur:
+  if . == null then "·"
+  elif . < 60 then "\(.)s"
+  elif . < 3600 then "\((. / 60 | floor)):\((. % 60) | pad2)"
+  else "\((. / 3600 | floor)):\(((. % 3600) / 60 | floor) | pad2):\((. % 60) | pad2)" end;
+def bar($d; $t; $n):
+  (if $t == 0 then 0 else ($d * $n / $t | floor) end) as $f
+  | ("█" * $f) + ("░" * ($n - $f));
+def kids($T; $O; $id): [$O[] | select(($T[.].parent // "") == $id and (($T[.].state) | IN("ask","drop") | not))];
+def leaves($T; $O; $id): kids($T; $O; $id) as $k
+  | if ($k | length) == 0 then [$id] else [$k[] | leaves($T; $O; .)[]] end;
+def tree($T; $O; $id; $pre): kids($T; $O; $id) as $k | ($k | length) as $n
+  | [range(0; $n) as $i | ($i == $n - 1) as $l
+     | [{pre:($pre + (if $l then "└─ " else "├─ " end)), t:$T[$k[$i]], depth:($pre | length)}]
+       + tree($T; $O; $k[$i]; $pre + (if $l then "   " else "│  " end))] | add // [];
+def prog($T; $ids): [$ids[] | $T[.] | select(.state != "drop")] as $x
+  | {d:([$x[] | select(.state == "done")] | length), t:($x | length)};
+def live: .current != null and (.status == "running" or .status == "blocked");
+def lpad($n):
+  . as $s | (" " * ($n - (($s|length) | if . < 0 then 0 elif . > $n then $n else . end))) + $s;
+def wrap($n):
+  if length == 0 then [""]
+  else (reduce (explode[]) as $c ({lines:[[]], w:0};
+          cw($c) as $cw
+          | if .w + $cw > $n then .lines += [[$c]] | .w = $cw
+            else .lines[-1] += [$c] | .w += $cw end)
+        | [.lines[] | implode])
+  end;
+
+($w   | if . < 40 then 40 elif . > 240 then 240 else . end) as $w |
+($h   | if . < 12 then 12 elif . > 200 then 200 else . end) as $h |
+($w - 1) as $inner |
+
+reduce (. // [])[] as $e (
+  {goal:"", agents:{}, gorder:{}, gseen:[], tasks:{}, torder:[], news:[]};
+  if   $e.t == "goal" then .goal = $e.text
+  elif $e.t == "news" then .news += [{text:$e.text, time:($e.time // "")}]
+  elif $e.t == "task" then
+    (if .tasks[$e.id] == null then .torder += [$e.id] else . end)
+    | .tasks[$e.id] = ((.tasks[$e.id] // {id:$e.id, state:"todo", text:$e.id, parent:"", owner:""})
+        + ({state:$e.state, text:$e.text, parent:$e.parent, owner:$e.owner}
+           | with_entries(select(.value != null and .value != ""))))
+  elif $e.t == "start" then
+    if .agents[$e.id] != null then
+      .agents[$e.id] += {status:"running", reason:"", endEp:null,
+                         pane:($e.pane // .agents[$e.id].pane), lastEp:($e.ep // .agents[$e.id].lastEp)}
+    else ($e.group // "default") as $g
+      | .agents[$e.id] = {id:$e.id, name:($e.name // $e.id), kind:($e.kind // "agent"),
+                          pane:($e.pane // ""), group:$g, status:"running",
+                          current:null, done:[], reason:"", gate:false,
+                          startEp:($e.ep // 0), lastEp:($e.ep // 0), endEp:null}
+      | .gorder[$g] = ((.gorder[$g] // []) + [$e.id])
+      | (if (.gseen | index($g)) then . else .gseen += [$g] end)
+    end
+  elif .agents[$e.id] == null then .
+  elif $e.t == "now" then
+    .agents[$e.id].current = {text:($e.text // ""), time:($e.time // ""), ep:($e.ep // 0)}
+    | .agents[$e.id] += {status:"running", reason:"", endEp:null}
+    | .agents[$e.id].lastEp = ($e.ep // .agents[$e.id].lastEp)
+  elif $e.t == "done" then
+    (.agents[$e.id]) as $a | ($e.ep // $a.lastEp) as $ep
+    | .agents[$e.id].done += [{text:((if $e.verified then "⊢ " else "" end) + ($e.text // $a.current.text // "milestone")),
+                               time:($e.time // ""), dur:([0, $ep - ($a.current.ep // $ep)] | max)}]
+    | .agents[$e.id].current = null
+    | .agents[$e.id].lastEp = $ep
+    | (if $e.verified then .agents[$e.id].gate = false
+         | (if .agents[$e.id].status == "failed"
+            then .agents[$e.id] += {status:"running", reason:"", endEp:null} else . end)
+       else . end)
+  elif $e.t == "status" and (($e.status // "running") | IN("running","blocked","failed","done") | not) then .
+  elif $e.t == "status" and $e.status == "done" and .agents[$e.id].gate then
+    .agents[$e.id] += {status:"failed", endEp:($e.ep // 0)}
+  elif $e.t == "status" then
+    .agents[$e.id].gate = (.agents[$e.id].gate or ($e.gate == true))
+    | .agents[$e.id].status = ($e.status // "running")
+    | .agents[$e.id].reason = ($e.reason // "")
+    | .agents[$e.id].lastEp = ($e.ep // .agents[$e.id].lastEp)
+    | (if ($e.status == "done" or $e.status == "failed") then .agents[$e.id].endEp = ($e.ep // 0)
+       elif ($e.status == "running" or $e.status == "blocked") then .agents[$e.id].endEp = null
+       else . end)
+  else . end)
+
+# pane closed without a finish/fail event -> dead (empty pane = remote agent)
+| .agents |= map_values(
+    (.pane) as $p
+    | if $p != "" and (($live | index($p)) == null) and (.status | IN("running","blocked"))
+      then .status = "dead" | .reason = "pane closed" | .endEp = .lastEp
+      else . end)
+
+| . as $s
+| ($s.gseen | map({g:., ids:$s.gorder[.]})) as $groups
+| ([$s.agents[]] | length) as $n
+| ([$s.agents[] | .status] | group_by(.) | map({key:.[0], value:length}) | from_entries) as $c
+| (if $s.goal == "" then "(no goal yet:  " + $prog + " goal \"ship it\")" else $s.goal end) as $goal
+| (($goal | gsub("\r";"") | split("\n") | map(wrap($inner - 4)) | add)) as $goal_lines
+| ("╭─ GOAL " + ("─" * ($inner - 8))) as $top
+| ("╰─ " +
+    (if $n == 0 then "no agents yet:  " + $prog + " run id name -- claude"
+     else ([$s.agents[] | .done | length] | add // 0) as $md
+       | ([$s.agents[] | select(live)] | length) as $mo
+       | prog($s.tasks; leaves($s.tasks; $s.torder; "")) as $tp
+       | (if $tp.t > 0 then "总进度 " + bar($tp.d; $tp.t; 20) + " \($tp.d)/\($tp.t) 任务 · " else "" end)
+         + "里程碑 \($md)/\($md + $mo) · "
+         + "\($n) agents ◔\($c.running // 0) ▲\($c.blocked // 0) ✓\($c.done // 0) ✗\($c.failed // 0) ■\($c.dead // 0)"
+     end)
+    + "   " + $now) as $foot
+| ({"todo":["○",$dm],"wip":["◔",$cy],"review":["◑",$cy],"blocked":["▲",$y],
+    "done":["✓",$g],"drop":["–",$dm],"ask":["?",$y]}) as $TI
+| ([ kids($s.tasks; $s.torder; "")[] as $root | $s.tasks[$root] as $rt
+     | prog($s.tasks; leaves($s.tasks; $s.torder; $root)) as $rp
+     | [$cy + "■ " + ($rt.text | clip($inner - 36)) + $rs + "  " + bar($rp.d; $rp.t; 12) + $dm + " \($rp.d)/\($rp.t)" + $rs]
+     + [ tree($s.tasks; $s.torder; $root; "  ")[]
+         | . as $n | ($TI[.t.state] // ["•",$dm]) as $ic
+         | (if .t.owner != "" then " @" + .t.owner else "" end) as $ow
+         | $ic[1] + .pre + $ic[0] + " " + ($n.t.text | clip($inner - $n.depth - 6 - ($ow | dwidth)))
+           + $dm + $ow + $rs ]
+   ] | add // []) as $ttree
+| ([$top] + [$goal_lines[] | "│ " + .] + [($foot | clip($inner))] + [""]
+   + (if ($ttree | length) > 0 then $ttree + [""] else [] end)) as $head
+
+| ([ $groups[] as $gr
+    | [$gr.ids[] | $s.agents[.] | select(. != null)] as $as
+    | ([$as[] | .done | length] | add // 0) as $gd
+    | ([$as[] | select(live)] | length) as $go
+    | ([$as[] | select(.status == "blocked")] | length) as $gb
+    | ($as | length) as $na
+    | [[$cy + "◆ " + $gr.g + $rs + "  " + bar($gd; $gd + $go; 10)
+        + $dm + "  \($gd)/\($gd + $go)  " + "\($na) agents" + (if $gb > 0 then "  ▲\($gb)" else "" end) + $rs]]
+    + [ range(0; $na) as $i | $as[$i] as $a | ($i == $na - 1) as $last
+      | (if $last then "└─ " else "├─ " end) as $br
+      | (if $last then "   " else "│  " end) as $ind
+      | ({"running":["◔",$cy,"进行中"],"done":["✓",$g,"完成"],"blocked":["▲",$y,"阻塞"],
+          "failed":["✗",$r,"失败"],"dead":["■",$r,"已退出"]}[$a.status] // ["•",$dm,$a.status]) as $st
+      | (($a.endEp // $nowep) - $a.startEp) as $tot
+      | ($nowep - $a.lastEp) as $idle
+      | ((($a.done|length) | tostring) + " ✓") as $cnt
+      | ((if $idle >= 600 and ($a.status == "running" or $a.status == "blocked")
+            then "  " + ($idle | sdur) + " 无更新" else "" end)) as $stale
+      | (($br + $st[0] + " " + ($a.name | clip(12) | pad(12)) + " " + $st[2] + "  " + $cnt + $stale)
+         | clip($inner - 9) | pad($inner - 9)) as $hd
+      | ([ (if ($a.done | length) > 3 then {k:"more", n:(($a.done|length) - 3)} else empty end) ]
+         + [ $a.done[-3:][] | {k:"done", text, dur, time} ]
+         + (if ($a | live) then [{k:"cur", text:$a.current.text, ep:$a.current.ep}] else [] end)
+         + (if $a.reason != "" then [{k:"why", text:$a.reason}] else [] end)) as $ch
+      | ($ch | length) as $nc
+      | [ $st[1] + $hd + $dm + ($tot | dur) + $rs ]
+      + [ range(0; $nc) as $j | $ch[$j] as $c
+          | ($ind + (if $j == $nc - 1 then "└─ " else "├─ " end)) as $pre
+          | if $c.k == "done" then
+              $g + $pre + "✓ " + ($c.text | clip($inner - 26) | pad($inner - 26)) + $dm
+              + ((($c.dur // null) | sdur) | lpad(6)) + " " + $c.time + $rs
+            elif $c.k == "cur" then
+              $cy + $pre + "▸ " + ($c.text | clip($inner - 26) | pad($inner - 26))
+              + ((($nowep - $c.ep) | sdur) | lpad(6)) + " 进行" + $rs
+            elif $c.k == "why" then
+              ({"blocked":$y,"failed":$r,"dead":$r}[$a.status] // $dm) + $pre + "▲ " + ($c.text | clip($inner - 10)) + $rs
+            else $dm + $pre + "… 更早 \($c.n) 条" + $rs end ]
+      ]
+  ] | add // []) as $blocks
+
+| ($h - ($head | length)) as $avail
+| (reduce $blocks[] as $b ({lines:[], rows:0, hidden:0};
+    if .rows + ($b|length) <= $avail
+    then .lines += $b | .rows += ($b|length)
+    else .hidden += 1 end)) as $fit
+| if $view == "full" then $head + $fit.lines
++ (if $fit.hidden > 0 then ["    … +\($fit.hidden) more rows (resize pane)"] else [] end)
+else
+  ([$inner, 72] | min) as $bw
+  | (prog($s.tasks; leaves($s.tasks; $s.torder; "")) as $tp
+   | ([$s.tasks[] | select(.state == "ask")] | length) as $na
+   | "╰─ 总进度 " + bar($tp.d; $tp.t; 20) + " \($tp.d)/\($tp.t)"
+     + (if $na > 0 then "  · 需要你拍板 \($na) 件" else "" end) + "   " + $now) as $bfoot
+  | ([$top] + [$goal_lines[] | "│ " + .] + [($bfoot | clip($bw))] + [""]
+  + ([ kids($s.tasks; $s.torder; "")[] as $root | $s.tasks[$root] as $rt
+       | prog($s.tasks; leaves($s.tasks; $s.torder; $root)) as $rp
+       | [$cy + "■ " + ($rt.text | clip($bw - 25) | pad($bw - 25)) + $rs + " " + bar($rp.d; $rp.t; 12) + $dm + " \($rp.d)/\($rp.t)" + $rs]
+       + [ kids($s.tasks; $s.torder; $root) as $k | range(0; $k | length) as $i
+           | $s.tasks[$k[$i]] as $t | ($TI[$t.state] // ["•",$dm]) as $ic
+           | leaves($s.tasks; $s.torder; $k[$i]) as $lv
+           | (if ($lv | length) > 1 then prog($s.tasks; $lv) else null end) as $cp
+           | (if $i == ($k | length) - 1 then "  └─ " else "  ├─ " end) as $pre
+           | $ic[1] + $pre + $ic[0] + " " + ($t.text | clip($bw - 26) | pad($bw - 26)) + $rs
+             + (if $cp then bar($cp.d; $cp.t; 6) + $dm + " \($cp.d)/\($cp.t)" + $rs else "" end) ]
+     ] | add // [])
+  + (if ($s.news | length) > 0 then ["", $g + "进展" + $rs]
+       + [ $s.news[-5:] | reverse[] | "  ✓ " + $dm + .time[0:5] + $rs + " " + (.text | clip($bw - 12)) ] else [] end)
+  + ([ $s.agents[] | select(.status == "running" or .status == "blocked")
+       | . + {idle:($nowep - .lastEp)} | select(.idle >= ($stale | tonumber)) ] | sort_by(-.idle) as $st
+     | if ($st | length) > 0 then ["", $r + "久未更新（≥\(($stale | tonumber) / 60 | floor) 分钟）" + $rs]
+       + [ $st[] | "  " + $r + (.idle | sdur | lpad(7)) + $rs + "  " + (.name | pad(10)) + " "
+           + $dm + ((if .current then .current.text else .reason end) // "" | clip($bw - 24)) + $rs ]
+       else [] end)
+  + ([ $s.torder[] | $s.tasks[.] | select(.state == "ask") ] as $asks
+     | if ($asks | length) > 0 then ["", $y + "需要你拍板" + $rs]
+       + [ $asks[] | $y + "  ? " + $rs + (.text | clip($bw - 6)) ] else [] end))
+end
+| .[:$h] | .[]
+'
+
+dims() {
+  if [ -n "${TMUX_PANE:-}" ]; then
+    tm display-message -p -t "$TMUX_PANE" '#{pane_width} #{pane_height}' 2>/dev/null
+  else
+    stty size 2>/dev/null | awk '{print $2, $1}'
+  fi || echo "80 24"
+}
+
+render() {
+  set -- $(dims)
+  cols=${1:-80}; rows=${2:-24}
+  if [ -n "${TMUX_PANE:-}${TMUX:-}" ] || [ -S "$AWB_DIR/sock" ]; then
+    live=$(tm list-panes -a -F '#{pane_id}' 2>/dev/null | jq -Rn '[inputs]')
+  else
+    live='[]'
+  fi
+  # tolerate a half-appended line from a concurrent writer
+  { [ -s "$EV" ] && cat "$EV" || true; } | jq -R -s \
+    'rtrimstr("\n") | if . == "" then [] else split("\n")
+       | map(fromjson? | select(type == "object" and has("t"))) end' \
+  | jq -r \
+    --argjson w "$cols" --argjson h "$rows" \
+    --arg now "$(date +$TS_FMT)" --argjson nowep "$(date +%s)" \
+    --arg prog "$PROG" --argjson live "$live" --arg view "${AWB_VIEW:-brief}" --arg stale "${AWB_STALE:-600}" \
+    --arg g  "${ESC}[32m"  --arg cy "${ESC}[36m" --arg y "${ESC}[33m" \
+    --arg r  "${ESC}[31m"  --arg dm "${ESC}[2m"  --arg rs "${ESC}[0m" \
+    "$JQ_RENDER"
+}
+
+watch() {
+  printf '\033[?1049h\033[H\033[2J'
+  trap 'printf "\033[?1049l"' EXIT INT TERM
+  last=
+  while :; do
+    out=$(render)
+    if [ "$out" != "$last" ]; then
+      last=$out
+      printf '\033[H\033[2J%s\n' "$out"
+    fi
+    sleep "${AWB_INTERVAL:-1}"
+  done
+}
+
+up() {
+  command -v tmux >/dev/null || die "tmux not installed"
+  init_dir
+  SOCK="$AWB_DIR/sock"
+  if [ -S "$SOCK" ] && tmux -S "$SOCK" has-session -t awb 2>/dev/null; then
+    exec tmux -S "$SOCK" attach-session -t awb
+  fi
+  rm -f "$SOCK"
+  tmux -S "$SOCK" new-session -d -s awb -n board -P -F '#{pane_id}' \
+    -e "AWB_DIR=$AWB_DIR" -e "AWB_TMUX_SOCKET=$SOCK" \
+    "AWB_DIR=$(q "$AWB_DIR") AWB_TMUX_SOCKET=$(q "$SOCK") $(q "$BIN") watch" >/dev/null
+  board=$(tmux -S "$SOCK" list-panes -t awb:board -F '#{pane_id}' | head -1)
+  work=$(tmux -S "$SOCK" split-window -v -t "$board" -d -p 45 -P -F '#{pane_id}' \
+           -e "AWB_DIR=$AWB_DIR" -e "AWB_TMUX_SOCKET=$SOCK" "$SHELL")
+  printf '%s\n' "$work" > "$AWB_DIR/work-pane"
+  tmux -S "$SOCK" select-pane -t "$board" -T board
+  tmux -S "$SOCK" select-pane -t "$work"  -T work
+  tmux -S "$SOCK" setw -t awb:board pane-border-status top
+  tmux -S "$SOCK" setw -t awb:board pane-border-format ' #{?pane_title,#{pane_title},pane} '
+  exec tmux -S "$SOCK" attach-session -t awb
+}
+
+run() {
+  group=${AWB_GROUP:-default}
+  case "${1:-}" in
+    -g) [ $# -ge 2 ] || die "usage: $PROG run [-g GROUP] ID NAME -- CMD..."
+        group=$2; shift 2 ;;
+  esac
+  [ $# -ge 3 ] || die "usage: $PROG run [-g GROUP] ID NAME -- CMD..."
+  id=$1; name=$2; shift 2
+  [ "${1:-}" = -- ] && shift
+  [ $# -ge 1 ] || die "usage: $PROG run [-g GROUP] ID NAME -- CMD..."
+  case $id in *[!A-Za-z0-9_-]* ) die "id must match [A-Za-z0-9_-] (got: $id)";; esac
+  init_dir
+  work=$(cat "$AWB_DIR/work-pane" 2>/dev/null) || die "run '$PROG up' first"
+  tm list-panes -t "$work" >/dev/null 2>&1 || die "work pane $work gone; restart with '$PROG up'"
+  kind=$(basename -- "$1")
+  cmdq=$(for a in "$@"; do printf '%s ' "$(q "$a")"; done)
+  sock=${AWB_TMUX_SOCKET:-$AWB_DIR/sock}
+  inner="AWB_DIR=$(q "$AWB_DIR") AWB_TMUX_SOCKET=$(q "$sock") AWB_GROUP=$(q "$group") \
+AWB_AGENT_ID=$(q "$id") AWB_AGENT_NAME=$(q "$name") AWB_AGENT_KIND=$(q "$kind") \
+$(q "$BIN") _enter; rc=0; $cmdq || rc=\$?; \
+AWB_DIR=$(q "$AWB_DIR") $(q "$BIN") _leave \$rc; exec $(q "$SHELL")"
+  pane=$(tm split-window -h -t "$work" -P -F '#{pane_id}' \
+           -e "AWB_DIR=$AWB_DIR" -e "AWB_TMUX_SOCKET=$sock" -e "AWB_GROUP=$group" \
+           -e "AWB_AGENT_ID=$id" -e "AWB_AGENT_NAME=$name" \
+           -e "AWB_AGENT_KIND=$kind" "$inner")
+  tm select-pane -t "$pane" -T "$name"
+}
+
+tui() {
+  group=${AWB_GROUP:-default}
+  case "${1:-}" in
+    -g) [ $# -ge 2 ] || die "usage: $PROG tui [-g GROUP] ID NAME [TASK...]"
+        group=$2; shift 2 ;;
+  esac
+  [ $# -ge 2 ] || die "usage: $PROG tui [-g GROUP] ID NAME [TASK...]"
+  id=$1; name=$2; shift 2
+  case $id in *[!A-Za-z0-9_-]* ) die "id must match [A-Za-z0-9_-] (got: $id)";; esac
+  init_dir
+  work=$(cat "$AWB_DIR/work-pane" 2>/dev/null) || die "run '$PROG up' first"
+  tm list-panes -t "$work" >/dev/null 2>&1 || die "work pane gone; restart with '$PROG up'"
+  tui_cmd=${AWB_TUI_CMD:-$(command -v claude-db >/dev/null && echo claude-db || echo claude)}
+  command -v "${tui_cmd%% *}" >/dev/null || die "$tui_cmd not on PATH (set AWB_TUI_CMD)"
+  sock=${AWB_TMUX_SOCKET:-$AWB_DIR/sock}
+  # resident TUI: register, run interactive claude, drop to shell on exit (pane stays)
+  inner="AWB_DIR=$(q "$AWB_DIR") AWB_TMUX_SOCKET=$(q "$sock") AWB_GROUP=$(q "$group") \
+AWB_AGENT_ID=$(q "$id") AWB_AGENT_NAME=$(q "$name") AWB_AGENT_KIND=claude \
+$(q "$BIN") _enter; $tui_cmd; exec $(q "$SHELL")"
+  pane=$(tm split-window -h -t "$work" -P -F '#{pane_id}' \
+           -e "AWB_DIR=$AWB_DIR" -e "AWB_TMUX_SOCKET=$sock" -e "AWB_GROUP=$group" \
+           -e "AWB_AGENT_ID=$id" -e "AWB_AGENT_NAME=$name" -e "AWB_AGENT_KIND=claude" \
+           "$inner")
+  tm select-pane -t "$pane" -T "$name"
+  # first message: Chinese working rules + optional task.
+  # paste via buffer — a plain Enter does not submit inside the claude TUI.
+  task=$*
+  prompt="你好，你已注册到 awb 工作台（agent ID: $id，组: $group）。请始终用中文。工作规则：开始一个阶段先运行 awb now $id \"阶段名\"，完成运行 awb done $id；卡住运行 awb block $id \"原因\"，恢复运行 awb unblock $id；全部完成运行 awb finish $id。"
+  [ -n "$task" ] && prompt="$prompt 首个任务：$task。先 awb now $id 再动手。"
+  sleep 3
+  printf '%s' "$prompt" | tm load-buffer -
+  tm paste-buffer -t "$pane"
+  sleep 1
+  tm send-keys -t "$pane" Enter
+}
+
+# Lean 4 acceptance, run in DIR: lake build, no sorry/admit in sources, and the
+# main agent's ACCEPT.lean (statements the agent never edits) must typecheck
+# against the build using only the standard axioms (catches sorryAx, custom axioms,
+# native_decide).
+lean_accept() (
+  dir=$1; acc=${2:-}
+  [ -z "$acc" ] || acc=$(cd "$(dirname "$acc")" && pwd)/$(basename "$acc")
+  PATH=$HOME/.elan/bin:$PATH
+  cd "$dir" || exit 1
+  lake build || exit 1
+  if grep -rnwE 'sorry|admit' --include='*.lean' --exclude-dir=.lake .; then
+    echo "sorry/admit in sources"; exit 1
+  fi
+  [ -n "$acc" ] || exit 0
+  f=.awb-accept.lean
+  { cat "$acc"; echo; sed -n 's/^theorem[[:space:]]*\([^[:space:](:{]*\).*/#print axioms \1/p' "$acc"; } > "$f"
+  rc=0; out=$(lake env lean "$f" 2>&1) || rc=$?; rm -f "$f"
+  printf '%s\n' "$out"
+  [ "$rc" = 0 ] || { echo "acceptance statements do not typecheck"; exit 1; }
+  printf '%s\n' "$out" | grep -q 'axioms' || { echo "ACCEPT.lean has no theorem"; exit 1; }
+  bad=$(printf '%s\n' "$out" | sed -n 's/.*depends on axioms: \[\(.*\)\].*/\1/p' | tr ',' '\n' \
+        | tr -d ' ' | grep -vxE 'propext|Classical\.choice|Quot\.sound' | sort -u | tr '\n' ' ')
+  [ -z "$bad" ] || { echo "non-standard axioms: $bad"; exit 1; }
+)
+
+# acceptance gate: the check the main agent chose decides done, not the agent's claim
+check() {
+  [ $# -ge 3 ] || die "usage: $PROG check ID -- CMD... | $PROG check ID --lean DIR [ACCEPT.lean]"
+  id=$1; shift
+  case $1 in
+    --lean) what="lean ${3:+$(basename "$3")}"; set -- lean_accept "$2" "${3:-}" ;;
+    --) shift; what=$* ;;
+    *) die "usage: $PROG check ID -- CMD... | $PROG check ID --lean DIR [ACCEPT.lean]" ;;
+  esac
+  init_dir; log=$AWB_DIR/check-$id.log
+  rc=0; "$@" >"$log" 2>&1 || rc=$?
+  if [ "$rc" = 0 ]; then
+    append '{t:"done",time:$time,ep:$ep,id:$id,text:null,verified:true}' --arg id "$id"
+    echo "accepted: $what"
+  else
+    why=$(grep -v '^[[:space:]]*$' "$log" | tail -1 | cut -c1-120)
+    [ -n "$why" ] || why="exit $rc"
+    append '{t:"status",time:$time,ep:$ep,id:$id,status:"failed",reason:$r,gate:true}' \
+      --arg id "$id" --arg r "验收未过($what): $why"
+    tail -40 "$log"; echo "rejected: $what (full log: $log)"; return 1
+  fi
+}
+
+_enter() {
+  [ -n "${AWB_AGENT_ID:-}" ] || die "_enter: AWB_AGENT_ID unset"
+  append '{t:"start",time:$time,ep:$ep,id:$id,name:$name,kind:$kind,pane:$pane,group:$group}' \
+    --arg id "$AWB_AGENT_ID" --arg name "${AWB_AGENT_NAME:-$AWB_AGENT_ID}" \
+    --arg kind "${AWB_AGENT_KIND:-agent}" --arg pane "${TMUX_PANE:-}" \
+    --arg group "${AWB_GROUP:-default}"
+}
+
+_leave() {
+  code=${1:-0}
+  if [ "$code" = 0 ]; then
+    append '{t:"status",time:$time,ep:$ep,id:env.AWB_AGENT_ID,status:"done",reason:""}'
+  else
+    append '{t:"status",time:$time,ep:$ep,id:env.AWB_AGENT_ID,status:"failed",reason:$r}' \
+      --arg r "exit $code"
+  fi
+}
+
+usage() {
+  cat <<EOF
+$PROG — tmux agent workbench (events in .awb/events.jsonl)
+
+  $PROG up                          tmux session: milestone board + work area
+  $PROG down                        kill the session
+  $PROG run [-g GROUP] ID NAME -- CMD...
+                                    split a pane for any agent (claude, codex, ...)
+  $PROG tui [-g GROUP] ID NAME [TASK...]
+                                    resident interactive claude TUI, Chinese, tracked
+                                    (AWB_TUI_CMD, default claude-db if on PATH else claude)
+  $PROG start ID NAME [KIND] [GROUP]  register a non-pane / remote agent
+  $PROG goal TEXT                   set the overall goal
+  $PROG news TEXT                   one progress line (board shows last 5)
+                                    board view: AWB_VIEW=brief (default) | full
+                                    AWB_STALE=SECS: list agents silent that long (default 600)
+  $PROG task ID STATE [TEXT] [PARENT] [OWNER]
+                                    task tree node; STATE todo|wip|review|blocked|done|drop;
+                                    re-issue to update (empty args keep old values)
+  $PROG now ID MILESTONE            set agent's current objective
+  $PROG done ID [TEXT]              milestone achieved
+  $PROG block ID REASON             mark blocked
+  $PROG unblock ID                  back to running
+  $PROG fail ID REASON
+  $PROG finish ID [NOTE]            close milestone + mark done
+  $PROG check ID -- CMD...          acceptance gate: CMD exit 0 -> milestone done (⊢), else failed
+  $PROG check ID --lean DIR [ACCEPT.lean]
+                                    Lean 4 gate: lake build, no sorry, ACCEPT.lean theorems
+                                    typecheck with standard axioms only
+  $PROG render | watch              one-shot render | render loop (board pane)
+  $PROG reset                       clear all events (fresh board)
+  $PROG selftest
+EOF
+}
+
+selftest() {
+  t=$(mktemp -d)
+  S=awbselftest$$
+  cleanup() { tmux -L "$S" kill-server 2>/dev/null || true; rm -rf "$t"; }
+  trap cleanup EXIT
+  export AWB_DIR=$t
+
+  "$BIN" goal "SHIP THE WORKBENCH"
+  "$BIN" start a1 claude agent backend
+  "$BIN" now a1 "wire event log"
+  sleep 1
+  "$BIN" done a1
+  "$BIN" now a1 "render board"
+  "$BIN" start a2 codex agent frontend
+  "$BIN" block a2 "waiting on review"
+  "$BIN" task r todo root
+  "$BIN" task l1 done leaf r
+  "$BIN" task l0 wip open r
+  "$BIN" task l0 wip "" r
+  "$BIN" task l1 done "" r
+  out=$(AWB_VIEW=full "$BIN" render)
+  brief=$("$BIN" render)
+  for s in "■ root" "进度" ; do printf "%s" "$brief" | grep -Fq -- "$s" || die "selftest: brief missing $s"; done
+  for s in "SHIP THE WORKBENCH" "✓ wire event log" "▸ render board" \
+           "▲ waiting on review" "2 agents" "✓0" "◔1" "▲1" "◆ backend" "◆ frontend" "■ root" "├─ ✓ leaf" "└─ ◔ open" "1/2 任务"; do
+    printf '%s' "$out" | grep -Fq -- "$s" || die "selftest: missing '$s'"
+  done
+  printf '%s' "$out" | grep -Eq '1s| [0-9]:[0-9][0-9]' || die "selftest: no durations"
+
+  "$BIN" now a1 "gated"
+  ! "$BIN" check a1 -- false >/dev/null || die "selftest: failing check accepted"
+  AWB_VIEW=full "$BIN" render | grep -Fq "✗1" || die "selftest: rejected check not failed"
+  "$BIN" check a1 -- true >/dev/null || die "selftest: passing check rejected"
+  AWB_VIEW=full "$BIN" render | grep -Fq "⊢ gated" || die "selftest: verified milestone not marked"
+  # regressions found by model/AwbModel.lean
+  "$BIN" start g1 gatecase; "$BIN" check g1 -- false >/dev/null || true; "$BIN" status g1 done
+  AWB_VIEW=full "$BIN" render | grep -q "✗ gatecase" || die "selftest: done overrode a rejected check"
+  "$BIN" start r1 rerun; "$BIN" finish r1; "$BIN" start r1 rerun
+  AWB_VIEW=full "$BIN" render | grep -q "◔ rerun" || die "selftest: re-start kept done"
+  ! "$BIN" status r1 bogus 2>/dev/null || die "selftest: bogus status accepted"
+
+  if command -v tmux >/dev/null; then
+    boardpane=$(tmux -L "$S" new-session -d -s awb -n board -x 200 -y 50 -P -F '#{pane_id}' \
+      "AWB_VIEW=full AWB_DIR=$(q "$t") $(q "$BIN") watch")
+    work=$(tmux -L "$S" split-window -v -t "$boardpane" -d -p 60 -P -F '#{pane_id}' "$SHELL")
+    sleep 1
+    cap=$(tmux -L "$S" capture-pane -p -t "$boardpane")
+    printf '%s' "$cap" | grep -Fq "SHIP THE WORKBENCH" || die "selftest: board not live-rendering"
+
+    printf '%s\n' "$work" > "$t/work-pane"
+    tmux -L "$S" send-keys -t "$work" "export AWB_DIR=$(q "$t")" Enter
+    tmux -L "$S" send-keys -t "$work" "$(q "$BIN") run z1 demo -- sleep 2" Enter
+    sleep 2
+    cap=$(tmux -L "$S" capture-pane -p -t "$boardpane")
+    printf '%s' "$cap" | grep -Fq "demo" || die "selftest: spawned agent not shown"
+    sleep 2
+    cap=$(tmux -L "$S" capture-pane -p -t "$boardpane")
+    printf '%s' "$cap" | grep -Fq "✓1" || die "selftest: exit 0 not marked done"
+  fi
+  echo "selftest ok"
+}
+
+cmd=${1:-}; shift 2>/dev/null || true
+case "$cmd" in
+  up)       up "$@" ;;
+  down)     init_dir; tm kill-session -t awb 2>/dev/null || true ;;
+  run)      run "$@" ;;
+  tui)      tui "$@" ;;
+  start)
+    [ $# -ge 1 ] || die "usage: $PROG start ID NAME [KIND] [GROUP]"
+    append '{t:"start",time:$time,ep:$ep,id:$id,name:$name,kind:$kind,pane:$pane,group:$group}' \
+      --arg id "$1" --arg name "${2:-$1}" --arg kind "${3:-agent}" --arg pane "" \
+      --arg group "${4:-default}"
+    ;;
+  task)     [ $# -ge 2 ] || die "usage: $PROG task ID STATE [TEXT] [PARENT] [OWNER]"
+            case $2 in todo|wip|review|blocked|done|drop|ask) ;; *) die "state: todo|wip|review|blocked|done|drop|ask" ;; esac
+            append '{t:"task",time:$time,ep:$ep,id:$id,state:$st,text:$text,parent:$par,owner:$own}' \
+              --arg id "$1" --arg st "$2" --arg text "${3:-}" --arg par "${4:-}" --arg own "${5:-}" ;;
+  news)     [ $# -ge 1 ] || die "usage: $PROG news TEXT"
+            append '{t:"news",time:$time,ep:$ep,text:$text}' --arg text "$*" ;;
+  goal)     [ $# -ge 1 ] || die "usage: $PROG goal TEXT"
+            append '{t:"goal",time:$time,ep:$ep,text:$text}' --arg text "$*" ;;
+  now)      [ $# -ge 2 ] || die "usage: $PROG now ID MILESTONE"
+            append '{t:"now",time:$time,ep:$ep,id:$id,text:$text}' --arg id "$1" --arg text "${2-}" ;;
+  done)     [ $# -ge 1 ] || die "usage: $PROG done ID [TEXT]"
+            append '{t:"done",time:$time,ep:$ep,id:$id,text:(if $text == "" then null else $text end)}' \
+              --arg id "$1" --arg text "${2:-}" ;;
+  block)    [ $# -ge 2 ] || die "usage: $PROG block ID REASON"
+            append '{t:"status",time:$time,ep:$ep,id:$id,status:"blocked",reason:$r}' \
+              --arg id "$1" --arg r "${2-}" ;;
+  unblock)  [ $# -ge 1 ] || die "usage: $PROG unblock ID"
+            append '{t:"status",time:$time,ep:$ep,id:$id,status:"running",reason:""}' --arg id "$1" ;;
+  fail)     [ $# -ge 2 ] || die "usage: $PROG fail ID REASON"
+            append '{t:"status",time:$time,ep:$ep,id:$id,status:"failed",reason:$r}' \
+              --arg id "$1" --arg r "${2-}" ;;
+  finish)   [ $# -ge 1 ] || die "usage: $PROG finish ID [NOTE]"
+            append '{t:"done",time:$time,ep:$ep,id:$id,text:(if $text == "" then null else $text end)}' \
+              --arg id "$1" --arg text "${2:-}"
+            append '{t:"status",time:$time,ep:$ep,id:$id,status:"done",reason:""}' --arg id "$1" ;;
+  status)   [ $# -ge 2 ] || die "usage: $PROG status ID running|blocked|failed|done [REASON]"
+            case $2 in running|blocked|failed|done) ;; *) die "status: running|blocked|failed|done" ;; esac
+            append '{t:"status",time:$time,ep:$ep,id:$id,status:$st,reason:$r}' \
+              --arg id "$1" --arg st "$2" --arg r "${3:-}" ;;
+  reset)    init_dir; : > "$EV" ;;
+  render)   init_dir; render ;;
+  watch)    init_dir; watch ;;
+  _enter)   _enter ;;
+  _leave)   _leave "${1:-0}" ;;
+  check)    check "$@" ;;
+  selftest) selftest ;;
+  ""|-h|--help|help) usage ;;
+  *) usage; die "unknown command: $cmd" ;;
+esac
