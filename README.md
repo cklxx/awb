@@ -134,7 +134,9 @@ awb pr fix1                          # pushes the branch; refuses without a pass
 ```
 
 CI does not test; it only publishes: pushing a tag `vX.Y.Z` that matches `VERSION` in `awb`
-creates a GitHub release with `awb` attached.
+creates a GitHub release with `awb`, `install.sh` and `SKILL.md` attached. Releases are at
+most daily: PRs accumulate on main without touching `VERSION`; a release is one PR that only
+bumps `VERSION`, then the tag.
 
 ## Verification chain
 

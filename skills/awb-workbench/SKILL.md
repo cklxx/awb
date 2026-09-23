@@ -131,4 +131,6 @@ git commit -am "<English summary>"              # 不加任何署名 trailer
 ./awb pr fix-<slug>                              # 验收未通过会拒绝
 ```
 
-PR 描述只写改动，不加 "Generated with ..." 之类署名。合并由人决定；CI 只负责发版：推与 `VERSION` 一致的 `vX.Y.Z` tag 即发布 release。
+PR 描述只写改动，不加 "Generated with ..." 之类署名。PR 里不要改 `VERSION`。
+
+发版：最多一天一次。平时只合并 PR，攒着；要发版时单独提一个只改 `VERSION` 的 PR，合并后推与之一致的 `vX.Y.Z` tag，CI 据此发布 release（CI 只负责发版）。
