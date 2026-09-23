@@ -107,6 +107,7 @@ ID 只能用 `[A-Za-z0-9_-]`。状态：◔ running · ✓ done · ▲ blocked �
 - 过程审计：`awb audit` 跑经过证明的 Lean 监控器（`audit_iff_clean`：报告为空 ⇔ 每个事件相对其前缀都合规）。规则：`⊢` 已验收标记前必须有通过的验收（抓伪造）；开 PR 前必须有通过的验收；验收被拒后不得报完成。违规显示在看板「审计违规」区。
 - `awb pr` 在验收未通过或审计有违规时拒绝，并把 PR 记入事件日志供审计。
 - 需要在克隆里构建模型（`./install.sh` 有 Lean 时自动 `lake build`）；没有模型时 audit 不可用、selftest 跳过差分测试。
+- 并发：`model/tla/` 的 TLA+ 规格经 TLC 检查。`check` / `pr` 按 agent 加锁串行；验收只验它开始时的那个里程碑，期间 agent `awb now` 了新里程碑则判为过期、需重新验收；并发 `tell` 同一 pane 按 pane 加锁、各用独立 buffer。
 - 边界：事件由 agent 追加，审计能发现伪造的 `verified`，但拦不住连验收事件一起伪造；jq 与模型是测试等价，不是证明等价。
 
 ## 通知 agent
