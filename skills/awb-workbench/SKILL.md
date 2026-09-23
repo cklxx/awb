@@ -15,7 +15,28 @@ description: tmux 多 agent 里程碑看板（awb）。当需要在 tmux 里同�
 curl -fsSL https://raw.githubusercontent.com/cklxx/awb/main/install.sh | sh
 ```
 
-## 快速开始
+## 对话式用法（推荐，只有 Claude 也能用）
+
+用户只跟一个 Claude 对话，看板用来看；不需要单独的主控 agent，也不需要模型记得汇报。
+
+```sh
+awb hooks            # 一次性：本项目 .claude/settings.local.json；所有项目用 awb hooks --global
+awb board            # 在当前 tmux pane 右侧开看板（不在 tmux 里就另开终端跑 awb watch）
+```
+
+之后正常对话。hooks 自动上报：
+- 会话启动 → 注册（ID 通过 SessionStart 输出告诉模型，模型可直接用它 `awb check` / `awb now`）；
+- 每条用户消息 → 当前里程碑（取第一行）；每轮结束 → 里程碑完成；
+- 模型用 Agent 工具开的 subagent → 自动出现在以会话名命名的组里，后台 subagent 完成时带上结果。
+
+当用户在对话里要求"开几个 agent 并行做 X"时，你（被对话的 Claude）直接执行，不要让用户去敲命令：
+`awb goal "..."`，然后每个并行任务 `awb tui -g <组> <id> <名字> "<任务>"`（常驻、可继续对话）或 `awb run -g <组> <id> <名字> -- <命令>`（一次性）。
+它们会在当前 pane 旁边开出来，自带 `AWB_DIR` 和 agent ID，装了 hooks 就自动上板。
+交付物用 `awb check` 验收，通过后 `awb pr`。
+
+多块看板：每个项目目录一个 `.awb`；会话从 `AWB_DIR` 环境变量取看板（awb 启动的 agent 都带），没有就用 cwd 往上最近的 `.awb`，都没有则不上报。
+
+## 快速开始（手动布局）
 
 ```sh
 awb up                                      # tmux 会话：看板在上，work 区在下
@@ -48,6 +69,8 @@ awb down
 | `awb peers` | agent 对应的 Claude 会话名与 busy/idle |
 | `awb stale` / `awb nudge` | 列出静默 ≥ `AWB_STALE` 秒的 agent / 循环提醒它们 |
 | `awb audit` / `awb state` | Lean 监控器报告协议违规（退出码 1 表示有）/ jq 折叠出的每个 agent 状态 |
+| `awb hooks [--global] [--remove]` | 安装/移除 Claude Code hooks，自动上报会话、消息、subagent |
+| `awb board` | 在当前 tmux pane 旁开看板，并把当前 pane 设为 tui/run 的分屏起点 |
 | `awb render` / `awb reset` | 一次性渲染（tmux 外可用）/ 清空事件 |
 | `awb skill` / `awb version` / `awb selftest` | 本手册 / 版本 / 端到端自检 |
 

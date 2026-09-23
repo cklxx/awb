@@ -38,6 +38,20 @@ This installs `awb` (needs sh, tmux, jq) to `~/.local/bin` and the agent skill t
 symlink both instead. Agents without a skill mechanism (codex, ...) read the same manual
 with `awb skill`; `awb` itself points agents there.
 
+## Chat-driven (Claude only)
+
+```sh
+awb hooks        # once per project (or --global): Claude Code hooks feed the board
+awb board        # board beside the current tmux pane
+claude           # just talk; ask it to start parallel workers and it runs awb tui / awb run
+```
+
+Hooks register the session (and tell the model its board ID), turn each prompt into the
+current milestone, close it when the turn ends, and put every subagent the model starts
+with its Agent tool on the board, finished with its result. No main agent and no reporting
+by the model are needed. Several boards coexist: a session uses `$AWB_DIR`, else the nearest
+`.awb` above its cwd, else reports nowhere.
+
 ## Use
 
 ```sh
