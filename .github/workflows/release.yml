@@ -1,0 +1,18 @@
+# Releases only. Verification happens before merge: `awb check` gates every PR (see README).
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches awb VERSION
+        run: test "awb ${GITHUB_REF_NAME#v}" = "$(sh awb version)"
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" awb --title "awb $GITHUB_REF_NAME" --generate-notes
