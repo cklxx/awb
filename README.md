@@ -29,23 +29,14 @@ each step, and per-group agents with their milestones; `⊢` marks a milestone t
 ## Install
 
 ```sh
-curl -fsSL https://github.com/cklxx/awb/releases/latest/download/awb -o ~/.local/bin/awb
-chmod +x ~/.local/bin/awb                # needs sh, tmux, jq
+curl -fsSL https://raw.githubusercontent.com/cklxx/awb/main/install.sh | sh
 awb selftest
 ```
 
-From a clone: `ln -sf "$PWD/awb" ~/.local/bin/awb`.
-
-Lean 4 is optional: only `awb check --lean` and `model/` need it. Install it with
-[elan](https://github.com/leanprover/elan):
-
-```sh
-curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
-```
-
-Each Lean project pins its version in `lean-toolchain` (`model/` uses v4.34.0); elan
-fetches it on the first `lake build`. `awb check --lean` looks for `lake` in `~/.elan/bin`
-as well as on `PATH`.
+This installs `awb` (needs sh, tmux, jq) to `~/.local/bin` and the agent skill to
+`~/.claude/skills/awb-workbench`, from the latest release. Run `./install.sh` in a clone to
+symlink both instead. Agents without a skill mechanism (codex, ...) read the same manual
+with `awb skill`; `awb` itself points agents there.
 
 ## Use
 
