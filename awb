@@ -5,8 +5,9 @@
 # agent process output.
 set -eu
 
-VERSION=0.0.3
+VERSION=0.0.4
 PROG=$(basename "$0")
+AWB_DIR_SET=${AWB_DIR:+1}
 AWB_DIR=${AWB_DIR:-$PWD/.awb}
 EV=$AWB_DIR/events.jsonl
 TS_FMT=%H:%M:%S
@@ -489,8 +490,9 @@ $(q "$BIN") _enter; $tui_cmd; exec $(q "$SHELL")"
   # first message: Chinese working rules + optional task.
   # paste via buffer — a plain Enter does not submit inside the claude TUI.
   task=$*
-  prompt="你好，你已注册到 awb 工作台（agent ID: ${id}，组: ${group}）。请始终用中文。工作规则：开始一个阶段先运行 awb now ${id} \"阶段名\"，完成运行 awb done ${id}；卡住运行 awb block ${id} \"原因\"，恢复运行 awb unblock ${id}；全部完成运行 awb finish ${id}。完整规则运行 awb skill 查看。"
-  [ -n "${task}" ] && prompt="${prompt} 首个任务：${task}。先 awb now ${id} 再动手。"
+  # first line = the task, so a hook-driven board shows it as the milestone
+  prompt="${task:-待命，等我的下一条消息}
+（awb 工作台：你是 agent ${id}，组 ${group}，请用中文。装了 awb hooks 时每轮对话自动上板；需要标更细的阶段时用 awb now ${id} \"阶段\" / awb done ${id}，卡住用 awb block ${id} \"原因\"。完整规则：awb skill）"
   sleep 3
   tell "$id" "$prompt"
 }
@@ -534,6 +536,111 @@ pr() {
   append '{t:"pr",time:$time,ep:$ep,id:$id,url:$u}' --arg id "$id" --arg u "$url"
 }
 
+# board beside the current tmux pane (the conversation), for chat-driven use
+board() {
+  init_dir; [ -f "$EV" ] || : > "$EV"
+  if [ -z "${TMUX_PANE:-}" ]; then
+    echo "not in tmux; watch it from another terminal: AWB_DIR=$AWB_DIR $PROG watch"; return 0
+  fi
+  printf '%s\n' "$TMUX_PANE" > "$AWB_DIR/work-pane"      # awb tui/run split from here
+  tmux split-window -h -d -l 45% -t "$TMUX_PANE" "AWB_DIR=$(q "$AWB_DIR") $(q "$BIN") watch"
+  echo "board: $AWB_DIR (right of this pane)"
+}
+
+# install / remove the Claude Code hooks that feed the board (default: this project's
+# .claude/settings.local.json; --global: ~/.claude/settings.json)
+hooks() {
+  f=$PWD/.claude/settings.local.json; rm=false
+  for a in "$@"; do case $a in
+    --global) f=$HOME/.claude/settings.json ;; --remove) rm=true ;;
+    *) die "usage: $PROG hooks [--global] [--remove]" ;; esac; done
+  mkdir -p "$(dirname "$f")"; [ -s "$f" ] || echo '{}' > "$f"
+  jq --arg c "$BIN hook" --argjson rm "$rm" '
+    def ours: any(.hooks[]?; (.command // "") | test("awb hook$"));
+    def entry($m): (if $m then {matcher:$m} else {} end) + {hooks:[{type:"command", command:$c}]};
+    .hooks = ((.hooks // {}) | with_entries(.value |= map(select(ours | not))) | with_entries(select(.value | length > 0)))
+    | if $rm then . else
+        reduce (["SessionStart",null],["UserPromptSubmit",null],["PreToolUse","Agent|Task"],
+                ["PostToolUse","Agent|Task"],["Stop",null],["SessionEnd",null]) as [$ev,$m]
+          (.; .hooks[$ev] = ((.hooks[$ev] // []) + [entry($m)])) end
+    | if .hooks == {} then del(.hooks) else . end' "$f" > "$f.awb.tmp" && mv "$f.awb.tmp" "$f"
+  if $rm; then echo "removed awb hooks from $f"; else echo "awb hooks -> $f"; fi
+}
+
+# Claude Code hook entry (see `hooks`): sessions, prompts and subagents go to the board of
+# $AWB_DIR, else the nearest .awb above the session cwd, else nowhere. Never fails the session.
+hook() {
+  in=$(cat)
+  j() { printf '%s' "$in" | jq -r "$1" 2>/dev/null; }
+  if [ -z "$AWB_DIR_SET" ]; then
+    d=$(j '.cwd // empty'); [ -n "$d" ] || d=$PWD
+    while [ "$d" != / ] && [ ! -f "$d/.awb/events.jsonl" ]; do d=$(dirname "$d"); done
+    [ -f "$d/.awb/events.jsonl" ] || return 0
+    AWB_DIR=$d/.awb
+  fi
+  init_dir
+  sid=$(j '.session_id // ""')
+  id=${AWB_AGENT_ID:-cc-$(printf %.6s "$sid")}
+  name=${AWB_AGENT_NAME:-}
+  if [ -z "$name" ]; then
+    rf=$(grep -l -- "$sid" "$HOME"/.claude/sessions/*.json 2>/dev/null | head -1)
+    [ -n "$rf" ] && name=$(jq -r '.name // empty' "$rf" 2>/dev/null)
+    [ -n "$name" ] || name=$(basename "$(j '.cwd // "."')")
+  fi
+  sub() { printf '%s-%s' "$id" "$(printf %s "$1" | tail -c 6)"; }
+  open() { grep -F "\"id\":\"$1\"" "$EV" | grep -E '"t":"(now|done)"' | tail -1 | grep -q '"t":"now"'; }
+  case $(j .hook_event_name) in
+    SessionStart)
+      append '{t:"start",time:$time,ep:$ep,id:$id,name:$name,kind:"claude",pane:$pane,group:$g}' \
+        --arg id "$id" --arg name "$name" --arg pane "${TMUX_PANE:-}" --arg g "${AWB_GROUP:-default}"
+      # stdout of SessionStart reaches the model: tell it who it is on the board
+      echo "awb: this session is agent $id on the board $AWB_DIR; prompts, turns and subagents are reported automatically. Manual: awb skill" ;;
+    UserPromptSubmit)
+      p=$(j '.prompt // ""')
+      # a prompt while the previous one is still open (queued mid-turn) closes it first
+      open "$id" && append '{t:"done",time:$time,ep:$ep,id:$id,text:null}' --arg id "$id"
+      case $p in
+        "<task-notification>"*)
+          tu=$(j '.prompt | capture("<tool-use-id>(?<v>[^<]*)</tool-use-id>").v')
+          st=$(j '.prompt | capture("<status>(?<v>[^<]*)</status>").v')
+          res=$(j '.prompt | capture("<result>(?<v>[\\s\\S]*?)</result>").v | split("\n") | map(select(test("\\S"))) | first // "" | .[0:60]')
+          sm=$(j '.prompt | capture("<summary>(?<v>[^<]*)</summary>").v | .[0:50]')
+          if [ -n "$tu" ]; then
+            s=$(sub "$tu")
+            if [ "$st" = completed ]; then
+              append '{t:"done",time:$time,ep:$ep,id:$id,text:(if $x == "" then null else $x end)}' --arg id "$s" --arg x "$res"
+              append '{t:"status",time:$time,ep:$ep,id:$id,status:"done",reason:""}' --arg id "$s"
+            else
+              append '{t:"status",time:$time,ep:$ep,id:$id,status:"failed",reason:$r}' --arg id "$s" --arg r "${st:-stopped}"
+            fi
+          fi
+          append '{t:"now",time:$time,ep:$ep,id:$id,text:$x}' --arg id "$id" --arg x "收到：${sm:-子任务结果}" ;;
+        *)
+          x=$(j '.prompt | split("\n") | map(select(test("\\S"))) | first // "" | .[0:60]')
+          [ -n "$x" ] && append '{t:"now",time:$time,ep:$ep,id:$id,text:$x}' --arg id "$id" --arg x "$x" ;;
+      esac ;;
+    PreToolUse)
+      tu=$(j '.tool_use_id // ""'); [ -n "$tu" ] || return 0; s=$(sub "$tu")
+      append '{t:"start",time:$time,ep:$ep,id:$id,name:$n,kind:$k,pane:"",group:$g}' --arg id "$s" \
+        --arg n "$(j '.tool_input.description // "subagent" | .[0:30]')" \
+        --arg k "$(j '.tool_input.subagent_type // "subagent"')" --arg g "$name"
+      append '{t:"now",time:$time,ep:$ep,id:$id,text:$x}' --arg id "$s" \
+        --arg x "$(j '.tool_input.prompt // "" | split("\n") | map(select(test("\\S"))) | first // "" | .[0:60]')" ;;
+    PostToolUse)
+      # background subagents finish later (task-notification); a foreground one is done here
+      [ "$(j '.tool_response.isAsync // false')" = true ] && return 0
+      tu=$(j '.tool_use_id // ""'); [ -n "$tu" ] || return 0; s=$(sub "$tu")
+      append '{t:"done",time:$time,ep:$ep,id:$id,text:null}' --arg id "$s"
+      append '{t:"status",time:$time,ep:$ep,id:$id,status:"done",reason:""}' --arg id "$s" ;;
+    Stop)
+      open "$id" && append '{t:"done",time:$time,ep:$ep,id:$id,text:null}' --arg id "$id"
+      append '{t:"status",time:$time,ep:$ep,id:$id,status:"done",reason:""}' --arg id "$id" ;;
+    SessionEnd)
+      append '{t:"status",time:$time,ep:$ep,id:$id,status:"done",reason:""}' --arg id "$id" ;;
+  esac
+  return 0
+}
+
 # the agent manual: the skill next to the real script (clone), else the installed skill
 skill() {
   for f in "$(src_dir)/skills/awb-workbench/SKILL.md" \
@@ -560,7 +667,7 @@ tell() {
   _p=$(agent_pane "$_id")
   [ -n "$_p" ] && tm list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qx "$_p" || die "$_id has no live pane"
   printf '%s' "$*" | tm load-buffer -b awb-tell -
-  tm paste-buffer -d -b awb-tell -t "$_p"
+  tm paste-buffer -p -d -b awb-tell -t "$_p"
   sleep 0.5
   tm send-keys -t "$_p" Enter
 }
@@ -692,6 +799,12 @@ usage() {
 $PROG $VERSION — tmux agent workbench (events in .awb/events.jsonl)
 Agents: read the operating manual with '$PROG skill' before driving the board.
 
+Chat-driven with Claude (no main agent needed):
+  $PROG hooks [--global]            report sessions, prompts and subagents automatically
+  $PROG board                       board beside the current tmux pane (the conversation)
+  then just talk to Claude; it can start workers itself with '$PROG tui' / '$PROG run'.
+  Several boards: each project's .awb (nearest above the session cwd), or \$AWB_DIR.
+
   $PROG up                          tmux session: milestone board + work area
   $PROG down                        kill the session
   $PROG run [-g GROUP] ID NAME -- CMD...
@@ -719,6 +832,8 @@ Agents: read the operating manual with '$PROG skill' before driving the board.
   $PROG peers                       agents that are Claude sessions: ID PANE SESSION STATUS
                                     (message them with SendMessage from a Claude main agent)
   $PROG pr ID [gh args...]          push this branch and open a PR, only after a passing check
+  $PROG hooks [--global] [--remove] install Claude Code hooks (project .claude/settings.local.json)
+  $PROG board                       split a board pane beside the current tmux pane
   $PROG state | audit               jq fold per agent | protocol violations (Lean monitor)
   $PROG version | skill             version | the agent operating manual (SKILL.md)
   $PROG check ID -- CMD...          acceptance gate: CMD exit 0 -> milestone done (⊢), else failed
@@ -799,6 +914,22 @@ selftest() {
       i=$((i + 1)); [ $i -lt 20 ] || die "selftest: tell not delivered"; sleep 0.5; done
   fi
   "$BIN" skill | grep -q "awb check" || die "selftest: skill manual not found"
+  # Claude Code hooks, with payload shapes recorded from a real session
+  hk() { printf '%s' "$1" | AWB_AGENT_ID= AWB_AGENT_NAME=chat "$BIN" hook; }
+  hk '{"hook_event_name":"SessionStart","session_id":"s0000001","cwd":"/x"}' | grep -q "agent cc-s00000" \
+    || die "selftest: SessionStart did not tell the model its id"
+  hk '{"hook_event_name":"UserPromptSubmit","session_id":"s0000001","prompt":"refactor the parser\nmore"}'
+  hk '{"hook_event_name":"PreToolUse","session_id":"s0000001","tool_name":"Agent","tool_use_id":"call_abc123",
+       "tool_input":{"description":"scan tests","prompt":"find flaky tests","subagent_type":"general-purpose"}}'
+  hk '{"hook_event_name":"PostToolUse","session_id":"s0000001","tool_name":"Agent","tool_use_id":"call_abc123",
+       "tool_response":{"isAsync":true}}'
+  hk '{"hook_event_name":"Stop","session_id":"s0000001"}'
+  hk '{"hook_event_name":"UserPromptSubmit","session_id":"s0000001","prompt":"<task-notification>\n<tool-use-id>call_abc123</tool-use-id>\n<status>completed</status>\n<summary>Agent done</summary>\n<result>3 flaky tests</result>\n</task-notification>"}'
+  hk '{"hook_event_name":"Stop","session_id":"s0000001"}'
+  out=$(AWB_VIEW=full "$BIN" render)
+  for x in "✓ refactor the parser" "✓ scan tests" "✓ 3 flaky tests" "◆ chat"; do
+    printf '%s' "$out" | grep -Fq -- "$x" || die "selftest: hook board missing '$x'"
+  done
   if m=$(model_bin); then
     "$BIN" audit | grep -q "^g1 done-while-check-rejected" || die "selftest: audit missed done after rejection"
     # differential test: jq fold (awb state) vs the proven Lean fold on random logs
@@ -877,6 +1008,9 @@ case "$cmd" in
   check)    check "$@" ;;
   pr)       pr "$@" ;;
   state)    state ;;
+  board)    board ;;
+  hooks)    hooks "$@" ;;
+  hook)     hook 2>/dev/null || true; exit 0 ;;
   audit)    audit ;;
   version|--version|-V) echo "$PROG $VERSION" ;;
   skill)    skill ;;
