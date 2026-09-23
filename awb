@@ -744,15 +744,54 @@ agent_pane() { agent_panes | awk -v i="$1" '$1 == i {print $2}'; }
 tell() {
   [ $# -ge 2 ] || die "usage: $PROG tell ID MESSAGE"
   _id=$1; shift; init_dir
+  _msg=$*
   _p=$(agent_pane "$_id")
   [ -n "$_p" ] && tm list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qx "$_p" || die "$_id has no live pane"
   # one tell per pane at a time, each with its own buffer: concurrent tells merged or lost
   # messages otherwise (model/tla/AwbTell.tla)
   lock "tell-$_p"
-  printf '%s' "$*" | tm load-buffer -b "awb-tell-$$" -
+  printf '%s' "$_msg" | tm load-buffer -b "awb-tell-$$" -
   tm paste-buffer -p -d -b "awb-tell-$$" -t "$_p"
-  sleep 0.5
+  # Confirm the paste actually submitted. A TUI can keep it in the input box
+  # after one Enter: Claude leaves the text (or a collapsed "[Pasted text #N
+  # +K lines]" placeholder) on the PROMPT line, with a divider and a ⏵⏵ footer
+  # below it -- so the input is NOT the last screen line. We therefore inspect
+  # the last line that begins with a prompt (❯ Claude / > codex/shell); if
+  # absent, fall back to the last non-empty line. capture -J joins wrapped
+  # lines so a long paste is read as one prompt line. That prompt line still
+  # showing the pasted tail or a collapsed-paste placeholder = unsubmitted ->
+  # re-send Enter, up to AWB_TELL_MAX_ENTER. A submitted command moves off it
+  # (echoed command runs -> output / empty prompt), so shells are not retried.
+  _probe=$(printf '%s' "$_msg" | jq -Rr '.[-60:]')  # char-safe tail; UTF-8 safe
+  _try=1; _max=${AWB_TELL_MAX_ENTER:-2}
+  # capture the prompt/input line: last line starting with ❯ or >, else last non-empty
+  _inputline() {
+    tm capture-pane -J -p -t "$_p" 2>/dev/null       | awk 'NF {l=$0; if ($0 ~ /^[[:space:]]*(❯|>)/) p=$0} END{ if (p != "") print p; else print l }'
+  }
+  _unsubmitted() { # $1 = input line -> 0 if it still holds the unsubmitted paste
+    case "$1" in
+      *"[Pasted text #"*) return 0 ;;
+      *"$_probe"*) return 0 ;;
+      *) return 1 ;;
+    esac
+  }
+  sleep ${AWB_TELL_SETTLE:-0.5}
   tm send-keys -t "$_p" Enter
+  while [ "$_try" -lt "$_max" ]; do
+    sleep ${AWB_TELL_SETTLE:-0.5}
+    _il=$(_inputline)
+    if _unsubmitted "$_il"; then _try=$((_try + 1)); tm send-keys -t "$_p" Enter
+    else _try=$_max; fi
+  done
+  _il=$(_inputline)
+  if _unsubmitted "$_il"; then
+    # return, not die: check/nudge call tell as a function and must keep going
+    # (a die here would abort check's logging or skip the rest of a nudge round)
+    printf '%s: %s tell not submitted after %s Enter; text still in input box: %s
+'       "$PROG" "$_id" "$_max" "$_il" >&2
+    unlock "tell-$_p"
+    return 1
+  fi
   unlock "tell-$_p"
 }
 
@@ -1037,6 +1076,58 @@ selftest() {
     sleep 1; cap=$(tmux -L "$S" capture-pane -p -t "$(agent_pane z1)")
     { printf '%s\n' "$cap" | grep -qx "told-A" && printf '%s\n' "$cap" | grep -qx "told-B"; } \
       || die "selftest: concurrent tells merged or lost"
+
+    # tell must confirm a paste actually submitted. A real Claude pane does NOT
+    # end on the input line: it is `❯ <text>`, then a divider, then a ⏵⏵
+    # footer. faketui mirrors that: while pending it draws the `❯` input line
+    # with a divider + footer BELOW it (so the input is not the last screen
+    # line -- a probe that only reads the tail would miss it, as in review);
+    # on submit the input clears to `❯` and a sentinel footer appears.
+    cat > "$t/faketui.sh" <<'FT'
+#!/bin/sh
+# read the pasted line (tell's first Enter ends this read), then need NEED more
+# Enters while the pasted text stays in the ❯ input box (with footer below);
+# on submit the box clears to an empty ❯ and the sentinel is the footer.
+read -r pending
+i=0
+while [ "$i" -lt "$1" ]; do
+  printf '❯ %s\n' "$pending"
+  printf -- '────────────────────────────\n'
+  printf '  ⏵⏵ fake-footer\n'
+  read -r _x; i=$((i+1))
+done
+printf '❯\n'
+printf -- '────────────────────────────\n'
+printf 'FAKE_SUBMITTED_OK\n'; sleep 2
+FT
+    chmod +x "$t/faketui.sh"
+    ft_paste() { # $1=NEED
+      tmux -L "$S" new-window -d -P -F '#{pane_id}' "$t/faketui.sh $1"; }
+    # positive: TUI needs 1 extra Enter; tell (default max 2) must succeed
+    fp=$(ft_paste 1)
+    printf 'ft %s\n' "$fp" > "$t/panes"
+    AWB_DIR=$t AWB_TMUX_SOCKET=$AWB_TMUX_SOCKET "$BIN" tell ft "ft-marker-ok-1234567890" \
+      || die "selftest: tell gave up on a TUI that submits on the 2nd Enter"
+    sleep 0.6
+    tmux -L "$S" capture-pane -J -p -t "$fp" | grep -Fq "FAKE_SUBMITTED_OK" \
+      || die "selftest: tell reported success but the TUI never submitted"
+    # negative control: TUI needs 3 extra Enters; with max 2 tell MUST fail.
+    # The stuck input shows Claude's collapsed-paste style for this marker too.
+    fb=$(ft_paste 3)
+    printf 'ft %s\n' "$fb" > "$t/panes"
+    ! AWB_DIR=$t AWB_TMUX_SOCKET=$AWB_TMUX_SOCKET AWB_TELL_MAX_ENTER=2 \
+        AWB_TELL_SETTLE=0.2 "$BIN" tell ft "ft-marker-bad-0987654321" 2>/dev/null \
+      || die "selftest: tell returned 0 though the text stayed unsubmitted"
+    # collapsed-paste case: input line holds "[Pasted text #1 +N lines]", not
+    # the text; tell must still treat it as unsubmitted.
+    fc=$(ft_paste 3)
+    printf 'ft %s\n' "$fc" > "$t/panes"
+    ! AWB_DIR=$t AWB_TMUX_SOCKET=$AWB_TMUX_SOCKET AWB_TELL_MAX_ENTER=1 \
+        AWB_TELL_SETTLE=0.2 "$BIN" tell ft "[Pasted text #7 +3 lines]" 2>/dev/null \
+      || die "selftest: collapsed [Pasted text] placeholder treated as submitted"
+    tmux -L "$S" kill-window -t "$fp" 2>/dev/null || true
+    tmux -L "$S" kill-window -t "$fb" 2>/dev/null || true
+    tmux -L "$S" kill-window -t "$fc" 2>/dev/null || true
     unset AWB_TMUX_SOCKET
 
     # no-code-change detection drives the REAL freeze_once, not just render:
