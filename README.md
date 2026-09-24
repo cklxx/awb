@@ -125,7 +125,15 @@ seconds (default 900) is reminded at most once per `AWB_NUDGE_EVERY` (default 90
 non-git directories are skipped.
 
 - `tell` works for any TUI agent (claude, codex, ...) and uses a named tmux buffer, so your
-  own paste buffer is untouched. Claude queues it if a turn is running.
+  own paste buffer is untouched. Claude queues it if a turn is running. After Enter it
+  captures the pane (joined lines) and reads the last line starting with a prompt (`❯`
+  Claude, `>` codex/shell), falling back to the last non-empty line; if that input line
+  still holds the paste — the raw text, or Claude's collapsed `[Pasted text #N +K lines]`
+  placeholder — it re-sends Enter up to `AWB_TELL_MAX_ENTER` (default 2), then prints the
+  stuck line to stderr and returns non-zero (without aborting a `check`/`nudge` round).
+  The input line is below Claude's divider/footer, so matching the screen tail would miss
+  it. A submitted message clears the input line (output / empty prompt), so a plain shell
+  or codex pane is never retried.
 - A rejected `awb check` tells the agent the reason automatically, unless the agent ran the
   check from its own pane (`AWB_NOTIFY=0` turns this off).
 - For Claude agents, `peers` maps each agent to its Claude Code session name via
