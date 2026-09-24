@@ -5,7 +5,7 @@
 # agent process output.
 set -eu
 
-VERSION=0.0.6
+VERSION=0.0.7
 PROG=$(basename "$0")
 AWB_DIR=${AWB_DIR:-$PWD/.awb}
 EV=$AWB_DIR/events.jsonl
