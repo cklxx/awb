@@ -48,8 +48,6 @@ card() {
     columns:[{tag:"column", width:"weighted", weight:1, padding:"8px 10px", elements:[{tag:"markdown", content:$md}]}]};
   . as $s
   | ($s.need | map(select(.kind == "fail")) | length) as $nfail
-  | ([$s.agents[] | select(.status == "running")] | length) as $nrun
-  | ([$s.agents[] | select(.status == "blocked")] | length) as $nblk
   | {"done":"✓","wip":"◔","review":"◑","blocked":"▲","todo":"○"} as $TI
   | {schema:"2.0",
      config:{update_multi:true, width_mode:"fill", summary:{content:$s.headline}},
@@ -58,9 +56,7 @@ card() {
        title:{tag:"plain_text", content:(if $s.title != "" then ($s.title | clip(60)) else $board end)},
        subtitle:{tag:"plain_text", content:("\($board) · 更新于 " + (if $s.quiet < 60 then "刚刚" else "\($s.quiet | ago)前" end))},
        template:(if $nfail > 0 then "red" elif ($s.need | length) > 0 then "orange" else "blue" end),
-       text_tag_list:([{tag:"text_tag", text:{tag:"plain_text", content:"在做 \($nrun)"}, color:"blue"}]
-         + (if $nblk > 0 then [{tag:"text_tag", text:{tag:"plain_text", content:"等待 \($nblk)"}, color:"orange"}] else [] end)
-         + (if ($s.need | length) > 0 then [{tag:"text_tag", text:{tag:"plain_text", content:"需要你 \($s.need | length)"}, color:"red"}] else [] end))},
+       text_tag_list:((if ($s.need | length) > 0 then [{tag:"text_tag", text:{tag:"plain_text", content:"需要你 \($s.need | length)"}, color:"red"}] else [] end))},
      body:{direction:"vertical", padding:"12px 12px 16px 12px", vertical_spacing:"12px", elements:(
        # 1. what it is, then the one-sentence verdict (the focus)
        ([ $s.about[] | {tag:"markdown", content:(. | clip(160) | grey), text_size:"notation"} ])
@@ -103,20 +99,12 @@ card() {
        + (if ($s.anomalies | length) > 0 then
            [box("yellow-50"; "**异常**\n" + ([$s.anomalies[] | "! \(.text | clip(100))"] | join("\n")))]
           else [] end)
-       # 5. the rest, folded: every agent, news, the task tree
+       # 5. the rest, folded: news and the task tree; agents show only in 需要你 and 异常
        + [{tag:"collapsible_panel", expanded:false,
-           header:{title:{tag:"markdown", content:("**agent 与进展**　" + ("在做 \($nrun) · 等待 \($nblk) · 空闲 \($s.idle | length) · 已核 \($s.verified.v)/\($s.verified.n)" | grey))}},
+           header:{title:{tag:"markdown", content:("**进展与任务**　" + ("里程碑已核 \($s.verified.v)/\($s.verified.n)" | grey))}},
            vertical_spacing:"8px",
            elements:(
-             (if ($s.agents | length) > 0 then
-               [{tag:"markdown", content:([$s.agents[] |
-                  ({"running":"◔","blocked":"▲","done":"✓"}[.status] // "•") + " **\(.name)** "
-                  + ("\(.age | hms) · ⊢\(.dv)/\(.dn)" | grey) + "　"
-                  + (if .flag != "" then "<font color=\"orange\">\(.flag)</font> " else "" end)
-                  + (.text | clip(90))] | join("\n"))}]
-              else [] end)
-             + (if ($s.idle | length) > 0 then [{tag:"markdown", content:("空闲：\($s.idle | map(.name) | join("、"))" | grey), text_size:"notation"}] else [] end)
-             + (if ($s.news | length) > 0 then
+             (if ($s.news | length) > 0 then
                  [{tag:"markdown", content:("**最近进展**\n" + ([$s.news[-5:] | reverse[] | ("\(.time[0:5])" | grey) + "　\(.text | clip(100))"] | join("\n")))}]
                 else [] end)
              + [ $s.tasks[] | {tag:"markdown", content:(
