@@ -49,7 +49,10 @@ type commands:
 5. Subagents you start with your Agent tool can be on the board too: `awb start <id> <name>`
    and `awb now` before starting, `awb done` when the result comes back.
 
-`awb peers` shows each agent's Claude session name and busy/idle. Several boards: one `.awb` per
+`awb peers` shows each agent's Claude session name and busy/idle/waiting. The board reads the
+same registry: `▲ 待批准` means the worker is on a permission dialog (tell the user; awb never
+types into it), and 会话实况 lists self-reports the session contradicts. `awb stale` prints
+`ID MINUTES waiting` for dialog-blocked workers. Several boards: one `.awb` per
 project directory, or set `AWB_DIR`.
 
 ## Manual layout
@@ -143,7 +146,9 @@ not process, one per stage. Full rules: `awb skill`.
 - Concurrency: TLA+ specs in `model/tla/`, checked with TLC. `check` / `pr` are serialized per
   agent; a check verifies only the milestone it started on (if the agent ran `awb now`
   meanwhile, the check is rejected as stale); concurrent `tell`s into one pane take a per-pane
-  lock and separate buffers.
+  lock and separate buffers. `tell` re-reads the session registry before each keystroke and
+  never types into a dialog already reported (`AwbWait.tla`); a dialog opening between the
+  read and the key is not preventable, so message Claude workers with SendMessage.
 - Limits: agents append events, so the audit catches a forged `verified` but not an agent that
   also forges the check events; jq and the model are equal by test, not by proof.
 
