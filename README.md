@@ -14,18 +14,19 @@ The board above (`AWB_VIEW=full`, demo data) shows the task tree, the acceptance
 each step, and per-group agents with their milestones; `⊢` marks a milestone that passed
 `awb check`; the full view tags an unverified finished milestone with a dim `自报`.
 
-The brief view (default) is ordered by the questions it answers, most important first, since
-it is cut at the pane height:
+The brief view (default) and the Lark card share one layout, most important first, since
+the view is cut at the pane height:
 
-1. How far, and is it moving: the goal; the metric with its history as a sparkline, the
-   change since the first reading and a linear time-to-target marked `（估）`; task progress
-   over open work; milestones and tasks finished in the last hour; `已核 M / 自报 K`.
-2. What needs you (`需要你`): permission dialogs, failed or dead agents, `ask` tasks.
-3. What each agent does: one line each with its current milestone, how long (red when silent
-   for `AWB_STALE`), `⊢verified/total` milestones, and flags for no code change or a session
-   that contradicts the report; idle agents share one line.
-4. The task tree: done children fold into a count, and roots done over an hour ago fold into
-   one line. Then recent news and checks.
+1. Title: the goal's first line. Its other lines say what the goal is (definition, scope).
+2. One-sentence verdict: needs you or not · the metric, its 24-hour change and a linear
+   time-to-target marked `（估）` · how many anomalies.
+3. The metric with its history, task progress, the last hour, `已核 M / 自报 K`, and how long
+   ago the board last changed.
+4. 需要你: permission dialogs, failed or dead agents, `ask` tasks, each with how long it waited.
+5. 下一步: the main line's next open steps.
+6. 异常: a bottleneck (an issue or PR, `#N`, two or more blocked agents wait for), a silent
+   agent, no code change, a session that contradicts the report, a board nobody writes to.
+7. Every agent, the last 24 hours in numbers, news and the task tree (folded on the card).
 
 ## Model
 
@@ -237,7 +238,9 @@ interleaved their events, so the audit flagged an honest pass; `awb pr` could op
 a new check was running; two concurrent `tell`s into one pane merged into one prompt or lost a
 message. Fixes: a per-agent lock around `check` and `pr`, a check verifies only the milestone
 it started on (otherwise it is rejected as stale), and `tell` uses a per-call buffer under a
-per-pane lock. Run TLC with
+per-pane lock. In 0.0.7 a process that had unlocked still removed that lock on exit, after
+another had taken it, and two tells merged; `AwbTellExitTrap.cfg` reproduces it and `unlock`
+now forgets the lock. Run TLC with
 `java -cp tla2tools.jar tlc2.TLC -config AwbCheckFixed.cfg -deadlock AwbCheck` in `model/tla/`.
 
 Audit rules, per agent: a verified milestone must follow a passing check (forged `verified`

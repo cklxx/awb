@@ -44,34 +44,48 @@ card() {
      elements:([{tag:"markdown", content:($label | grey), text_size:"notation"},
                 {tag:"markdown", content:$value, text_size:"heading-2"}]
                + (if $sub == "" then [] else [{tag:"markdown", content:($sub | grey), text_size:"notation"}] end))};
+  def box($bg; $md): {tag:"column_set", background_style:$bg,
+    columns:[{tag:"column", width:"weighted", weight:1, padding:"8px 10px", elements:[{tag:"markdown", content:$md}]}]};
   . as $s
   | ($s.need | map(select(.kind == "fail")) | length) as $nfail
   | ([$s.agents[] | select(.status == "running")] | length) as $nrun
   | ([$s.agents[] | select(.status == "blocked")] | length) as $nblk
+  | {"done":"✓","wip":"◔","review":"◑","blocked":"▲","todo":"○"} as $TI
   | {schema:"2.0",
-     config:{update_multi:true, width_mode:"fill",
-             summary:{content:("\($board) · 进度 \($s.progress.d)/\($s.progress.t)"
-               + (if ($s.need | length) > 0 then " · 需要你 \($s.need | length)" else "" end))}},
+     config:{update_multi:true, width_mode:"fill", summary:{content:$s.headline}},
      header:{
-       title:{tag:"plain_text", content:$board},
-       subtitle:{tag:"plain_text", content:(($s.goal | split("\n")[0]) // "" | clip(80))},
+       # the title is the goal; which board and how fresh is the subtitle
+       title:{tag:"plain_text", content:(if $s.title != "" then ($s.title | clip(60)) else $board end)},
+       subtitle:{tag:"plain_text", content:("\($board) · 更新于 " + (if $s.quiet < 60 then "刚刚" else "\($s.quiet | ago)前" end))},
        template:(if $nfail > 0 then "red" elif ($s.need | length) > 0 then "orange" else "blue" end),
        text_tag_list:([{tag:"text_tag", text:{tag:"plain_text", content:"在做 \($nrun)"}, color:"blue"}]
          + (if $nblk > 0 then [{tag:"text_tag", text:{tag:"plain_text", content:"等待 \($nblk)"}, color:"orange"}] else [] end)
          + (if ($s.need | length) > 0 then [{tag:"text_tag", text:{tag:"plain_text", content:"需要你 \($s.need | length)"}, color:"red"}] else [] end))},
      body:{direction:"vertical", padding:"12px 12px 16px 12px", vertical_spacing:"12px", elements:(
-       # 1. how far and is it moving: the metric (or task progress) as the one focus
-       [{tag:"column_set", flex_mode:"bisect", background_style:"blue-50", horizontal_spacing:"12px",
-         columns:(
-           (if $s.metric then
-              [tile($s.metric.name | clip(20); "**\($s.metric.value)** / \($s.metric.target)";
-                    (if $s.metric.eta then "按均速约 \($s.metric.eta | ago)达标（估）" else "" end)),
-               tile("达成"; (if $s.metric.frac then "\($s.metric.frac * 100 | floor)%" else "—" end);
-                    (if $s.metric.v0 then "起 \($s.metric.v0) · \($s.metric.since | ago)前" else "" end))]
-            else [] end)
-           + [tile("任务"; "\($s.progress.d) / \($s.progress.t)"; ""),
-              tile("近 1 小时"; "里程碑 +\($s.hour.milestones)";
-                   "任务 +\($s.hour.tasks) · 已核 \($s.verified.v)/\($s.verified.n)")])}]
+       # 1. what it is, then the one-sentence verdict (the focus)
+       ([ $s.about[] | {tag:"markdown", content:(. | clip(160) | grey), text_size:"notation"} ])
+       + [{tag:"markdown", text_size:"heading-4",
+           content:("**" + $s.headline + "**")}]
+       # 2. needs you, with how long each has waited
+       + (if ($s.need | length) > 0 then
+           [box(if $nfail > 0 then "red-50" else "orange-50" end; "**需要你**\n" + ([$s.need[] |
+              (if .age then "<font color=\"grey\"> · 已 \(.age | ago)</font>" else "" end) as $ag
+              | if .kind == "wait" then "▲ **\(.name)** \(.text)"
+                elif .kind == "fail" then "✗ **\(.name)** \(.text | clip(80))\($ag)"
+                else "? \(.text | clip(90))\($ag)" end] | join("\n")))]
+          else [] end)
+       # 3. the goal: the metric, its trend, and the next open steps
+       + [{tag:"column_set", flex_mode:"bisect", background_style:"blue-50", horizontal_spacing:"12px",
+           columns:(
+             (if $s.metric then
+                [tile($s.metric.name | clip(20); "**\($s.metric.value)** / \($s.metric.target)";
+                      (if $s.metric.eta then "按均速约 \($s.metric.eta | ago)达标（估）" else "" end)),
+                 tile("达成"; (if $s.metric.frac then "\($s.metric.frac * 100 | floor)%" else "—" end);
+                      (if $s.metric.v0 then "起 \($s.metric.v0) · \($s.metric.since | ago)前" else "" end))]
+              else [tile("任务"; "\($s.progress.d) / \($s.progress.t)"; "")] end)
+             + [tile("24 小时"; "里程碑 +\($s.day.milestones)";
+                     "已核 \($s.day.verified) · 任务 +\($s.day.tasks)"
+                     + (if $s.day.metric then " · \(if $s.day.metric >= 0 then "+" else "" end)\($s.day.metric * 100 | round / 100)" else "" end))])}]
        + (if $s.metric and ($s.metric.history | length) >= 2 then
            [{tag:"chart", height:"180px", chart_spec:{
               type:"line",
@@ -80,53 +94,35 @@ card() {
               axes:[{orient:"left", min:0, max:([$s.metric.target, ([$s.metric.history[].value] | max)] | max)}],
               markLine:[{y:$s.metric.target, label:{text:"目标 \($s.metric.target)"}}]}}]
           else [] end)
-       # 2. needs you
-       + (if ($s.need | length) > 0 then
-           [{tag:"column_set", background_style:(if $nfail > 0 then "red-50" else "orange-50" end),
-             columns:[{tag:"column", width:"weighted", weight:1, padding:"8px", elements:[
-               {tag:"markdown", content:("**需要你**\n" + ([$s.need[] |
-                 if .kind == "wait" then "▲ **\(.name)** \(.text)"
-                 elif .kind == "fail" then "✗ **\(.name)** \(.text | clip(80))"
-                 else "? \(.text | clip(90))" end] | join("\n")))}]}]}]
+       + (if ($s.next | length) > 0 then
+           [{tag:"markdown", content:("**下一步**\n" + ([$s.next[] | "\($TI[.state] // "•") \(.text | clip(90))"] | join("\n")))}]
           else [] end)
-       # 3. what each agent does
-       + (if ($s.agents | length) > 0 then
-           [{tag:"table", page_size:10, row_height:"auto", freeze_first_column:true,
-             header_style:{background_style:"grey", bold:true, text_size:"normal"},
-             columns:[
-               {name:"a", display_name:"agent", data_type:"text", width:"110px"},
-               {name:"s", display_name:"状态", data_type:"options", width:"80px"},
-               {name:"c", display_name:"当前", data_type:"lark_md", width:"auto"},
-               {name:"d", display_name:"用时", data_type:"text", width:"80px"},
-               {name:"v", display_name:"已核", data_type:"text", width:"80px"}],
-             rows:[$s.agents[] | {
-               a:.name,
-               s:[{"running":{text:"在做", color:"blue"}, "blocked":{text:"等待", color:"orange"},
-                   "done":{text:"完成", color:"green"}}[.status] // {text:.status, color:"neutral"}],
-               c:((if .flag != "" then "<font color=\"orange\">\(.flag)</font> " else "" end) + (.text | clip(120))),
-               d:(if .silent then "\(.age | hms) ⚠" else (.age | hms) end),
-               v:"\(.dv)/\(.dn)"}]}]
+       # 4. what is off
+       + (if ($s.anomalies | length) > 0 then
+           [box("yellow-50"; "**异常**\n" + ([$s.anomalies[] | "! \(.text | clip(100))"] | join("\n")))]
           else [] end)
-       + (if ($s.idle | length) > 0 then
-           [{tag:"markdown", content:("空闲：\($s.idle | map(.name) | join("、"))" | grey), text_size:"notation"}] else [] end)
-       # 4. latest news, on the card itself
-       + (if ($s.news | length) > 0 then
-           [{tag:"column_set", background_style:"grey-50", columns:[{tag:"column", width:"weighted", weight:1, padding:"8px",
-             elements:[{tag:"markdown", content:("**最近进展**\n" + ([$s.news[-5:] | reverse[]
-               | "<font color=\"grey\">\(.time[0:5])</font>　\(.text | clip(100))"] | join("\n")))}]}]}]
-          else [] end)
-       # 5. the task tree, folded
+       # 5. the rest, folded: every agent, news, the task tree
        + [{tag:"collapsible_panel", expanded:false,
-           header:{title:{tag:"markdown", content:"**任务**　<font color=\"grey\">\($s.progress.d)/\($s.progress.t)</font>"}},
+           header:{title:{tag:"markdown", content:("**agent 与进展**　" + ("在做 \($nrun) · 等待 \($nblk) · 空闲 \($s.idle | length) · 已核 \($s.verified.v)/\($s.verified.n)" | grey))}},
            vertical_spacing:"8px",
            elements:(
-             [ $s.tasks[] | {tag:"markdown", content:(
+             (if ($s.agents | length) > 0 then
+               [{tag:"markdown", content:([$s.agents[] |
+                  ({"running":"◔","blocked":"▲","done":"✓"}[.status] // "•") + " **\(.name)** "
+                  + ("\(.age | hms) · ⊢\(.dv)/\(.dn)" | grey) + "　"
+                  + (if .flag != "" then "<font color=\"orange\">\(.flag)</font> " else "" end)
+                  + (.text | clip(90))] | join("\n"))}]
+              else [] end)
+             + (if ($s.idle | length) > 0 then [{tag:"markdown", content:("空闲：\($s.idle | map(.name) | join("、"))" | grey), text_size:"notation"}] else [] end)
+             + (if ($s.news | length) > 0 then
+                 [{tag:"markdown", content:("**最近进展**\n" + ([$s.news[-5:] | reverse[] | ("\(.time[0:5])" | grey) + "　\(.text | clip(100))"] | join("\n")))}]
+                else [] end)
+             + [ $s.tasks[] | {tag:"markdown", content:(
                  "**\(.text | clip(60))**　\(.d)/\(.t)"
                  + (if .folded > 0 then "\n✓ 另 \(.folded) 项已完成" else "" end)
-                 + ([.kids[] | "\n" + ({"done":"✓","wip":"◔","review":"◑","blocked":"▲","todo":"○"}[.state] // "•")
-                     + " " + (.text | clip(70)) + (if .prog then "　\(.prog.d)/\(.prog.t)" else "" end)] | join("")))} ]
+                 + ([.kids[] | "\n" + ($TI[.state] // "•") + " " + (.text | clip(70)) + (if .prog then "　\(.prog.d)/\(.prog.t)" else "" end)] | join("")))} ]
              + (if $s.tasks_old > 0 then [{tag:"markdown", content:("✓ 另有 \($s.tasks_old) 项已完成" | grey)}] else [] end))}]
-       + [{tag:"markdown", content:("更新于 \($s.clock) · \($path)" | grey), text_size:"notation"}])}}'
+       + [{tag:"markdown", content:("\($path)" | grey), text_size:"notation"}])}}'
 }
 
 
