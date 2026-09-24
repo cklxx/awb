@@ -1085,9 +1085,61 @@ selftest() {
   else
     echo "selftest: Lean model not built, skipped audit and differential test (cd model && lake build)" >&2
   fi
+  # hot-edit safety: the dispatch is a main() function invoked at EOF, so sh
+  # parses the whole executable tail before it runs and an in-place rewrite of
+  # awb cannot corrupt a running board/nudge loop ("syntax error near
+  # unexpected token" hit twice while awb was being edited).
+  tail -1 "$BIN" | grep -Fxq 'main "$@"; exit' || die "selftest: dispatch must end in 'main "$@"; exit' (hot-edit unsafe)"
+
+  # Hot-edit injection proof, in a SEPARATE script/process so its background
+  # jobs never touch this selftest's tmux sequence. A sh that resumes reading
+  # by byte offset after a blocked command (bash 3.2) can, on a LONGER
+  # in-place rewrite, read bytes past the original EOF: with a bare
+  # `main "$@"` tail it then executes code appended by the rewrite; the fix is
+  # `main "$@"; exit` on one line. Two legal main-wrapped programs differ only
+  # in that tail; each is rewritten mid-sleep to a longer file carrying an
+  # INJECTED_MARKER after the tail. The bare tail MUST run the marker (proves
+  # the leak), the `; exit` tail MUST NOT (proves the fix). A whole-file reader
+  # (dash) never runs the marker in the probe, so the leg is skipped there.
+  ha=$t/hotedit; mkdir -p "$ha"
+  cat > "$ha/check.sh" <<'CHK'
+#!/bin/sh
+set -u
+ha=$(dirname "$0")
+mk() {
+  { printf '#!/bin/sh\nmain() {\nsleep 1\necho MAIN_RAN\n}\n'
+    i=1; while [ $i -le 2000 ]; do printf 'echo f-%s-aaaaaaaaaaaaaaaaaaaaaaaa\n' "$i"; i=$((i+1)); done
+    printf '%s\n' "$2"; } > "$1"; chmod +x "$1"; }
+elongate() {
+  { printf '#!/bin/sh\nmain() {\nsleep 1\necho MAIN_RAN\n}\n'
+    i=1; while [ $i -le 3000 ]; do printf 'echo g-%s-bbbbbbbbbbbbbbbbbbbbbbbb\n' "$i"; i=$((i+1)); done
+    printf '%s\n' "$2"
+    printf 'echo INJECTED_MARKER\n'; } > "$1"; }
+run1() {
+  mk "$ha/$1.sh" "$2"
+  /bin/sh "$ha/$1.sh" </dev/null >"$ha/$1.out" 2>"$ha/$1.err" &
+  p=$!; sleep 0.4; elongate "$ha/$1.sh" "$2"
+  wait "$p" 2>/dev/null; echo $? >"$ha/$1.rc"; }
+run1 probe 'main "$@"'
+grep -q INJECTED_MARKER "$ha/probe.out" || exit 0   # whole-file reader: leak cannot occur
+run1 fixed 'main "$@"; exit'
+[ "$(cat "$ha/fixed.rc")" = 0 ] && grep -q MAIN_RAN "$ha/fixed.out" || exit 3
+if grep -q INJECTED_MARKER "$ha/fixed.out"; then exit 4; fi  # code appended past old EOF must not run
+exit 0
+CHK
+  /bin/sh "$ha/check.sh" </dev/null || die "selftest: hot-edit exit guard (rc $?): 'main \"$@\"; exit' must stop code appended by a longer rewrite"
+
   echo "selftest ok"
 }
 
+# Dispatch lives in main(), invoked at EOF and followed by `; exit` on the
+# SAME line. Wrapping makes the executable tail a function sh fully parses
+# before the call, and the exit stops sh from re-reading bytes a LONGER
+# in-place rewrite appends past the original EOF (bash 3.2 resumes by byte
+# offset after a blocked command). Without both, a hot edit either desyncs a
+# running board/nudge loop ("syntax error near unexpected token") or runs
+# newly appended code after main returns.
+main() {
 cmd=${1:-}; shift 2>/dev/null || true
 case "$cmd" in
   up)       up "$@" ;;
@@ -1164,3 +1216,6 @@ case "$cmd" in
   ""|-h|--help|help) usage ;;
   *) usage; die "unknown command: $cmd" ;;
 esac
+}
+
+main "$@"; exit
