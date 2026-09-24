@@ -1,8 +1,8 @@
 #!/bin/sh
 # awb-lark: mirror every awb board into its own topic of one Lark (Feishu) topic group.
 # One board (AWB_DIR) = one topic. The topic's root message is a card showing the board's
-# current state, patched in place on every sync; new news lines and new "needs you" items
-# are posted as replies in the topic. Needs lark-cli with a bot identity in the group.
+# current state, patched in place on every sync: every update lands on that card, nothing
+# else is posted. Needs lark-cli with a bot identity in the group.
 # The group is set once with `awb-lark setup oc_xxx`; the board -> topic mapping lives in
 # $AWB_DIR/lark.json, so it follows the board.
 set -eu
@@ -109,9 +109,15 @@ card() {
           else [] end)
        + (if ($s.idle | length) > 0 then
            [{tag:"markdown", content:("空闲：\($s.idle | join("、"))" | grey), text_size:"notation"}] else [] end)
-       # 4. task tree and news, folded
+       # 4. latest news, on the card itself
+       + (if ($s.news | length) > 0 then
+           [{tag:"column_set", background_style:"grey-50", columns:[{tag:"column", width:"weighted", weight:1, padding:"8px",
+             elements:[{tag:"markdown", content:("**最近进展**\n" + ([$s.news[-5:] | reverse[]
+               | "<font color=\"grey\">\(.time[0:5])</font>　\(.text | clip(100))"] | join("\n")))}]}]}]
+          else [] end)
+       # 5. the task tree, folded
        + [{tag:"collapsible_panel", expanded:false,
-           header:{title:{tag:"markdown", content:"**任务与进展**　<font color=\"grey\">\($s.progress.d)/\($s.progress.t) · 最近 \([$s.news | length, 5] | min) 条进展</font>"}},
+           header:{title:{tag:"markdown", content:"**任务**　<font color=\"grey\">\($s.progress.d)/\($s.progress.t)</font>"}},
            vertical_spacing:"8px",
            elements:(
              [ $s.tasks[] | {tag:"markdown", content:(
@@ -119,15 +125,10 @@ card() {
                  + (if .folded > 0 then "\n✓ 另 \(.folded) 项已完成" else "" end)
                  + ([.kids[] | "\n" + ({"done":"✓","wip":"◔","review":"◑","blocked":"▲","todo":"○"}[.state] // "•")
                      + " " + (.text | clip(70)) + (if .prog then "　\(.prog.d)/\(.prog.t)" else "" end)] | join("")))} ]
-             + (if $s.tasks_old > 0 then [{tag:"markdown", content:("✓ 另有 \($s.tasks_old) 项已完成" | grey)}] else [] end)
-             + (if ($s.news | length) > 0 then
-                 [{tag:"markdown", content:("**最近进展**\n" + ([$s.news[-5:] | reverse[] | "\(.time[0:5])　\(.text | clip(100))"] | join("\n")))}]
-                else [] end))}]
+             + (if $s.tasks_old > 0 then [{tag:"markdown", content:("✓ 另有 \($s.tasks_old) 项已完成" | grey)}] else [] end))}]
        + [{tag:"markdown", content:("更新于 \($s.clock) · \($path)" | grey), text_size:"notation"}])}}'
 }
 
-# reply in the topic with markdown
-reply() { lark im +messages-reply --message-id "$1" --reply-in-thread --markdown "$2" >/dev/null; }
 
 sync() {
   [ -d "$AWB_DIR" ] || die "no board at $AWB_DIR"
@@ -152,33 +153,27 @@ sync() {
   # a board moved to another group gets a new topic there
   [ "$(printf '%s' "$st" | jq -r '.chat // ""')" = "$c" ] || st='{}'
   root=$(printf '%s' "$st" | jq -r '.root // ""')
-  live=$(printf '%s' "$st" | jq -r '.card // ""')
+  ep=$(printf '%s' "$st" | jq -r '.card_ep // 0')
   now=$(date +%s)
+  # Lark lets a card be patched for 14 days. Before that, the board moves to a new topic and
+  # the old card is replaced by a pointer to it; nothing is ever appended to a topic.
+  if [ -n "$root" ] && [ $((now - ep)) -ge "${AWB_LARK_ROLL:-1123200}" ]; then
+    old=$root; root=
+  fi
   if [ -z "$root" ]; then
     root=$(lark im +messages-send --chat-id "$c" --msg-type interactive --content "$body" -q '.data.message_id')
     [ -n "$root" ] || die "sending the card failed"
-    live=$root
-    # the existing news is on the card; only later lines become replies
-    st=$(jq -n --arg c "$c" --arg r "$root" --argjson ep "$now" --argjson s "$snap" \
-      '{chat:$c, root:$r, card:$r, card_ep:$ep, news:($s.news | length), need:[$s.need[] | tojson]}')
-  else
-    # a card can be patched for 14 days; after that, a fresh card is posted in the topic
-    if ! lark im messages patch --message-id "$live" --data "$(jq -n --arg b "$body" '{content:$b}')" >/dev/null 2>&1; then
-      live=$(lark im +messages-reply --message-id "$root" --reply-in-thread --msg-type interactive --content "$body" -q '.data.message_id')
-      [ -n "$live" ] || die "neither patching nor re-posting the card worked"
-      st=$(printf '%s' "$st" | jq --arg l "$live" --argjson ep "$now" '.card = $l | .card_ep = $ep')
+    st=$(jq -n --arg c "$c" --arg r "$root" --argjson ep "$now" '{chat:$c, root:$r, card_ep:$ep}')
+    if [ -n "${old:-}" ]; then
+      moved=$(jq -nc --arg b "$proj" '{schema:"2.0", header:{title:{tag:"plain_text", content:$b}, template:"grey"},
+        body:{elements:[{tag:"markdown", content:"此看板已移到新话题继续更新（飞书卡片 14 天后不能再更新）。"}]}}')
+      lark im messages patch --message-id "$old" --data "$(jq -n --arg b "$moved" '{content:$b}')" >/dev/null 2>&1 || true
     fi
-    # new news lines, at most 5 per sync
-    n0=$(printf '%s' "$st" | jq '.news // 0')
-    new=$(printf '%s' "$snap" | jq -r --argjson n "$n0" '.news[$n:] | if length == 0 then empty else
-      (if length > 5 then "另有 \(length - 5) 条\n" else "" end) + ([.[-5:][] | "✓ \(.time[0:5])　\(.text)"] | join("\n")) end')
-    [ -z "$new" ] || reply "$root" "$new"
-    # needs-you items not seen before
-    need=$(printf '%s' "$snap" | jq -r --argjson st "$st" '[.need[] | select((tojson) as $k | ($st.need // []) | index($k) | not)
-      | if .kind == "wait" then "▲ \(.name) \(.text)" elif .kind == "fail" then "✗ \(.name) \(.text)" else "? \(.text)" end]
-      | if length == 0 then empty else "**需要你**\n" + join("\n") end')
-    [ -z "$need" ] || reply "$root" "$need"
-    st=$(printf '%s' "$st" | jq --argjson s "$snap" '.news = ($s.news | length) | .need = [$s.need[] | tojson]')
+  else
+    # a failed patch (network, rate limit) fails this sync only; the next one retries the
+    # same card, so a glitch never posts anything
+    lark im messages patch --message-id "$root" --data "$(jq -n --arg b "$body" '{content:$b}')" >/dev/null \
+      || die "patching the card failed; the next sync retries"
   fi
   printf '%s\n' "$st" > "$map.tmp" && mv "$map.tmp" "$map"
 }

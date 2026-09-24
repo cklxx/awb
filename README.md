@@ -136,14 +136,16 @@ its own topic of one Lark topic group. `install.sh` asks for the group (or reads
 `AWB_LARK_CHAT=oc_xxx`); `awb-lark setup oc_xxx` sets it later. The bot must be a member of
 the group.
 
-- One board = one topic. The topic's root message is a card: the metric with its trend chart,
-  task progress and the last hour's movement, what needs you, a table of agents (current
-  milestone, time, verified milestones), and the task tree and news folded underneath. The
-  card is patched in place; after 14 days (Lark's limit) a fresh card is posted in the topic.
-- New news lines and new "needs you" items are posted as replies in the topic, once each.
+- One board = one topic, and every update lands on that topic's card, patched in place:
+  the metric with its trend chart, task progress and the last hour's movement, what needs
+  you, a table of agents (current milestone, time, verified milestones), the latest news,
+  and the task tree folded. Nothing else is posted.
+- A failed patch fails that sync only; the next one retries the same card. Lark stops
+  patching a card after 14 days, so at 13 days the board opens a new topic and the old card
+  is replaced by a pointer to it.
 - The board syncs by itself once a minute while `awb board` / `awb up` runs
   (`AWB_LARK_EVERY`); `awb-lark sync` does it by hand, `--dry-run` prints the card JSON.
-- The mapping is `$AWB_DIR/lark.json` (chat, root message, live card), so it follows the
+- The mapping is `$AWB_DIR/lark.json` (chat, root message), so it follows the
   board. The card is built from `awb snapshot`, the same data as the brief view.
 
 ## Notify agents
