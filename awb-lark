@@ -89,7 +89,9 @@ card() {
        + (if $s.metric and ($s.metric.history | length) >= 2 then
            [{tag:"chart", height:"180px", chart_spec:{
               type:"line",
-              data:{values:[$s.metric.history[] | {t:(.ep | strflocaltime("%m-%d %H:%M")), v:.value}]},
+              # x is the training step when every reading has one (metric --step), else the time
+              data:{values:(all($s.metric.history[]; .x != null) as $steps
+                | [$s.metric.history[] | {t:(if $steps then "step \(.x)" else (.ep | strflocaltime("%m-%d %H:%M")) end), v:.value}])},
               xField:"t", yField:"v", point:{visible:true},
               axes:[{orient:"left", min:0, max:([$s.metric.target, ([$s.metric.history[].value] | max)] | max)}],
               markLine:[{y:$s.metric.target, label:{text:"目标 \($s.metric.target)"}}]}}]
