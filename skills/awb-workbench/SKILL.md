@@ -25,7 +25,10 @@ When you are the Claude the user talks to, follow this protocol and do not ask t
 type commands:
 
 1. Board: `awb board` (opens right of your tmux pane; outside tmux, ask the user to run
-   `awb watch` in another terminal), then `awb goal "<goal>"`.
+   `awb watch` in another terminal), then `awb goal "<goal>"`. The goal holds only the goal.
+   Every new measurement of the goal's number goes in `awb metric <name> <value> <target>
+   "<one-line note>"`, never into the goal text: the board draws the metric's history, the
+   change since the first reading and an estimated time to target from these events only.
 2. Workers: for each parallel task, `awb tui -g <group> <id> <name>`. It waits until the
    worker's Claude is ready and prints `<id> session: <session name>`. If it prints "answer the
    folder-trust prompt", ask the user to confirm trust in that pane; neither awb nor you makes
