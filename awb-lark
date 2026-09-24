@@ -108,7 +108,7 @@ card() {
                v:"\(.dv)/\(.dn)"}]}]
           else [] end)
        + (if ($s.idle | length) > 0 then
-           [{tag:"markdown", content:("空闲：\($s.idle | join("、"))" | grey), text_size:"notation"}] else [] end)
+           [{tag:"markdown", content:("空闲：\($s.idle | map(.name) | join("、"))" | grey), text_size:"notation"}] else [] end)
        # 4. latest news, on the card itself
        + (if ($s.news | length) > 0 then
            [{tag:"column_set", background_style:"grey-50", columns:[{tag:"column", width:"weighted", weight:1, padding:"8px",
@@ -134,14 +134,19 @@ sync() {
   [ -d "$AWB_DIR" ] || die "no board at $AWB_DIR"
   AWB_DIR=$(cd "$AWB_DIR" && pwd); export AWB_DIR
   map=$AWB_DIR/lark.json
-  # one sync per board at a time (the board's watch loop starts one every minute); a lock
-  # left by a killed sync is broken after AWB_LARK_STALE seconds, or refreshes stop for good
+  # One sync per board at a time. The lock is a symlink to its holder's pid and is taken
+  # over only when that process is gone: breaking it by age let a slow sync and a new one
+  # open two topics or patch an older state over a newer one (model/tla/AwbLark.tla).
+  # A hung sync is killed by the board's watch loop, which then frees the lock this way.
   lk=$AWB_DIR/lock-lark
-  if [ -d "$lk" ] && [ $(($(date +%s) - $(stat -f %m "$lk" 2>/dev/null || stat -c %Y "$lk"))) -ge "${AWB_LARK_STALE:-300}" ]; then
-    rm -rf "$lk"
+  # awb 0.0.7 locked with a directory, and ln -s would link inside it
+  if [ -d "$lk" ] && [ ! -L "$lk" ]; then rm -rf "$lk"; fi
+  if ! ln -s "$$" "$lk" 2>/dev/null; then
+    hp=$(readlink "$lk" 2>/dev/null || true)
+    if [ -n "$hp" ] && kill -0 "$hp" 2>/dev/null; then return 0; fi
+    rm -rf "$lk"; ln -s "$$" "$lk" 2>/dev/null || return 0
   fi
-  mkdir "$lk" 2>/dev/null || return 0
-  trap 'rm -rf "$AWB_DIR/lock-lark"' EXIT INT TERM
+  trap 'rm -f "$AWB_DIR/lock-lark"' EXIT INT TERM
   snap=$("$AWB" snapshot)
   # topic title: the project directory for ./.awb, else the board directory's own name
   proj=$(basename "$AWB_DIR"); [ "$proj" != .awb ] || proj=$(basename "$(dirname "$AWB_DIR")")
@@ -161,7 +166,11 @@ sync() {
     old=$root; root=
   fi
   if [ -z "$root" ]; then
-    root=$(lark im +messages-send --chat-id "$c" --msg-type interactive --content "$body" -q '.data.message_id')
+    # Lark returns the first message for a repeated key, so a send repeated after a sync died
+    # before writing lark.json reuses the topic instead of opening a second one
+    key=awb-$(printf '%s|%s' "$AWB_DIR" "${old:-first}" | cksum | cut -d' ' -f1)
+    root=$(lark im +messages-send --chat-id "$c" --msg-type interactive --content "$body" \
+             --idempotency-key "$key" -q '.data.message_id')
     [ -n "$root" ] || die "sending the card failed"
     st=$(jq -n --arg c "$c" --arg r "$root" --argjson ep "$now" '{chat:$c, root:$r, card_ep:$ep}')
     if [ -n "${old:-}" ]; then

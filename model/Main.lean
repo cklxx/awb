@@ -1,4 +1,5 @@
 import Audit
+import Brief
 import Lean.Data.Json
 
 /-!
@@ -7,6 +8,7 @@ import Lean.Data.Json
 * `awbmodel fold`  — per-agent state from `step`: `ID STATUS GATE END DUR ND`, sorted by id;
                      `awb state` prints the same from awb's jq fold (differential test).
 * `awbmodel audit` — protocol violations from the verified monitor `audit`; exit 1 if any.
+* `awbmodel brief` — each agent's brief-view section (`Brief.sec`): `ID work|idle|need`.
 * `awbmodel gen SEED N` — a random event log for the differential test.
 -/
 
@@ -115,6 +117,13 @@ def main (args : List String) : IO UInt32 := do
             let e := match a.endEp with | some x => toString x | none => "-"
             IO.println s!"{id} {a.st.name} {a.gate} {e} {a.dur} {a.nd}"
         return 0
+      else if cmd == "brief" then
+        for (id, tr) in ts.toArray.qsort (fun x y => x.1 < y.1) do
+          if tr.any (fun | .ev .start => true | _ => false) then
+            let s := match sec (fold tr).st with
+              | some .work => "work" | some .idle => "idle" | some .needYou => "need" | none => "none"
+            IO.println s!"{id} {s}"
+        return 0
       else if cmd == "audit" then
         let mut bad := false
         for (id, tr) in ts do
@@ -122,5 +131,5 @@ def main (args : List String) : IO UInt32 := do
             IO.println s!"{id} {v.name}"; bad := true
         return (if bad then 1 else 0)
       else
-        IO.eprintln "usage: awbmodel fold|audit < events.jsonl | awbmodel gen SEED N"; return 2
+        IO.eprintln "usage: awbmodel fold|brief|audit < events.jsonl | awbmodel gen SEED N"; return 2
   | _ => IO.eprintln "usage: awbmodel fold|audit < events.jsonl | awbmodel gen SEED N"; return 2

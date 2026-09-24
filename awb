@@ -339,9 +339,9 @@ else
                then ($tt - $v) / (($v - $v0) / $el) else null end)}
      end) as $M
   # needs you: a permission dialog, a failed or dead agent, a decision
-  | ([ $s.agents[] | select(.wait) | {kind:"wait", name, text:.sess} ]
-     + [ $s.agents[] | select((.wait | not) and (.status | IN("failed","dead"))) | {kind:"fail", name, text:(.reason // "")} ]
-     + [ $s.torder[] | $s.tasks[.] | select(.state == "ask") | {kind:"ask", name:"", text} ]) as $need
+  | ([ $s.agents[] | select(.wait) | {kind:"wait", id, name, text:.sess} ]
+     + [ $s.agents[] | select((.wait | not) and (.status | IN("failed","dead"))) | {kind:"fail", id, name, text:(.reason // "")} ]
+     + [ $s.torder[] | $s.tasks[.] | select(.state == "ask") | {kind:"ask", id, name:"", text} ]) as $need
   # one record per working agent: what it does now, for how long, verified/claimed
   # milestones, flags (no code change, session disagrees); idle agents by name
   | (([ $diffs[] | {key:.id, value:.} ] | from_entries) as $df
@@ -362,7 +362,7 @@ else
                       then "无改动 " + (($nowep - $d.ep) | sdur) else empty end),
                     (if ($a.sess // "") != "" then "≠ " + $a.sess else empty end) ] | join(" · "))} ]
      | sort_by([(if .status == "blocked" then 0 elif .status == "running" then 1 else 2 end), -.idle])) as $act
-  | ([ $s.agents[] | select((.wait | not) and .status == "done" and ((.sess // "") == "")) | .name ]) as $idl
+  | ([ $s.agents[] | select((.wait | not) and .status == "done" and ((.sess // "") == "")) | {id, name} ]) as $idl
   | ([ $lroots[] as $root | $s.tasks[$root] as $rt
        | prog($s.tasks; leaves($s.tasks; $s.torder; $root)) as $rp
        | kids($s.tasks; $s.torder; $root) as $k0
@@ -411,7 +411,7 @@ else
              + $dm + " ⊢\($a.dv)/\($a.dn)" + $rs + " "
              + (if $a.flag != "" then $y + $a.flag + $rs + " " else "" end)
              + ($a.text | clip([$tw, 8] | max)) ]
-       + (if ($idl | length) > 0 then ["  " + $dm + "○ 空闲：" + ($idl | join(" ") | clip($bw - 12)) + $rs] else [] end)
+       + (if ($idl | length) > 0 then ["  " + $dm + "○ 空闲：" + ($idl | map(.name) | join(" ") | clip($bw - 12)) + $rs] else [] end)
      end) as $agb
   | (if ($trees | length) + $nold == 0 then [] else [""]
      + [ $trees[] | . as $tr
@@ -602,10 +602,21 @@ watch() {
   # a board mirrored to Lark (awb-lark setup ran) syncs its topic once a minute, in the background
   lk=$(dirname "$(readlink "$BIN" 2>/dev/null || echo "$BIN")")/awb-lark
   [ -x "$lk" ] || lk=$(command -v awb-lark || true)
+  # A tick starts a sync only when the last one has ended (its pid is in lock-lark); one
+  # running for AWB_LARK_STALE seconds is killed with its lark-cli (model/tla/AwbLark.tla)
   while :; do
     if [ -n "$lk" ] && [ -s "${XDG_CONFIG_HOME:-$HOME/.config}/awb/lark-chat" ] \
        && [ $(($(date +%s) - synced)) -ge "${AWB_LARK_EVERY:-60}" ]; then
-      synced=$(date +%s); ( AWB="$BIN" "$lk" sync >/dev/null 2>&1 & )
+      synced=$(date +%s)
+      lp=$(readlink "$AWB_DIR/lock-lark" 2>/dev/null || true)
+      if [ -n "$lp" ] && kill -0 "$lp" 2>/dev/null; then
+        la=$(stat -f %m "$AWB_DIR/lock-lark" 2>/dev/null || stat -c %Y "$AWB_DIR/lock-lark" 2>/dev/null || echo "$synced")
+        if [ $((synced - la)) -ge "${AWB_LARK_STALE:-300}" ]; then
+          pkill -TERM -P "$lp" 2>/dev/null || true; kill -TERM "$lp" 2>/dev/null || true
+        fi
+      else
+        ( AWB="$BIN" "$lk" sync >/dev/null 2>&1 & )
+      fi
     fi
     out=$(render)
     if [ "$out" != "$last" ]; then
@@ -734,7 +745,7 @@ unlock() { rm -rf "$AWB_DIR/lock-$1"; }
 # the agent's open milestone ("EP TEXT" of its last `now`, if no `done` came after)
 open_ms() {
   [ -s "$EV" ] || return 0
-  grep -F "\"id\":\"$1\"" "$EV" | grep -E '"t":"(now|done)"' | tail -1 | jq -r 'select(.t == "now") | "\(.ep) \(.text)"'
+  grep -F "\"id\":\"$1\"" "$EV" | grep -E '"t":"(now|done)"' | tail -1 | jq -R -r 'fromjson? | select(.t == "now") | "\(.ep) \(.text)"'
 }
 
 # dispatch/report loop with a worker over the session socket (model/tla/AwbLoop.tla):
@@ -742,7 +753,7 @@ open_ms() {
 # task: the first makes the main ask once, the second marks the task blocked for the user.
 open_key() {
   [ -s "$EV" ] || return 0
-  grep -F "\"id\":\"$1\"" "$EV" | grep -E '"t":"(now|done)"' | tail -1 | jq -r 'select(.t == "now") | .key // empty'
+  grep -F "\"id\":\"$1\"" "$EV" | grep -E '"t":"(now|done)"' | tail -1 | jq -R -r 'fromjson? | select(.t == "now") | .key // empty'
 }
 send() {
   [ $# -ge 2 ] || die "usage: $PROG send ID TASK   (prints the message to SendMessage)"
@@ -776,7 +787,7 @@ idle() {
 pending() {
   init_dir
   st=$(peers)
-  for id in $(agent_panes | cut -d' ' -f1; [ -s "$EV" ] && jq -r 'select(.t == "start") | .id' "$EV"); do echo "$id"; done | awk '!s[$0]++' |
+  for id in $(agent_panes | cut -d' ' -f1; [ -s "$EV" ] && jq -R -r 'fromjson? | select(.t == "start") | .id' "$EV"); do echo "$id"; done | awk '!s[$0]++' |
   while read -r id; do
     k=$(open_key "$id"); [ -n "$k" ] || continue
     printf '%s #%s %s\n' "$id" "$k" "$(printf '%s\n' "$st" | awk -v i="$id" '$1 == i {print $3, $4}')"
@@ -843,7 +854,8 @@ skill() {
 }
 
 agent_panes() {
-  { [ -s "$EV" ] && jq -r 'select(.t=="start" and (.pane // "") != "") | "\(.id) \(.pane)"' "$EV"
+  # a torn (half-appended) line is skipped, as in events_json
+  { [ -s "$EV" ] && jq -R -r 'fromjson? | select(.t=="start" and (.pane // "") != "") | "\(.id) \(.pane)"' "$EV"
     [ -s "$AWB_DIR/panes" ] && awk 'NF >= 2 {print $1, $2}' "$AWB_DIR/panes"; } \
   | awk '{ p[$1] = $2; if (!($1 in o)) o[$1] = NR } END { for (i in p) print o[i], i, p[i] }' \
   | sort -n | cut -d' ' -f2-
@@ -1428,6 +1440,15 @@ FT
       "$m" gen $n 80 > "$t/diff/events.jsonl"
       a=$(AWB_DIR=$t/diff "$BIN" state); b=$("$m" fold < "$t/diff/events.jsonl")
       [ "$a" = "$b" ] || { printf 'jq:\n%s\nlean:\n%s\n' "$a" "$b" >&2; die "selftest: jq fold != Lean model (awbmodel gen $n 80)"; }
+      # every 4th log: the brief view's sections (awb snapshot) match Brief.sec, which is
+      # proven to show every agent; each agent must appear in exactly one section
+      if [ $((n % 4)) = 0 ]; then
+        a=$(AWB_DIR=$t/diff "$BIN" snapshot 2>"$t/diff/err" | jq -r '[(.agents[] | "\(.id) work"), (.idle[] | "\(.id) idle"),
+              (.need[] | select(.kind == "fail") | "\(.id) need")] | sort[]')
+        b=$("$m" brief < "$t/diff/events.jsonl")
+        [ "$a" = "$b" ] || { printf 'jq:\n%s\nlean:\n%s\n' "$a" "$b" >&2; die "selftest: brief sections != Lean Brief.sec (awbmodel gen $n 80)"; }
+        [ ! -s "$t/diff/err" ] || die "selftest: snapshot errored on a log with a torn line: $(head -1 "$t/diff/err")"
+      fi
     done
   else
     echo "selftest: Lean model not built, skipped audit and differential test (cd model && lake build)" >&2
@@ -1512,6 +1533,7 @@ FAKE
       || die "selftest: awb-lark card"
     lr sync; grep -c '+messages-send --chat-id oc_test --msg-type interactive' "$t/lark.log" | grep -qx 1 \
       || die "selftest: awb-lark did not create the topic once"
+    cp "$t/lark.log" "$t/lark.log.first"
     jq -e '.root == "om_root"' "$lb/lark.json" >/dev/null || die "selftest: awb-lark mapping"
     # every update lands on the one card: news and needs-you are patched in, never posted
     AWB_DIR=$lb "$BIN" news "second-news"; AWB_DIR=$lb "$BIN" task q9 ask "pick-one"; : > "$t/lark.log"; lr sync
@@ -1531,11 +1553,19 @@ FAKE
     grep -q 'messages patch --message-id om_root' "$t/lark.log" && grep -q '新话题' "$t/lark-last.json" \
       || die "selftest: the old card does not point to the new topic"
     ! grep -q '+messages-reply' "$t/lark.log" || die "selftest: rolling over posted into the old topic"
-    # a lock left by a killed sync must not stop refreshes for good
-    mkdir "$lb/lock-lark"; touch -t 200001010000 "$lb/lock-lark"; : > "$t/lark.log"; lr sync
-    grep -q 'messages patch' "$t/lark.log" || die "selftest: a stale awb-lark lock stopped the refresh"
-    mkdir "$lb/lock-lark"; : > "$t/lark.log"; lr sync; rmdir "$lb/lock-lark"
-    ! grep -q 'messages patch' "$t/lark.log" || die "selftest: awb-lark ran two syncs of one board at once"
+    # the lock (model/tla/AwbLark.tla): a dead holder's lock is taken over, a live holder's
+    # never is, however old; a lock directory left by awb 0.0.7 is taken over too
+    sh -c 'exit 0' & dp=$!; wait $dp
+    ln -s "$dp" "$lb/lock-lark"; : > "$t/lark.log"; lr sync
+    grep -q 'messages patch' "$t/lark.log" || die "selftest: a dead sync's lock stopped the refresh"
+    [ ! -e "$lb/lock-lark" ] || die "selftest: awb-lark left its lock behind"
+    sleep 30 & lp=$!; ln -s "$lp" "$lb/lock-lark"; : > "$t/lark.log"; lr sync
+    ! grep -q 'messages patch' "$t/lark.log" || die "selftest: awb-lark took a live sync's lock"
+    kill $lp; wait $lp 2>/dev/null || true; rm -f "$lb/lock-lark"
+    mkdir "$lb/lock-lark"; : > "$t/lark.log"; lr sync
+    grep -q 'messages patch' "$t/lark.log" || die "selftest: an old lock directory stopped the refresh"
+    # the topic is created with a key derived from the board, so a repeated send is deduplicated
+    grep -q 'idempotency-key awb-' "$t/lark.log.first" || die "selftest: the topic was created without an idempotency key"
     # the refresh itself: a running board (watch) patches the card on its own, again and
     # again, and each patch carries the board's latest state
     : > "$t/lark.log"
