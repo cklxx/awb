@@ -98,7 +98,7 @@ card() {
                {name:"s", display_name:"状态", data_type:"options", width:"80px"},
                {name:"c", display_name:"当前", data_type:"lark_md", width:"auto"},
                {name:"d", display_name:"用时", data_type:"text", width:"80px"},
-               {name:"v", display_name:"已核", data_type:"text", width:"70px"}],
+               {name:"v", display_name:"已核", data_type:"text", width:"80px"}],
              rows:[$s.agents[] | {
                a:.name,
                s:[{"running":{text:"在做", color:"blue"}, "blocked":{text:"等待", color:"orange"},
