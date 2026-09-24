@@ -76,7 +76,7 @@ reduce (. // [])[] as $e (
     | (.checks[$e.id].steps | map(.s) | index($e.step)) as $i
     | if $i == null then .checks[$e.id].steps += [{s:$e.step, state:$e.state, ep0:$e.ep, ep1:null, note:""}]
       else .checks[$e.id].steps[$i] += {state:$e.state, ep1:$e.ep, note:$e.note} end
-  elif .agents[$e.id] == null then .
+  elif ($e.id | type) != "string" or .agents[$e.id] == null then .
   elif $e.t == "now" then
     (if .agents[$e.id].status == "done" then .agents[$e.id].status = "running" | .agents[$e.id].endEp = null | .agents[$e.id].reason = "" else . end)
     | .agents[$e.id].current = {text:($e.text // ""), time:($e.time // ""), ep:($e.ep // 0)}
@@ -170,7 +170,9 @@ def wrap($n):
 ($h   | if . < 12 then 12 elif . > 200 then 200 else . end) as $h |
 ($w - 1) as $inner |
 
-fold
+. as $raw
+| ([$raw[] | select(type == "object" and .t == "metric")] | last // {}) as $metric
+| ($raw | fold)
 
 # pane closed without a finish/fail event -> dead (empty pane = remote agent)
 | .agents |= map_values(
@@ -293,7 +295,22 @@ else
   | ([$s.agents[].done[]? | .text // ""]) as $mdone
   | ([$mdone[] | select(startswith("⊢ "))] | length) as $mver
   | ("   里程碑 已核 \($mver) / 自报 \(( $mdone | length) - $mver)") as $bmil
-  | ([$top] + [$goal_lines[] | "│ " + .] + [($bfoot | clip($bw)), ($dm + ($bagents | clip($bw)) + $rs), ($dm + ($bmil | clip($bw)) + $rs)] + [""]
+  | (if ($metric.name // "") == "" then ""
+      else (($metric.value | tonumber? ) as $v | ($metric.target | tonumber?) as $tt
+        # clip each PLAIN field to a fixed width BEFORE wrapping it in colour,
+        # so a later clip can never bisect an ANSI escape and leak colour.
+        | ($metric.name | clip(14) | pad(14)) as $nm
+        | ($metric.note // "" | clip($bw - 46)) as $nt
+        | (if ($v != null and $tt != null and $tt > 0)
+             then ([0, $v / $tt, 1] | if .[1] < .[0] then .[0] elif .[1] > .[2] then .[2] else .[1] end) as $frac
+               | "▕" + bar($frac; 1; 10) + "▏ " + (($frac * 100) | floor | tostring) + "%  "
+             else "" end) as $bar
+        | ($cy + $nm + $rs + " " + ($metric.value | tostring) + " / " + ($metric.target | tostring)
+           + "  " + $bar + (if $nt != "" then $dm + $nt + $rs else "" end)))
+      end) as $mline
+  | ([$top] + [$goal_lines[] | "│ " + .]
+     + (if $mline == "" then [] else ["│ " + $mline] end)
+     + [($bfoot | clip($bw)), ($dm + ($bagents | clip($bw)) + $rs), ($dm + ($bmil | clip($bw)) + $rs)] + [""]
   + ([ kids($s.tasks; $s.torder; "")[] as $root | $s.tasks[$root] as $rt
        | prog($s.tasks; leaves($s.tasks; $s.torder; $root)) as $rp
        | [$cy + "■ " + ($rt.text | clip($bw - 25) | pad($bw - 25)) + $rs + " " + bar($rp.d; $rp.t; 12) + $dm + " \($rp.d)/\($rp.t)" + $rs]
@@ -947,6 +964,8 @@ Chat-driven: you talk to one Claude (the main agent); it keeps the board and run
   $PROG stale                       print "ID MINUTES" for running agents silent >= AWB_STALE
   $PROG nudge [--once]              remind silent agents in their pane ($AWB_DIR/panes: "ID PANE")
   $PROG news TEXT                   one progress line (board shows last 5)
+  $PROG metric NAME VALUE TARGET [NOTE]
+                                    single value/target bar under GOAL (brief view)
                                     board view: AWB_VIEW=brief (default) | full
                                     AWB_STALE=SECS: list agents silent that long (default 600)
   $PROG task ID STATE [TEXT] [PARENT] [OWNER]
@@ -1007,6 +1026,38 @@ selftest() {
     printf '%s' "$out" | grep -Fq -- "$s" || die "selftest: missing '$s'"
   done
   printf '%s' "$out" | grep -Eq '1s| [0-9]:[0-9][0-9]' || die "selftest: no durations"
+
+  # single metric indicator under GOAL, render-only (the "#" id keeps it out
+  # of the proven fold; `awb state` below proves no agent is created).
+  ! "$BIN" render | grep -Fq '▕' || die "selftest: metric bar shown with no metric event"
+  "$BIN" metric "tps" 32 40 "V100 target"
+  m=$("$BIN" render)
+  printf '%s' "$m" | grep -Fq 'tps' || die "selftest: metric name not rendered"
+  printf '%s' "$m" | grep -Fq '32 / 40' || die "selftest: metric value/target not rendered"
+  printf '%s' "$m" | grep -Fq 'V100 target' || die "selftest: metric note not rendered"
+  printf '%s' "$m" | grep -Fq '80%' || die "selftest: metric percent wrong"
+  # latest metric wins
+  "$BIN" metric "qps" 5 10 second-note
+  "$BIN" render | grep -Fq 'qps' || die "selftest: newer metric not shown"
+  ! "$BIN" render | grep -Fq 'V100 target' || die "selftest: stale metric still rendered"
+  # clamp to 100% and never below 0
+  "$BIN" metric over 41 40 x; "$BIN" render | grep -Fq '100%' || die "selftest: metric not clamped at 100"
+  "$BIN" metric under 3 0 x; "$BIN" render | grep -Fq ' 3 / 0' || die "selftest: zero-target metric mishandled"
+  # value/target must be finite numbers, not tokens jq can't tonumber
+  ! "$BIN" metric bad abc 10 2>/dev/null || die "selftest: non-numeric metric value accepted"
+  ! "$BIN" metric bad 1.2.3 10 2>/dev/null || die "selftest: '1.2.3' metric value accepted"
+  ! "$BIN" metric bad 10 - 2>/dev/null || die "selftest: '-' metric target accepted"
+  ! "$BIN" metric bad NaN 10 2>/dev/null || die "selftest: NaN metric value accepted"
+  ! "$BIN" metric bad 10 Infinity 2>/dev/null || die "selftest: Infinity metric target accepted"
+  # the fold must ignore an unknown event with NO id (used to index .agents[null]
+  # and blank the board; now matches Lean parseLine's `_ => none`). A metric has
+  # no id and must neither create an agent nor stop a later event applying.
+  printf '%s\n' '{"t":"zzz","ep":900000}' >> "$EV"
+  "$BIN" render | grep -Fq "SHIP THE WORKBENCH" || die "selftest: unknown no-id event blanked the board"
+  _ids=$("$BIN" state | awk '{print $1}' | sort -u | tr '\n' ' ')
+  [ "$_ids" = "a1 a2 " ] || die "selftest: unknown event leaked an agent into the fold (got: $_ids)"
+  "$BIN" now a1 "post-unknown-still-works"
+  AWB_VIEW=full "$BIN" render | grep -Fq "post-unknown-still-works" || die "selftest: events after an unknown no-id event dropped"
   # verified vs self-reported milestones: a1 has one done, none verified yet
   printf '%s' "$brief" | grep -Fq "里程碑 已核 0 / 自报 1" || die "selftest: brief milestone verify/self count wrong"
   printf '%s' "$out" | grep -F "✓ wire event log" | grep -Fq "自报" || die "selftest: unverified done not marked 自报"
@@ -1165,6 +1216,20 @@ FT
   "$BIN" skill | grep -q "awb check" || die "selftest: skill manual not found"
   if m=$(model_bin); then
     "$BIN" audit | grep -q "^g1 done-while-check-rejected" || die "selftest: audit missed done after rejection"
+    # fixed differential case: unknown events with NO id (and unknown t with an
+    # id that never started) interleaved with real ones must be ignored by both
+    # folds -- this pins jq's `($e.id|type)!="string" or .agents[id]==null` arm
+    # to Lean parseLine's `_ => none`.
+    mkdir -p "$t/diff0"
+    printf '%s\n' \
+      '{"t":"start","id":"u","name":"u","ep":1}' \
+      '{"t":"weird-no-id","ep":2}' \
+      '{"t":"now","id":"u","ep":3,"text":"m"}' \
+      '{"t":"zzz","ep":4}' \
+      '{"t":"status","id":"ghost","status":"running","ep":5}' \
+      '{"t":"done","id":"u","ep":6}' > "$t/diff0/events.jsonl"
+    a0=$(AWB_DIR=$t/diff0 "$BIN" state); b0=$("$m" fold < "$t/diff0/events.jsonl")
+    [ "$a0" = "$b0" ] || { printf 'jq:\n%s\nlean:\n%s\n' "$a0" "$b0" >&2; die "selftest: jq/Lean differ on unknown events"; }
     # differential test: jq fold (awb state) vs the proven Lean fold on random logs
     mkdir -p "$t/diff"; n=0
     while [ $n -lt "${AWB_DIFF_N:-200}" ]; do
@@ -1264,6 +1329,18 @@ case "$cmd" in
             append '{t:"news",time:$time,ep:$ep,text:$text}' --arg text "$*" ;;
   goal)     [ $# -ge 1 ] || die "usage: $PROG goal TEXT"
             append '{t:"goal",time:$time,ep:$ep,text:$text}' --arg text "$*" ;;
+  metric)   [ $# -ge 3 ] || die "usage: $PROG metric NAME VALUE TARGET [NOTE]"
+            # jq tonumber rejects '1.2.3'/'-'/''; the finite/self-equal guard
+            # additionally rejects NaN/Infinity (jq 1.8 has no finite/0).
+            _numok='tonumber as $n | $n == $n and $n < 1e309 and $n > -1e309'
+            printf '%s' "$2" | jq -eR "$_numok" >/dev/null || die "metric VALUE must be numeric (got: $2)"
+            printf '%s' "$3" | jq -eR "$_numok" >/dev/null || die "metric TARGET must be numeric (got: $3)"
+            # render-only: no id / agent. The fold's `($e.id|type)!="string" or
+            # .agents[id]==null` arm (matching Lean parseLine's `_ => none`)
+            # drops the unknown event, so it never reaches agent state; render
+            # reads it from the same piped event array, not a second log read.
+            append '{t:"metric",time:$time,ep:$ep,name:$name,value:($value|tonumber),target:($target|tonumber),note:$note}' \
+              --arg name "$1" --arg value "$2" --arg target "$3" --arg note "${4-}" ;;
   now)      [ $# -ge 2 ] || die "usage: $PROG now ID MILESTONE"
             append '{t:"now",time:$time,ep:$ep,id:$id,text:$text}' --arg id "$1" --arg text "${2-}" ;;
   done)     [ $# -ge 1 ] || die "usage: $PROG done ID [TEXT]"
