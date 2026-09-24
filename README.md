@@ -140,7 +140,11 @@ the group.
   the metric with its trend chart, task progress and the last hour's movement, what needs
   you, a table of agents (current milestone, time, verified milestones), the latest news,
   and the task tree folded. Nothing else is posted.
-- A failed patch fails that sync only; the next one retries the same card. Lark stops
+- A failed patch fails that sync only; the next one retries the same card. Syncs of one board
+  never overlap: the lock holds its owner's pid and is taken over only when that process is
+  gone, the watch loop kills a sync hung for `AWB_LARK_STALE` (300 s), and the topic is
+  created with an idempotency key so a send repeated after a crash reuses it
+  (`model/tla/AwbLark.tla`). Lark stops
   patching a card after 14 days, so at 13 days the board opens a new topic and the old card
   is replaced by a pointer to it.
 - The board syncs by itself once a minute while `awb board` / `awb up` runs
@@ -218,11 +222,13 @@ proven model:
 |---|---|---|
 | status fold (events → agent state) | proven: duration frozen iff ended, no `done` while a check is rejected, only known states, non-negative durations | `model/AwbModel.lean` |
 | jq fold in `awb` = Lean fold | differential test on random logs (`awb selftest`, 200 logs; 1000 run clean) | `awb state` vs `awbmodel fold` |
+| brief view / Lark card (events → sections) | proven: every agent is shown in one section, and an agent with a rejected check is never shown idle; the jq snapshot is differentially tested against it (every 4th random log) | `model/Brief.lean` vs `awb snapshot` |
 | protocol audit | proven: the one-pass monitor reports nothing iff every event obeys the rules given its prefix (`audit_iff_clean`); corollary: every PR in a clean log followed a passing check | `model/Audit.lean` |
 | deliverables | `awb check` (tests, or Lean with kernel-checked theorems and standard axioms only) | `awb check` |
 | merge | `awb pr` refuses without a passing check or with audit violations, and logs the PR for the audit | `awb pr` |
 | dispatch/report loop (main ↔ worker) | TLA+ with liveness: no false done, no lost task | `model/tla/AwbLoop.tla` |
 | tell vs a permission dialog | TLA+: a dialog the registry reported before a keystroke is never typed into (registry re-read before the paste and every Enter); `AwbWaitRace.cfg` shows the window no check closes | `model/tla/AwbWait.tla` |
+| Lark sync (ticks, manual syncs, crashes vs one topic) | TLA+: one topic per board and the card never goes back to an older state; `AwbLarkOld*.cfg` reproduce two topics and a regressed card from breaking the lock by age | `model/tla/AwbLark.tla` |
 | concurrency (check, pr, tell vs the agent) | TLA+, model-checked with TLC: `*Old.cfg` reproduces the races of 0.0.5, `*Fixed.cfg` passes | `model/tla/` |
 
 Races TLC found in 0.0.5, now fixed and covered by selftest: a check that passed after the
