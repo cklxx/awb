@@ -49,7 +49,10 @@ type commands:
 5. Subagents you start with your Agent tool can be on the board too: `awb start <id> <name>`
    and `awb now` before starting, `awb done` when the result comes back.
 
-`awb peers` shows each agent's Claude session name and busy/idle. Several boards: one `.awb` per
+`awb peers` shows each agent's Claude session name and busy/idle/waiting. The board reads the
+same registry: `▲ 待批准` means the worker is on a permission dialog (tell the user; awb never
+types into it), and 会话实况 lists self-reports the session contradicts. `awb stale` prints
+`ID MINUTES waiting` for dialog-blocked workers. Several boards: one `.awb` per
 project directory, or set `AWB_DIR`.
 
 ## Manual layout

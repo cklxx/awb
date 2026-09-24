@@ -143,6 +143,14 @@ non-git directories are skipped.
   or codex pane is never retried.
 - A rejected `awb check` tells the agent the reason automatically, unless the agent ran the
   check from its own pane (`AWB_NOTIFY=0` turns this off).
+- The board reads each Claude agent's live session state from `~/.claude/sessions` (read
+  only) and does not trust the self-report over it. A session on a permission dialog shows as
+  `▲ 待批准` with the dialog kind and its age, and `awb stale` prints it as `ID MINUTES waiting`,
+  whatever the agent last reported; `tell` and `nudge` refuse to type into it, since typed
+  text plus Enter would answer the dialog. A self-report the session contradicts is flagged
+  under 会话实况: reported done or failed while the session is busy, or reported running
+  while the session has been idle for `AWB_STALE` seconds. The dialog's own text is often
+  scrolled off the pane by queued messages, so the registry state is used, not the screen.
 - For Claude agents, `peers` maps each agent to its Claude Code session name via
   `~/.claude/sessions`. A main agent that is itself a Claude session can then message them with
   its `SendMessage` tool, which goes over Claude's own per-session socket and reaches the agent

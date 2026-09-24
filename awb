@@ -181,6 +181,18 @@ def wrap($n):
       then .status = "dead" | .reason = "pane closed" | .endEp = .lastEp
       else . end)
 
+# live Claude session state ($sess, from ~/.claude/sessions, not the proven fold): a
+# permission dialog overrides the self-report; a self-report the session contradicts is flagged
+| .agents |= with_entries(($sess[.key] // null) as $x
+    | if $x == null then .
+      elif $x.status == "waiting" then .value.wait = true
+        | .value.sess = "待批准：" + (if $x.waiting != "" then $x.waiting else "对话框" end) + " " + (($nowep - $x.since) | sdur)
+      elif $x.status == "busy" and (.value.status | IN("done","failed")) then
+        .value.sess = "自报" + {"done":"完成","failed":"失败"}[.value.status] + "，会话在忙"
+      elif $x.status == "idle" and .value.status == "running" and ($nowep - $x.since) >= ($stale | tonumber) then
+        .value.sess = "自报进行，会话空闲 " + (($nowep - $x.since) | sdur)
+      else . end)
+
 | . as $s
 | ($s.gseen | map({g:., ids:$s.gorder[.]})) as $groups
 | ([$s.agents[]] | length) as $n
@@ -244,8 +256,9 @@ def wrap($n):
     + [ range(0; $na) as $i | $as[$i] as $a | ($i == $na - 1) as $last
       | (if $last then "└─ " else "├─ " end) as $br
       | (if $last then "   " else "│  " end) as $ind
-      | ({"running":["◔",$cy,"进行中"],"done":["✓",$g,"完成"],"blocked":["▲",$y,"阻塞"],
-          "failed":["✗",$r,"失败"],"dead":["■",$r,"已退出"]}[$a.status] // ["•",$dm,$a.status]) as $st
+      | (if $a.wait then ["▲",$y,"待批准"] else
+          {"running":["◔",$cy,"进行中"],"done":["✓",$g,"完成"],"blocked":["▲",$y,"阻塞"],
+           "failed":["✗",$r,"失败"],"dead":["■",$r,"已退出"]}[$a.status] // ["•",$dm,$a.status] end) as $st
       | (($a.endEp // $nowep) - $a.startEp) as $tot
       | ($nowep - $a.lastEp) as $idle
       | ((($a.done|length) | tostring) + " ✓") as $cnt
@@ -256,7 +269,8 @@ def wrap($n):
       | ([ (if ($a.done | length) > 3 then {k:"more", n:(($a.done|length) - 3)} else empty end) ]
          + [ $a.done[-3:][] | {k:"done", text, dur, time} ]
          + (if ($a | live) then [{k:"cur", text:$a.current.text, ep:$a.current.ep}] else [] end)
-         + (if $a.reason != "" then [{k:"why", text:$a.reason}] else [] end)) as $ch
+         + (if $a.reason != "" then [{k:"why", text:$a.reason}] else [] end)
+         + (if ($a.sess // "") != "" then [{k:"sess", text:$a.sess}] else [] end)) as $ch
       | ($ch | length) as $nc
       | [ $st[1] + $hd + $dm + ($tot | dur) + $rs ]
       + [ range(0; $nc) as $j | $ch[$j] as $c
@@ -271,6 +285,7 @@ def wrap($n):
             elif $c.k == "cur" then
               $cy + $pre + "▸ " + ($c.text | clip($inner - 26) | pad($inner - 26))
               + ((($nowep - $c.ep) | sdur) | lpad(6)) + " 进行" + $rs
+            elif $c.k == "sess" then $y + $pre + "≠ " + ($c.text | clip($inner - 10)) + $rs
             elif $c.k == "why" then
               ({"blocked":$y,"failed":$r,"dead":$r}[$a.status] // $dm) + $pre + "▲ " + ($c.text | clip($inner - 10)) + $rs
             else $dm + $pre + "… 更早 \($c.n) 条" + $rs end ]
@@ -331,6 +346,10 @@ else
        + [ $st[] | "  " + (if .status == "blocked" then $y + "▲" else $r + " " end) + (.idle | sdur | lpad(6)) + $rs + "  " + (.name | pad(10)) + " "
            + $dm + ((if .status == "blocked" then "等：" + .reason elif .current then .current.text else .reason end) // "" | clip($bw - 24)) + $rs ]
        else [] end)
+  + ([ $s.agents[] | select((.sess // "") != "") ] as $sx
+     | if ($sx | length) > 0 then ["", $y + "会话实况（与自报不符）" + $rs]
+       + [ $sx[] | "  " + $y + (if .wait then "▲" else "≠" end) + $rs + " " + (.name | clip(10) | pad(10)) + " "
+           + (.sess | clip($bw - 16)) ] else [] end)
   + ( ([ $diffs[] | {key:.id, value:.} ] | from_entries) as $df
       | ([ $s.agents[] | select(.status == "running") ]
            | map(. as $a | ($df[$a.id] // null) as $d
@@ -409,7 +428,7 @@ render() {
     --argjson w "$cols" --argjson h "$rows" \
     --arg now "$(date +$TS_FMT)" --argjson nowep "$(date +%s)" \
     --arg prog "$PROG" --argjson live "$live" --arg view "${AWB_VIEW:-brief}" --arg stale "${AWB_STALE:-600}" \
-    --argjson diffs "$diffs" --argjson frz "${AWB_FROZEN:-900}" \
+    --argjson diffs "$diffs" --argjson frz "${AWB_FROZEN:-900}" --argjson sess "$(sessions_json)" \
     --arg g  "${ESC}[32m"  --arg cy "${ESC}[36m" --arg y "${ESC}[33m" \
     --arg r  "${ESC}[31m"  --arg dm "${ESC}[2m"  --arg rs "${ESC}[0m" \
     "$JQ_RENDER"
@@ -764,6 +783,9 @@ tell() {
   _msg=$*
   _p=$(agent_pane "$_id")
   [ -n "$_p" ] && tm list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qx "$_p" || die "$_id has no live pane"
+  # typed text + Enter would answer a permission dialog (Enter picks the highlighted "Yes")
+  [ "$(sessions_json | jq -r --arg i "$_id" '.[$i].status // ""')" != waiting ] \
+    || die "$_id is waiting on a permission dialog; answer it in pane $_p, awb will not type into it"
   # one tell per pane at a time, each with its own buffer: concurrent tells merged or lost
   # messages otherwise (model/tla/AwbTell.tla)
   lock "tell-$_p"
@@ -812,24 +834,39 @@ tell() {
   unlock "tell-$_p"
 }
 
+# Claude Code sessions of awb agents, read from ~/.claude/sessions (never written):
+# {ID: {name, status, waiting, since}}, status busy|idle|waiting|shell. One pass over the
+# registry; an entry being rewritten or of a dead pid is skipped. Pane ids are unique per
+# tmux server; the registry keeps the session a pane started in (panes move), so the session
+# name is matched only on awb's own server, where ids collide. Always prints JSON.
+sessions_json() {
+  _panes=$(tm list-panes -a -F '#{pane_id} #{session_name}' 2>/dev/null) || { echo '{}'; return 0; }
+  _strict=0; { [ -n "${AWB_TMUX_SOCKET:-}" ] || [ -S "$(sock_path)" ]; } && _strict=1
+  { awk 1 "$HOME"/.claude/sessions/*.json 2>/dev/null || true; } | jq -Rnc \
+    --arg ag "$(agent_panes)" --arg panes "$_panes" --argjson strict "$_strict" \
+    --arg pids " $(ps -Ao pid= | tr -s ' \n' '  ') " '
+    [inputs | fromjson? | select(type == "object" and (.tmux | type) == "string"
+                                 and (" \(.pid) " as $k | $pids | contains($k)))] as $reg
+    | ($panes | split("\n") | map(select(. != "") | split(" ") | {key:.[0], value:.[1]}) | from_entries) as $sn
+    | [ $ag | split("\n")[] | select(. != "") | split(" ") | .[0] as $id | .[1] as $p
+        | ($sn[$p] // null) as $s | select($s != null)
+        | ([$reg[] | select((.tmux | endswith("." + $p)) and ($strict == 0 or (.tmux | startswith($s + ":"))))]
+           | max_by(.startedAt // 0)) as $r
+        | select($r != null)
+        | {key:$id, value:{name:$r.name, status:$r.status, waiting:($r.waitingFor // ""),
+                           since:((($r.statusUpdatedAt // 0) / 1000) | floor)}} ]
+    | from_entries' 2>/dev/null || echo '{}'
+}
+
 # awb agents that are Claude Code sessions: ID PANE SESSION-NAME STATUS. A main Claude
 # agent messages them over Claude's own session socket with SendMessage(to: SESSION-NAME).
 peers() {
   init_dir
-  # per file: a registry entry being rewritten must not hide the others
-  _reg=$(for f in "$HOME"/.claude/sessions/*.json; do
-           jq -c '{tmux:(.tmux // ""), name, status, pid}' "$f" 2>/dev/null || true; done | jq -cs .)
-  # pane ids are unique per tmux server; the registry keeps the session a pane started in
-  # (panes move), so match the session name only on awb's own server, where ids collide
-  strict=0; { [ -n "${AWB_TMUX_SOCKET:-}" ] || [ -S "$(sock_path)" ]; } && strict=1
+  _s=$(sessions_json); _l=$(tm list-panes -a -F '#{pane_id}' 2>/dev/null || true)
   agent_panes | while read -r id pane; do
-      sess=$(tm display-message -p -t "$pane" '#{session_name}' 2>/dev/null) || { echo "$id $pane - gone"; continue; }
-      hit=$(printf '%s' "$_reg" | jq -r --arg s "$sess:" --arg p ".$pane" \
-            --argjson strict "$strict" \
-            '.[] | select((.tmux | endswith($p)) and ($strict == 0 or (.tmux | startswith($s))))
-             | "\(.pid) \(.name) \(.status)"' \
-            | while read -r pid n st; do kill -0 "$pid" 2>/dev/null && echo "$n $st"; done | head -1)
-      echo "$id $pane ${hit:-- not-claude}"
+      printf '%s\n' "$_l" | grep -Fxq "$pane" || { echo "$id $pane - gone"; continue; }
+      printf '%s' "$_s" | jq -r --arg i "$id" --arg p "$pane" \
+        '.[$i] | if . then "\($i) \($p) \(.name) \(.status)" else "\($i) \($p) - not-claude" end'
     done
 }
 
@@ -961,7 +998,8 @@ Chat-driven: you talk to one Claude (the main agent); it keeps the board and run
                                     (AWB_TUI_CMD, default claude-db if on PATH else claude)
   $PROG start ID NAME [KIND] [GROUP]  register a non-pane / remote agent
   $PROG goal TEXT                   set the overall goal
-  $PROG stale                       print "ID MINUTES" for running agents silent >= AWB_STALE
+  $PROG stale                       print "ID MINUTES" for running agents silent >= AWB_STALE,
+                                    and "ID MINUTES waiting" for agents on a permission dialog
   $PROG nudge [--once]              remind silent agents in their pane ($AWB_DIR/panes: "ID PANE")
   $PROG news TEXT                   one progress line (board shows last 5)
   $PROG metric NAME VALUE TARGET [NOTE]
@@ -1179,6 +1217,32 @@ FT
     tmux -L "$S" kill-window -t "$fp" 2>/dev/null || true
     tmux -L "$S" kill-window -t "$fb" 2>/dev/null || true
     tmux -L "$S" kill-window -t "$fc" 2>/dev/null || true
+    # session truth from a fake ~/.claude/sessions entry on z1's pane (pid = this shell):
+    # A. a permission dialog shows on the board and in stale, and tell will not type into it;
+    # B. a self-report the session contradicts is flagged. Each has its negative control.
+    zp=$(agent_pane z1); zs=$(tmux -L "$S" display-message -p -t "$zp" '#{session_name}')
+    mkdir -p "$t/home/.claude/sessions"
+    reg() { printf '{"pid":%s,"name":"zz-1","status":"%s","waitingFor":"%s","startedAt":1,"statusUpdatedAt":%s000,"tmux":"%s:@0.%s"}\n' \
+              $$ "$1" "${2-}" "$(($(date +%s) - ${3:-0}))" "$zs" "$zp" > "$t/home/.claude/sessions/1.json"; }
+    ht() { HOME=$t/home "$BIN" "$@"; }
+    reg waiting "permission prompt"
+    ht render | grep -Fq "待批准：permission prompt" || die "selftest: permission dialog not on the board"
+    ht stale | grep -Eq '^z1 [0-9]+ waiting$' || die "selftest: permission dialog not in stale"
+    ! ht tell z1 "echo typed-into-dialog" 2>/dev/null || die "selftest: tell typed into a permission dialog"
+    reg idle
+    ! ht render | grep -Fq "待批准" || die "selftest: idle session shown as waiting for approval"
+    ! ht stale | grep -q waiting || die "selftest: idle session listed as waiting"
+    reg busy        # z1 reported done
+    ht render | grep -Fq "自报完成，会话在忙" || die "selftest: done agent with a busy session not flagged"
+    reg idle
+    ! ht render | grep -Fq "会话在忙" || die "selftest: done agent with an idle session flagged"
+    "$BIN" now z1 "still going"
+    reg idle "" 900
+    ht render | grep -Fq "自报进行，会话空闲" || die "selftest: running agent idle 15m not flagged"
+    reg idle "" 10
+    ! ht render | grep -Fq "会话空闲" || die "selftest: running agent idle 10s flagged"
+    "$BIN" finish z1
+    [ "$(ht peers | grep '^z1 ')" = "z1 $zp zz-1 idle" ] || die "selftest: peers lost the session"
     unset AWB_TMUX_SOCKET
 
     # no-code-change detection drives the REAL freeze_once, not just render:
@@ -1322,7 +1386,10 @@ case "$cmd" in
                   elif ($e.t | IN("start","done")) then .[$e.id].last = $e.ep | .[$e.id].st = (.[$e.id].st // "running")
                   else . end)
               | to_entries[] | select(.value.st == "running" and $now - .value.last >= $stale)
-              | "\(.key) \((($now - .value.last) / 60) | floor)"' ;;
+              | "\(.key) \((($now - .value.last) / 60) | floor)"'
+            # agents on a permission dialog, whatever they reported: "ID MINUTES waiting"
+            sessions_json | jq -r --argjson now "$now" 'to_entries[] | select(.value.status == "waiting")
+              | "\(.key) \((($now - .value.since) / 60) | floor) waiting"' ;;
   nudge)    init_dir; if [ "${1:-}" = "--once" ]; then nudge_once
             else while :; do nudge_once; sleep "${AWB_NUDGE_POLL:-60}"; done; fi ;;
   news)     [ $# -ge 1 ] || die "usage: $PROG news TEXT"
