@@ -1048,7 +1048,7 @@ Agents: read the operating manual with '$PROG skill' before driving the board.
 Chat-driven: you talk to one Claude (the main agent); it keeps the board and runs workers:
   $PROG board                       board beside the main agent's tmux pane
   $PROG tui ID NAME                 start a Claude worker; prints its session name
-  msg=$($PROG send ID "task"); SendMessage(to: <session>, message: $msg, notify_when_idle: true);
+  msg=\$($PROG send ID "task"); SendMessage(to: <session>, message: \$msg, notify_when_idle: true);
   on a reply "[awb ID#KEY] ...": $PROG reply ID KEY "result"; on an idle notice: $PROG idle ID.
   Several boards: one .awb per project dir, or \$AWB_DIR.
 
@@ -1106,6 +1106,10 @@ selftest() {
   trap cleanup EXIT
   export AWB_DIR=$t AWB_COLS=160 AWB_ROWS=200; EV=$t/events.jsonl
 
+  ( cd "$t" && AWB_DIR=help-probe "$BIN" up --help >/dev/null ) || die "selftest: up --help failed"
+  [ ! -e "$t/help-probe" ] || die "selftest: up --help created AWB_DIR"
+  ( cd "$t" && AWB_DIR=help-probe "$BIN" --help >/dev/null ) || die "selftest: --help failed"
+  [ ! -e "$t/help-probe" ] || die "selftest: --help ran a command (created AWB_DIR)"
   "$BIN" goal "SHIP THE WORKBENCH"
   "$BIN" start a1 claude agent backend
   "$BIN" now a1 "wire event log"
@@ -1461,6 +1465,8 @@ CHK
 # newly appended code after main returns.
 main() {
 cmd=${1:-}; shift 2>/dev/null || true
+# `awb up --help` used to start a session and create AWB_DIR in the cwd; help never has side effects
+case "${1:-}" in -h|--help) usage; exit 0 ;; esac
 case "$cmd" in
   up)       up "$@" ;;
   down)     init_dir; tm kill-session -t awb 2>/dev/null || true ;;
