@@ -413,6 +413,19 @@ else
         then {kind:"board", text:"看板 \($quiet | ago)没有新事件，主控可能停了"} else empty end) ]) as $anom
   # the next open steps of the main line
   | ([ $trees[] | .kids[] | select(.state | IN("done","drop") | not) ][:3]) as $next
+  # the tree below leaves out the steps already shown as 下一步
+  | [ $trees[] | .kids |= map(select(. as $k | $next | index([$k]) | not)) ] as $trees
+  # news: two lines of the same minute about one reading (an automatic feed and a
+  # hand-written line) show once, the latest: the numbers of one line include a decimal and all
+  # of them appear in the other line. A shared step number alone ("15000") is not a reading.
+  | (def nums: [scan("[0-9]+(?:\\.[0-9]+)?")] | unique;
+     def sub($a; $b): ($a | any(contains("."))) and ($a | inside($b));
+     reduce ($s.news | reverse[]) as $n ([];
+       ($n.text | nums) as $nn
+       | if any(.[]; .time[0:5] == $n.time[0:5]
+             and ((.text | nums) as $o | sub($o; $nn) or sub($nn; $o)))
+         then . else . + [$n] end)
+     | reverse) as $news
   | ([ (if ($need | length) > 0 then "需要你 \($need | length) 件" else "无需你处理" end),
        # a judgement only: the numbers are on the metric line and the footer
        (if $M == null or $M.value == null or $M.target == null then empty
@@ -429,7 +442,7 @@ else
          verified:{v:$mver, n:($mdone | length)}, running:$nrun, metric:$M, need:$need,
          anomalies:$anom, next:$next,
          agents:$act, idle:$idl, tasks:$trees, tasks_old:$nold,
-         news:$s.news, checks:[$s.checks[] | {id, what, ok:(all(.steps[]; .state == "ok")),
+         news:$news, checks:[$s.checks[] | {id, what, ok:(all(.steps[]; .state == "ok")),
            fail:any(.steps[]; .state == "fail"), startEp}]} | tojson ]
     else
   (if $m1 + $t1 > 0 then $g + "近 1 小时 里程碑 +\($m1) 任务 +\($t1)" + $rs
@@ -478,8 +491,8 @@ else
      + $rs) as $bday
   | ([$btop] + $babout + [$bhead] + $mlines + [($bfoot | clip($bw)), $bstat]
      + $needb + $nextb + $anomb + ["", $bday]
-     + (if ($s.news | length) > 0 then ["", $g + "进展" + $rs]
-          + [ $s.news[-3:] | reverse[] | "  ✓ " + $dm + .time[0:5] + $rs + " " + (.text | clip($bw - 12)) ] else [] end)
+     + (if ($news | length) > 0 then ["", $g + "进展" + $rs]
+          + [ $news[-3:] | reverse[] | "  ✓ " + $dm + .time[0:5] + $rs + " " + (.text | clip($bw - 12)) ] else [] end)
      + $tasksb + $chk)
     end
 end
@@ -1330,6 +1343,14 @@ selftest() {
   bd2=$t/brief2; mkdir -p "$bd2"
   for v in 1 2 3; do AWB_DIR=$bd2 "$BIN" metric he $v 30; done
   AWB_DIR=$bd2 "$BIN" snapshot | jq -e '.metric.eta == null' >/dev/null || die "selftest: an estimate from readings in one second"
+  # a step shown as 下一步 is not repeated in the tree below it
+  [ "$(printf '%s\n' "$b" | grep -c 'open one')" = 1 ] || die "selftest: a 下一步 step repeated in the task tree"
+  # news about one reading in the same minute shows once; another reading or a bare step does not merge
+  bd4=$t/brief4; mkdir -p "$bd4"
+  for n in "step 15000 checkpoint saved" "step 15000 val loss 1.888" "val 1.888 at 15000, grad 0.55 ok" "val loss 1.901 at 15500"; do
+    AWB_DIR=$bd4 "$BIN" news "$n"; done
+  [ "$(AWB_DIR=$bd4 "$BIN" snapshot | jq -c '[.news[].text]')" = '["step 15000 checkpoint saved","val 1.888 at 15000, grad 0.55 ok","val loss 1.901 at 15500"]' ] \
+    || die "selftest: news about one reading not shown once"
   # the headline is a judgement; the numbers stay on the metric line
   ! printf '%s\n' "$b" | grep '▶' | grep -Fq '25/40' || die "selftest: headline repeats the metric numbers"
   # an estimate past the deadline (--by, given once) is replaced by "misses it"; a far deadline keeps it
