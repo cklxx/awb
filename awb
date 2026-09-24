@@ -419,7 +419,8 @@ dims() {
   if [ -n "${AWB_ROWS:-}" ] && [ -n "${AWB_COLS:-}" ]; then
     echo "$AWB_COLS $AWB_ROWS"
   elif [ -n "${TMUX_PANE:-}" ]; then
-    tm display-message -p -t "$TMUX_PANE" '#{pane_width} #{pane_height}' 2>/dev/null
+    # $TMUX_PANE names a pane of the server this process runs in ($TMUX); tm would prefer AWB_DIR's socket
+    tmux display-message -p -t "$TMUX_PANE" '#{pane_width} #{pane_height}' 2>/dev/null
   else
     stty size 2>/dev/null | awk '{print $2, $1}'
   fi || echo "80 24"
@@ -1439,6 +1440,15 @@ exit 0
 CHK
   /bin/sh "$ha/check.sh" </dev/null || die "selftest: hot-edit exit guard (rc $?): 'main \"$@\"; exit' must stop code appended by a longer rewrite"
 
+  if command -v tmux >/dev/null; then
+    # a board inside some tmux server must size itself from THAT server, even when AWB_DIR holds a live awb socket
+    tmux -S "$t/sock" new-session -d -s decoy -x 80 -y 24 "sleep 60"
+    ep=$(tmux -L "${S}e" new-session -d -x 150 -y 60 -P -F '#{pane_id}' "sleep 60")
+    es=$(tmux -L "${S}e" display-message -p '#{socket_path}')
+    rows=$(TMUX="$es,0,0" TMUX_PANE=$ep AWB_COLS= AWB_ROWS= AWB_VIEW=full "$BIN" render | wc -l | tr -d ' ')
+    tmux -S "$t/sock" kill-server 2>/dev/null; tmux -L "${S}e" kill-server 2>/dev/null
+    [ "$rows" -gt 24 ] || die "selftest: board sized from the awb socket's pane, not its own ($rows rows)"
+  fi
   echo "selftest ok"
 }
 
