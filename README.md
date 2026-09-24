@@ -238,7 +238,9 @@ interleaved their events, so the audit flagged an honest pass; `awb pr` could op
 a new check was running; two concurrent `tell`s into one pane merged into one prompt or lost a
 message. Fixes: a per-agent lock around `check` and `pr`, a check verifies only the milestone
 it started on (otherwise it is rejected as stale), and `tell` uses a per-call buffer under a
-per-pane lock. Run TLC with
+per-pane lock. In 0.0.7 a process that had unlocked still removed that lock on exit, after
+another had taken it, and two tells merged; `AwbTellExitTrap.cfg` reproduces it and `unlock`
+now forgets the lock. Run TLC with
 `java -cp tla2tools.jar tlc2.TLC -config AwbCheckFixed.cfg -deadlock AwbCheck` in `model/tla/`.
 
 Audit rules, per agent: a verified milestone must follow a passing check (forged `verified`
