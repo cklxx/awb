@@ -171,7 +171,7 @@ def wrap($n):
   end;
 
 ($w   | if . < 40 then 40 elif . > 240 then 240 else . end) as $w |
-($h   | if . < 12 then 12 elif . > 200 then 200 else . end) as $h |
+($h   | if . < 12 then 12 elif . > 5000 then 5000 else . end) as $h |
 ($w - 1) as $inner |
 
 . as $raw
@@ -649,10 +649,22 @@ nudge_once() {
 
 watch() {
   printf '\033[?1049h\033[H\033[2J'
-  # INT/TERM must end the loop (a bare trap on them ignored kill); EXIT restores the screen
-  trap 'printf "\033[?1049l"' EXIT
+  # The board is rendered in full and scrolls: j/k, arrows or the mouse wheel by lines,
+  # space/b by pages, g/G to the top/end, q quits. Keys are read with a timeout of one
+  # refresh (stty time); the wheel arrives as SGR mouse reports, which tmux forwards once
+  # the pane asks for them. Without a terminal on stdin the board just refreshes.
+  kb=0; [ -t 0 ] && kb=1
+  if [ $kb = 1 ]; then
+    _stty=$(stty -g)
+    stty -icanon -echo min 0 time "$(awk -v i="${AWB_INTERVAL:-1}" 'BEGIN { t = int(i * 10); print (t < 1 ? 1 : t) }')"
+    printf '\033[?1000h\033[?1006h'
+    trap 'printf "\033[?1000l\033[?1006l\033[?1049l"; stty "$_stty"' EXIT
+  else
+    # INT/TERM must end the loop (a bare trap on them ignored kill); EXIT restores the screen
+    trap 'printf "\033[?1049l"' EXIT
+  fi
   trap 'exit 130' INT TERM
-  last=; synced=0
+  last=; synced=0; off=0; full=; rt=0
   # a board mirrored to Lark (awb-lark setup ran) syncs its topic once a minute, in the background
   lk=$(dirname "$(readlink "$BIN" 2>/dev/null || echo "$BIN")")/awb-lark
   [ -x "$lk" ] || lk=$(command -v awb-lark || true)
@@ -672,12 +684,56 @@ watch() {
         ( AWB="$BIN" "$lk" sync >/dev/null 2>&1 & )
       fi
     fi
-    out=$(render)
+    set -- $(dims); cols=${1:-80}; rows=${2:-24}
+    # a key within the same second scrolls what is on screen instead of rendering again
+    now=$(date +%s)
+    if [ "$now" != "$rt" ] || [ -z "$full" ]; then
+      rt=$now; full=$(AWB_COLS=$cols AWB_ROWS=5000 render)
+    fi
+    n=$(printf '%s\n' "$full" | wc -l | tr -d ' ')
+    if [ "$n" -le "$rows" ]; then off=0; out=$full
+    else
+      max=$((n - rows + 1)); [ "$off" -le "$max" ] || off=$max; [ "$off" -ge 0 ] || off=0
+      out=$(printf '%s\n' "$full" | sed -n "$((off + 1)),$((off + rows - 1))p")
+      below=$((n - off - rows + 1))
+      if [ "$below" -gt 0 ]; then hint="↓ 还有 $below 行 · j/k ↑↓ 滚轮 · 空格翻页 · g 顶部"
+      else hint="↑ 上面 $off 行 · k ↑ 滚轮 · g 顶部"; fi
+      out="$out
+${ESC}[2m  ${hint}${ESC}[0m"
+    fi
     if [ "$out" != "$last" ]; then
       last=$out
-      printf '\033[H\033[2J%s\n' "$out"
+      printf '\033[H\033[2J%s' "$out"
     fi
-    sleep "${AWB_INTERVAL:-1}"
+    if [ $kb = 1 ]; then
+      # one read can hold several keys (a fast wheel, typed ahead): take them in turn
+      k=$(dd bs=256 count=1 2>/dev/null || true); i=0
+      while [ -n "$k" ] && [ $i -lt 256 ]; do
+        i=$((i + 1))
+        case "$k" in
+          "${ESC}["\<*)   # SGR mouse report: ESC [ < button ; x ; y M|m
+            case "$k" in "${ESC}[<64;"*) off=$((off - 3)) ;; "${ESC}[<65;"*) off=$((off + 3)) ;; esac
+            r=${k#*[Mm]}; [ "$r" != "$k" ] || r=; k=$r; continue ;;
+          "${ESC}[A"*|"${ESC}OA"*) off=$((off - 1)); k=${k#???}; continue ;;
+          "${ESC}[B"*|"${ESC}OB"*) off=$((off + 1)); k=${k#???}; continue ;;
+          "${ESC}[5~"*) off=$((off - rows + 2)); k=${k#????}; continue ;;
+          "${ESC}[6~"*) off=$((off + rows - 2)); k=${k#????}; continue ;;
+        esac
+        c=${k%"${k#?}"}; k=${k#?}
+        case "$c" in
+          q) exit 0 ;;
+          k) off=$((off - 1)) ;;
+          j) off=$((off + 1)) ;;
+          " ") off=$((off + rows - 2)) ;;
+          b) off=$((off - rows + 2)) ;;
+          g) off=0 ;;
+          G) off=$n ;;
+        esac
+      done
+      [ "$off" -ge 0 ] || off=0
+    else
+      sleep "${AWB_INTERVAL:-1}"
+    fi
   done
 }
 
@@ -1589,6 +1645,19 @@ CHK
     rows=$(TMUX="$es,0,0" TMUX_PANE=$ep AWB_COLS= AWB_ROWS= AWB_VIEW=full "$BIN" render | wc -l | tr -d ' ')
     tmux -S "$t/sock" kill-server 2>/dev/null; tmux -L "${S}e" kill-server 2>/dev/null
     [ "$rows" -gt 24 ] || die "selftest: board sized from the awb socket's pane, not its own ($rows rows)"
+    # a board taller than its pane scrolls: G shows the last task and the hint, g j j moves 2 lines
+    sb=$t/scroll; mkdir -p "$sb"
+    i=1; while [ $i -le 30 ]; do AWB_DIR=$sb "$BIN" task "s$i" wip "scroll row $i" >/dev/null; i=$((i + 1)); done
+    tmux -L "${S}s" new-session -d -x 100 -y 12 "AWB_DIR=$sb AWB_COLS= AWB_ROWS= TMUX= '$BIN' watch"
+    cap() { sleep 1.5; tmux -L "${S}s" capture-pane -p; }
+    top=$(cap); tmux -L "${S}s" send-keys G; end=$(cap); tmux -L "${S}s" send-keys g j j; two=$(cap)
+    tmux -L "${S}s" send-keys q; sleep 1; alive=$(tmux -L "${S}s" ls 2>/dev/null || true)
+    tmux -L "${S}s" kill-server 2>/dev/null || true
+    printf '%s\n' "$top" | grep -q '还有 .* 行' || die "selftest: a board taller than the pane shows no scroll hint"
+    printf '%s\n' "$end" | grep -q 'scroll row 30' || die "selftest: G does not scroll to the last line"
+    [ "$(printf '%s\n' "$two" | sed -n 1p)" = "$(printf '%s\n' "$top" | sed -n 3p)" ] \
+      || die "selftest: g j j does not scroll 2 lines from the top"
+    [ -z "$alive" ] || die "selftest: q does not quit the board"
   fi
   # awb-lark: one board = one topic whose root card carries every update. A fake lark-cli
   # records each call; the flow must create the topic once, then only patch that card.
