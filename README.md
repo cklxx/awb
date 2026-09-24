@@ -12,8 +12,20 @@ the `ω` mouth, as in (・ω・). It watches your agents.
 
 The board above (`AWB_VIEW=full`, demo data) shows the task tree, the acceptance runs with
 each step, and per-group agents with their milestones; `⊢` marks a milestone that passed
-`awb check`. The brief footer counts `里程碑 已核 M / 自报 K` (verified `⊢` milestones vs
-plain `done`s); the full view tags an unverified finished milestone with a dim `自报`.
+`awb check`; the full view tags an unverified finished milestone with a dim `自报`.
+
+The brief view (default) is ordered by the questions it answers, most important first, since
+it is cut at the pane height:
+
+1. How far, and is it moving: the goal; the metric with its history as a sparkline, the
+   change since the first reading and a linear time-to-target marked `（估）`; task progress
+   over open work; milestones and tasks finished in the last hour; `已核 M / 自报 K`.
+2. What needs you (`需要你`): permission dialogs, failed or dead agents, `ask` tasks.
+3. What each agent does: one line each with its current milestone, how long (red when silent
+   for `AWB_STALE`), `⊢verified/total` milestones, and flags for no code change or a session
+   that contradicts the report; idle agents share one line.
+4. The task tree: done children fold into a count, and roots done over an hour ago fold into
+   one line. Then recent news and checks.
 
 ## Model
 
@@ -26,8 +38,9 @@ plain `done`s); the full view tags an unverified finished milestone with a dim `
 - An agent's own `done` is a claim. `awb check` runs a check the main agent chose; only a
   passing check marks the milestone verified (`⊢`), and a rejected check blocks `done`
   until a later check passes.
-- `awb metric NAME VALUE TARGET [NOTE]` is a render-only single indicator: the latest event
-  shows under GOAL in the brief view as `NAME VALUE / TARGET ▕bar▏pct% NOTE`. It has no id
+- `awb metric NAME VALUE TARGET [NOTE]` is a render-only indicator: the latest event shows
+  under GOAL in the brief view as `NAME VALUE / TARGET ▕bar▏pct%`, followed by the history of
+  that name. Record every measurement with it and keep numbers out of `awb goal`. It has no id
   and is ignored by the proven fold/audit — the fold drops any unknown event whose id is not
   a string (or whose agent is absent), matching the Lean parser's `_ => none` (a fixed
   unknown-event differential case pins this) — and render reads it from the same piped event
