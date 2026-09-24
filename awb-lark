@@ -1,0 +1,195 @@
+#!/bin/sh
+# awb-lark: mirror every awb board into its own topic of one Lark (Feishu) topic group.
+# One board (AWB_DIR) = one topic. The topic's root message is a card showing the board's
+# current state, patched in place on every sync; new news lines and new "needs you" items
+# are posted as replies in the topic. Needs lark-cli with a bot identity in the group.
+# The group is set once with `awb-lark setup oc_xxx`; the board -> topic mapping lives in
+# $AWB_DIR/lark.json, so it follows the board.
+set -eu
+
+PROG=awb-lark
+CONF=${XDG_CONFIG_HOME:-$HOME/.config}/awb/lark-chat
+AWB_DIR=${AWB_DIR:-$PWD/.awb}
+AWB=${AWB:-$(d=$(dirname "$(readlink "$0" 2>/dev/null || echo "$0")"); [ -x "$d/awb" ] && echo "$d/awb" || echo awb)}
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+lark() { lark-cli "$@" --as bot; }
+
+chat() { [ -s "$CONF" ] || die "no group configured: $PROG setup oc_xxx"; cat "$CONF"; }
+
+setup() {
+  [ $# -eq 1 ] || die "usage: $PROG setup CHAT_ID"
+  command -v lark-cli >/dev/null || die "lark-cli not found"
+  case $1 in oc_*) ;; *) die "chat id must start with oc_" ;; esac
+  in=$(lark api GET "/open-apis/im/v1/chats/$1/members/is_in_chat" -q '.data.is_in_chat' 2>/dev/null || true)
+  if [ "$in" != true ]; then
+    # a bot can join a public group by itself; a private one needs a member to add it
+    lark api PATCH "/open-apis/im/v1/chats/$1/members/me_join" >/dev/null 2>&1 \
+      || die "the bot is not in $1 and cannot join it; add the app's bot to the group, then rerun"
+  fi
+  mkdir -p "$(dirname "$CONF")"; printf '%s\n' "$1" > "$CONF"
+  echo "awb boards will post to $1"
+}
+
+# the card, from `awb snapshot` (the same data as the board's brief view)
+card() {
+  jq -c --arg board "$1" --arg path "$2" '
+  def clip($n): if length > $n then .[:$n - 1] + "…" else . end;
+  def ago: if . >= 86400 then "\((. / 8640 | floor) / 10) 天" elif . >= 3600 then "\(. / 3600 | floor) 小时"
+    else "\(. / 60 | floor) 分钟" end;
+  def hms: if . < 3600 then "\(. / 60 | floor) 分" else "\(. / 3600 | floor) 时 \((. % 3600) / 60 | floor) 分" end;
+  def grey: "<font color=\"grey\">" + . + "</font>";
+  def tile($label; $value; $sub):
+    {tag:"column", width:"weighted", weight:1, vertical_spacing:"4px",
+     elements:([{tag:"markdown", content:($label | grey), text_size:"notation"},
+                {tag:"markdown", content:$value, text_size:"heading-2"}]
+               + (if $sub == "" then [] else [{tag:"markdown", content:($sub | grey), text_size:"notation"}] end))};
+  . as $s
+  | ($s.need | map(select(.kind == "fail")) | length) as $nfail
+  | ([$s.agents[] | select(.status == "running")] | length) as $nrun
+  | ([$s.agents[] | select(.status == "blocked")] | length) as $nblk
+  | {schema:"2.0",
+     config:{update_multi:true, width_mode:"fill",
+             summary:{content:("\($board) · 进度 \($s.progress.d)/\($s.progress.t)"
+               + (if ($s.need | length) > 0 then " · 需要你 \($s.need | length)" else "" end))}},
+     header:{
+       title:{tag:"plain_text", content:$board},
+       subtitle:{tag:"plain_text", content:(($s.goal | split("\n")[0]) // "" | clip(80))},
+       template:(if $nfail > 0 then "red" elif ($s.need | length) > 0 then "orange" else "blue" end),
+       text_tag_list:([{tag:"text_tag", text:{tag:"plain_text", content:"在做 \($nrun)"}, color:"blue"}]
+         + (if $nblk > 0 then [{tag:"text_tag", text:{tag:"plain_text", content:"等待 \($nblk)"}, color:"orange"}] else [] end)
+         + (if ($s.need | length) > 0 then [{tag:"text_tag", text:{tag:"plain_text", content:"需要你 \($s.need | length)"}, color:"red"}] else [] end))},
+     body:{direction:"vertical", padding:"12px 12px 16px 12px", vertical_spacing:"12px", elements:(
+       # 1. how far and is it moving: the metric (or task progress) as the one focus
+       [{tag:"column_set", flex_mode:"bisect", background_style:"blue-50", horizontal_spacing:"12px",
+         columns:(
+           (if $s.metric then
+              [tile($s.metric.name | clip(20); "**\($s.metric.value)** / \($s.metric.target)";
+                    (if $s.metric.eta then "按均速约 \($s.metric.eta | ago)达标（估）" else "" end)),
+               tile("达成"; (if $s.metric.frac then "\($s.metric.frac * 100 | floor)%" else "—" end);
+                    (if $s.metric.v0 then "起 \($s.metric.v0) · \($s.metric.since | ago)前" else "" end))]
+            else [] end)
+           + [tile("任务"; "\($s.progress.d) / \($s.progress.t)"; ""),
+              tile("近 1 小时"; "里程碑 +\($s.hour.milestones)";
+                   "任务 +\($s.hour.tasks) · 已核 \($s.verified.v)/\($s.verified.n)")])}]
+       + (if $s.metric and ($s.metric.history | length) >= 2 then
+           [{tag:"chart", height:"180px", chart_spec:{
+              type:"line",
+              data:{values:[$s.metric.history[] | {t:(.ep | strflocaltime("%m-%d %H:%M")), v:.value}]},
+              xField:"t", yField:"v", point:{visible:true},
+              axes:[{orient:"left", min:0, max:([$s.metric.target, ([$s.metric.history[].value] | max)] | max)}],
+              markLine:[{y:$s.metric.target, label:{text:"目标 \($s.metric.target)"}}]}}]
+          else [] end)
+       # 2. needs you
+       + (if ($s.need | length) > 0 then
+           [{tag:"column_set", background_style:(if $nfail > 0 then "red-50" else "orange-50" end),
+             columns:[{tag:"column", width:"weighted", weight:1, padding:"8px", elements:[
+               {tag:"markdown", content:("**需要你**\n" + ([$s.need[] |
+                 if .kind == "wait" then "▲ **\(.name)** \(.text)"
+                 elif .kind == "fail" then "✗ **\(.name)** \(.text | clip(80))"
+                 else "? \(.text | clip(90))" end] | join("\n")))}]}]}]
+          else [] end)
+       # 3. what each agent does
+       + (if ($s.agents | length) > 0 then
+           [{tag:"table", page_size:10, row_height:"auto", freeze_first_column:true,
+             header_style:{background_style:"grey", bold:true, text_size:"normal"},
+             columns:[
+               {name:"a", display_name:"agent", data_type:"text", width:"110px"},
+               {name:"s", display_name:"状态", data_type:"options", width:"80px"},
+               {name:"c", display_name:"当前", data_type:"lark_md", width:"auto"},
+               {name:"d", display_name:"用时", data_type:"text", width:"80px"},
+               {name:"v", display_name:"已核", data_type:"text", width:"80px"}],
+             rows:[$s.agents[] | {
+               a:.name,
+               s:[{"running":{text:"在做", color:"blue"}, "blocked":{text:"等待", color:"orange"},
+                   "done":{text:"完成", color:"green"}}[.status] // {text:.status, color:"neutral"}],
+               c:((if .flag != "" then "<font color=\"orange\">\(.flag)</font> " else "" end) + (.text | clip(120))),
+               d:(if .silent then "\(.age | hms) ⚠" else (.age | hms) end),
+               v:"\(.dv)/\(.dn)"}]}]
+          else [] end)
+       + (if ($s.idle | length) > 0 then
+           [{tag:"markdown", content:("空闲：\($s.idle | join("、"))" | grey), text_size:"notation"}] else [] end)
+       # 4. task tree and news, folded
+       + [{tag:"collapsible_panel", expanded:false,
+           header:{title:{tag:"markdown", content:"**任务与进展**　<font color=\"grey\">\($s.progress.d)/\($s.progress.t) · 最近 \([$s.news | length, 5] | min) 条进展</font>"}},
+           vertical_spacing:"8px",
+           elements:(
+             [ $s.tasks[] | {tag:"markdown", content:(
+                 "**\(.text | clip(60))**　\(.d)/\(.t)"
+                 + (if .folded > 0 then "\n✓ 另 \(.folded) 项已完成" else "" end)
+                 + ([.kids[] | "\n" + ({"done":"✓","wip":"◔","review":"◑","blocked":"▲","todo":"○"}[.state] // "•")
+                     + " " + (.text | clip(70)) + (if .prog then "　\(.prog.d)/\(.prog.t)" else "" end)] | join("")))} ]
+             + (if $s.tasks_old > 0 then [{tag:"markdown", content:("✓ 另有 \($s.tasks_old) 项已完成" | grey)}] else [] end)
+             + (if ($s.news | length) > 0 then
+                 [{tag:"markdown", content:("**最近进展**\n" + ([$s.news[-5:] | reverse[] | "\(.time[0:5])　\(.text | clip(100))"] | join("\n")))}]
+                else [] end))}]
+       + [{tag:"markdown", content:("更新于 \($s.clock) · \($path)" | grey), text_size:"notation"}])}}'
+}
+
+# reply in the topic with markdown
+reply() { lark im +messages-reply --message-id "$1" --reply-in-thread --markdown "$2" >/dev/null; }
+
+sync() {
+  [ -d "$AWB_DIR" ] || die "no board at $AWB_DIR"
+  AWB_DIR=$(cd "$AWB_DIR" && pwd); export AWB_DIR
+  map=$AWB_DIR/lark.json
+  # one sync per board at a time (the board's watch loop starts one every minute)
+  mkdir "$AWB_DIR/lock-lark" 2>/dev/null || return 0
+  trap 'rm -rf "$AWB_DIR/lock-lark"' EXIT INT TERM
+  snap=$("$AWB" snapshot)
+  # topic title: the project directory for ./.awb, else the board directory's own name
+  proj=$(basename "$AWB_DIR"); [ "$proj" != .awb ] || proj=$(basename "$(dirname "$AWB_DIR")")
+  body=$(printf '%s' "$snap" | card "$proj" "$AWB_DIR")
+  [ "${1:-}" = --dry-run ] && { printf '%s\n' "$body"; return 0; }
+  command -v lark-cli >/dev/null || die "lark-cli not found"
+  c=$(chat)
+  st=$( [ -s "$map" ] && cat "$map" || echo '{}')
+  # a board moved to another group gets a new topic there
+  [ "$(printf '%s' "$st" | jq -r '.chat // ""')" = "$c" ] || st='{}'
+  root=$(printf '%s' "$st" | jq -r '.root // ""')
+  live=$(printf '%s' "$st" | jq -r '.card // ""')
+  now=$(date +%s)
+  if [ -z "$root" ]; then
+    root=$(lark im +messages-send --chat-id "$c" --msg-type interactive --content "$body" -q '.data.message_id')
+    [ -n "$root" ] || die "sending the card failed"
+    live=$root
+    # the existing news is on the card; only later lines become replies
+    st=$(jq -n --arg c "$c" --arg r "$root" --argjson ep "$now" --argjson s "$snap" \
+      '{chat:$c, root:$r, card:$r, card_ep:$ep, news:($s.news | length), need:[$s.need[] | tojson]}')
+  else
+    # a card can be patched for 14 days; after that, a fresh card is posted in the topic
+    if ! lark im messages patch --message-id "$live" --data "$(jq -n --arg b "$body" '{content:$b}')" >/dev/null 2>&1; then
+      live=$(lark im +messages-reply --message-id "$root" --reply-in-thread --msg-type interactive --content "$body" -q '.data.message_id')
+      [ -n "$live" ] || die "neither patching nor re-posting the card worked"
+      st=$(printf '%s' "$st" | jq --arg l "$live" --argjson ep "$now" '.card = $l | .card_ep = $ep')
+    fi
+    # new news lines, at most 5 per sync
+    n0=$(printf '%s' "$st" | jq '.news // 0')
+    new=$(printf '%s' "$snap" | jq -r --argjson n "$n0" '.news[$n:] | if length == 0 then empty else
+      (if length > 5 then "另有 \(length - 5) 条\n" else "" end) + ([.[-5:][] | "✓ \(.time[0:5])　\(.text)"] | join("\n")) end')
+    [ -z "$new" ] || reply "$root" "$new"
+    # needs-you items not seen before
+    need=$(printf '%s' "$snap" | jq -r --argjson st "$st" '[.need[] | select((tojson) as $k | ($st.need // []) | index($k) | not)
+      | if .kind == "wait" then "▲ \(.name) \(.text)" elif .kind == "fail" then "✗ \(.name) \(.text)" else "? \(.text)" end]
+      | if length == 0 then empty else "**需要你**\n" + join("\n") end')
+    [ -z "$need" ] || reply "$root" "$need"
+    st=$(printf '%s' "$st" | jq --argjson s "$snap" '.news = ($s.news | length) | .need = [$s.need[] | tojson]')
+  fi
+  printf '%s\n' "$st" > "$map.tmp" && mv "$map.tmp" "$map"
+}
+
+case "${1:-}" in
+  setup) shift; setup "$@" ;;
+  sync)  shift; sync "$@" ;;
+  watch) while :; do ( sync ) || true; sleep "${AWB_LARK_EVERY:-60}"; done ;;
+  where) chat; [ -s "$AWB_DIR/lark.json" ] && cat "$AWB_DIR/lark.json" || echo "no topic yet" ;;
+  *) cat <<EOF
+$PROG setup CHAT_ID      use this Lark topic group for every board (the bot must be in it)
+$PROG sync [--dry-run]   create or update this board's topic (AWB_DIR, default ./.awb);
+                         --dry-run prints the card JSON and sends nothing
+$PROG watch              sync every AWB_LARK_EVERY seconds (default 60)
+$PROG where              the group, and this board's topic mapping
+A board started with 'awb board' / 'awb up' syncs by itself once setup has run.
+EOF
+     [ -z "${1:-}" ] || [ "$1" = -h ] || [ "$1" = --help ] || exit 1 ;;
+esac
