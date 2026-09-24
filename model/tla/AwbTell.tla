@@ -3,9 +3,12 @@
 \* agent): load a tmux buffer, paste it (-d deletes it), press Enter.
 \* Fixed = FALSE is awb 0.0.5 (one shared buffer name, no lock); Fixed = TRUE uses a buffer
 \* per call and a per-pane lock around load..Enter.
+\* A teller that finished runs its EXIT trap, which removes the locks it still lists.
+\* ExitKeepsList = TRUE is awb 0.0.7: unlock did not drop the lock from that list, so the
+\* trap removed a lock another teller had taken since.
 EXTENDS Naturals, Sequences
 
-CONSTANTS Tellers, Fixed
+CONSTANTS Tellers, Fixed, ExitKeepsList
 
 VARIABLES pc, bufs, input, submitted, lock, lost
 vars == <<pc, bufs, input, submitted, lock, lost>>
@@ -31,11 +34,16 @@ Paste(t) == /\ pc[t] = "paste"
 Enter(t) == /\ pc[t] = "enter"
             /\ submitted' = IF input = <<>> THEN submitted ELSE Append(submitted, input)
             /\ input' = <<>>
-            /\ pc' = [pc EXCEPT ![t] = "end"]
+            /\ pc' = [pc EXCEPT ![t] = "exit"]
             /\ lock' = IF Fixed THEN "free" ELSE lock
             /\ UNCHANGED <<bufs, lost>>
+\* the EXIT trap: with the stale list it frees the lock whoever holds it now
+Exit(t) == /\ pc[t] = "exit"
+           /\ pc' = [pc EXCEPT ![t] = "end"]
+           /\ lock' = IF Fixed /\ ExitKeepsList THEN "free" ELSE lock
+           /\ UNCHANGED <<bufs, input, submitted, lost>>
 
-Next == \E t \in Tellers : Load(t) \/ Paste(t) \/ Enter(t)
+Next == \E t \in Tellers : Load(t) \/ Paste(t) \/ Enter(t) \/ Exit(t)
 Spec == Init /\ [][Next]_vars
 
 \* every submitted prompt is exactly one message, and no message is lost or sent twice

@@ -791,7 +791,12 @@ lock() {
   echo $$ > "$_l/pid"
   LOCKS="${LOCKS:-} $_l"; trap 'rm -rf $LOCKS' EXIT; trap 'exit 130' INT TERM
 }
-unlock() { rm -rf "$AWB_DIR/lock-$1"; }
+# drop it from LOCKS too: otherwise this process's EXIT trap would later remove the lock
+# another process has taken since, and a third one could enter
+unlock() {
+  rm -rf "$AWB_DIR/lock-$1"
+  _k=; for _x in ${LOCKS:-}; do [ "$_x" = "$AWB_DIR/lock-$1" ] || _k="$_k $_x"; done; LOCKS=$_k
+}
 
 # the agent's open milestone ("EP TEXT" of its last `now`, if no `done` came after)
 open_ms() {
@@ -1347,6 +1352,10 @@ selftest() {
     AWB_TMUX_SOCKET=$(tmux -L "$S" display-message -p '#{socket_path}') "$BIN" tell z1 "echo told-\$((6*7))"
     i=0; until tmux -L "$S" capture-pane -p -t "$(agent_pane z1)" | grep -q told-42; do
       i=$((i + 1)); [ $i -lt 20 ] || die "selftest: tell not delivered"; sleep 0.5; done
+    # a process that unlocked must not remove, when it exits, the lock another one took since
+    ( lock t9; unlock t9; sleep 0.5 ) &
+    sleep 0.2; ( lock t9; sleep 0.6; [ -d "$AWB_DIR/lock-t9" ] ) || die "selftest: an exiting process removed another's lock"
+    wait; unlock t9
     # concurrent tells into one pane arrive as two separate commands
     AWB_TMUX_SOCKET=$(tmux -L "$S" display-message -p '#{socket_path}'); export AWB_TMUX_SOCKET
     "$BIN" tell z1 "echo told-A" & "$BIN" tell z1 "echo told-B" & wait
