@@ -788,7 +788,10 @@ tell() {
   # never typed into (model/tla/AwbWait.tla). One that opens between the read and the key
   # still takes it; no check can close that window.
   _dialog() { [ "$(sessions_json | jq -r --arg i "$_id" '.[$i].status // ""')" = waiting ]; }
-  ! _dialog || die "$_id is waiting on a permission dialog; answer it in pane $_p, awb will not type into it"
+  if _dialog; then   # return, not die: check and nudge call tell as a function
+    echo "$PROG: $_id is waiting on a permission dialog; answer it in pane $_p, awb will not type into it" >&2
+    return 1
+  fi
   # one tell per pane at a time, each with its own buffer: concurrent tells merged or lost
   # messages otherwise (model/tla/AwbTell.tla)
   lock "tell-$_p"
