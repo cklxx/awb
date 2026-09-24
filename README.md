@@ -64,6 +64,9 @@ with `awb skill`; `awb` itself points agents there.
 You talk to one Claude, the main agent; the board is for watching. Nothing in Claude's
 configuration changes and workers need not know awb.
 
+A board taller than its pane scrolls: `j`/`k`, arrow keys or the mouse wheel move by lines,
+space/`b` by pages, `g`/`G` jump to the top/end, `q` quits.
+
 ```sh
 awb board                 # board beside the main agent's tmux pane
 awb tui -g g w1 worker    # a Claude worker; prints "w1 session: <name>" once it is ready
