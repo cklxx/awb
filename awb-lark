@@ -79,7 +79,7 @@ card() {
            columns:(
              (if $s.metric then
                 [tile($s.metric.name | clip(20); "**\($s.metric.value)** / \($s.metric.target)";
-                      (if $s.metric.eta then "按均速约 \($s.metric.eta | ago)达标（估）" else "" end)),
+                      (if $s.metric.eta then "按均速约 \($s.metric.eta | ago)达标（估）" elif $s.metric.late then "按当前趋势截止前达不到" else "" end)),
                  tile("达成"; (if $s.metric.frac then "\($s.metric.frac * 100 | floor)%" else "—" end);
                       (if $s.metric.v0 then "起 \($s.metric.v0) · \($s.metric.since | ago)前" else "" end))]
               else [tile("任务"; "\($s.progress.d) / \($s.progress.t)"; "")] end)

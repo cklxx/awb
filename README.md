@@ -18,14 +18,16 @@ The brief view (default) and the Lark card share one layout, most important firs
 the view is cut at the pane height:
 
 1. Title: the goal's first line. Its other lines say what the goal is (definition, scope).
-2. One-sentence verdict: needs you or not · the metric, its 24-hour change and a linear
-   time-to-target marked `（估）` · how many anomalies.
-3. The metric with its history, task progress, the last hour, `已核 M / 自报 K`, and how long
-   ago the board last changed.
+2. One-sentence verdict without numbers: needs you or not · whether the metric rose in 24
+   hours, reached its target or misses its deadline · how many anomalies.
+3. The metric with its history and a linear time-to-target marked `（估）` (hidden past the
+   `--by` deadline), task progress, the last hour, `已核 M / 自报 K`, and how long ago the
+   board last changed.
 4. 需要你: permission dialogs, failed or dead agents, `ask` tasks, each with how long it waited.
 5. 下一步: the main line's next open steps.
-6. 异常: a bottleneck (an issue or PR, `#N`, two or more blocked agents wait for), a silent
-   agent, no code change, a session that contradicts the report, a board nobody writes to.
+6. 异常, one line per agent: a bottleneck (an issue or PR, `#N`, two or more blocked agents
+   wait for), no code change, a session that contradicts the report, a silent agent that has
+   no Claude session to report for it, a board nobody writes to.
 7. Every agent, the last 24 hours in numbers, news and the task tree (folded on the card).
 
 ## Model
