@@ -459,19 +459,6 @@ else
                        elif .kind == "fail" then $r + "  ✗ " + $rs + (.name | clip(10) | pad(10)) + " " + (.text | clip($bw - 26)) + $ag
                        else $y + "  ? " + $rs + (.text | clip($bw - 16)) + $ag end ]
      else [] end) as $needb
-  | (if ($act | length) + ($idl | length) == 0 then [] else
-       ["", $cy + "agent" + $rs + $dm + "  ◔ \([$act[] | select(.status == "running")] | length)"
-          + " · ▲ \([$act[] | select(.status == "blocked")] | length) · ○ \($idl | length)" + $rs]
-       + [ $act[] | . as $a
-           | ({"blocked":["▲",$y],"running":["◔",$cy],"done":["✓",$g]}[$a.status] // ["•",$dm]) as $ic
-           | ($bw - 30 - (if $a.flag == "" then 0 else ($a.flag | dwidth) + 1 end)) as $tw
-           | "  " + $ic[1] + $ic[0] + $rs + " " + ($a.name | clip(10) | pad(10))
-             + (if $a.silent and $a.live == null then $r else $dm end) + ($a.age | sdur | lpad(7)) + $rs
-             + $dm + " ⊢\($a.dv)/\($a.dn)" + $rs + " "
-             + (if $a.flag != "" then $y + $a.flag + $rs + " " else "" end)
-             + ($a.text | clip([$tw, 8] | max)) ]
-       + (if ($idl | length) > 0 then ["  " + $dm + "○ 空闲：" + ($idl | map(.name) | join(" ") | clip($bw - 12)) + $rs] else [] end)
-     end) as $agb
   | (if ($trees | length) + $nold == 0 then [] else [""]
      + [ $trees[] | . as $tr
          | $cy + "■ " + ($tr.text | clip($bw - 25) | pad($bw - 25)) + $rs + " " + bar($tr.d; $tr.t; 12) + $dm + " \($tr.d)/\($tr.t)" + $rs,
@@ -490,7 +477,7 @@ else
      + (if $D.metric != null then " · \($M.name) " + (if $D.metric >= 0 then "+" else "" end) + ($D.metric * 100 | round / 100 | tostring) else "" end)
      + $rs) as $bday
   | ([$btop] + $babout + [$bhead] + $mlines + [($bfoot | clip($bw)), $bstat]
-     + $needb + $nextb + $anomb + $agb + ["", $bday]
+     + $needb + $nextb + $anomb + ["", $bday]
      + (if ($s.news | length) > 0 then ["", $g + "进展" + $rs]
           + [ $s.news[-3:] | reverse[] | "  ✓ " + $dm + .time[0:5] + $rs + " " + (.text | clip($bw - 12)) ] else [] end)
      + $tasksb + $chk)
@@ -1303,7 +1290,7 @@ selftest() {
   "$BIN" task l1 done "" r
   out=$(AWB_VIEW=full "$BIN" render)
   brief=$("$BIN" render)
-  for s in "■ root" "进度" "◔ 1 · ▲ 1 · ○ 0" ; do printf "%s" "$brief" | grep -Fq -- "$s" || die "selftest: brief missing $s"; done
+  for s in "■ root" "进度" ; do printf "%s" "$brief" | grep -Fq -- "$s" || die "selftest: brief missing $s"; done
   for s in "SHIP THE WORKBENCH" "✓ wire event log" "▸ render board" \
            "▲ waiting on review" "2 agents" "✓0" "◔1" "▲1" "◆ backend" "◆ frontend" "■ root" "├─ ✓ leaf" "└─ ◔ open" "1/2 任务"; do
     printf '%s' "$out" | grep -Fq -- "$s" || die "selftest: missing '$s'"
@@ -1328,12 +1315,13 @@ selftest() {
   bb metric --at $((bn - 500000)) --step 100 tps 5 40
   ! bb metric --at yesterday tps 1 40 2>/dev/null || die "selftest: metric --at accepted a non-epoch"
   b=$(bb render | sed 's/\x1b\[[0-9;]*m//g')
-  for s in "tuning kernel" "等 review #9" "○ 空闲：idler" "另 2 项已完成" "另有 1 项已完成" \
+  for s in "另 2 项已完成" "另有 1 项已完成" \
            "近 1 小时 里程碑 +" "达标（估）" "? pick a config" "✓ done-4" \
            "╭─ GOAL-TITLE" "│ what-it-is line" "▶ 需要你 1 件 · tps 24 小时在涨 · 异常" "异常 1" "#9 卡住 waiter、waiter2" \
-           "下一步" "◔ open one" "24 小时：里程碑 +" "等 #9 合入" "起 5"; do
+           "下一步" "◔ open one" "24 小时：里程碑 +" "起 5"; do
     printf '%s' "$b" | grep -Fq -- "$s" || die "selftest: brief missing '$s'"; done
-  for s in "等：" "等 等" "ancient root" "done-1"; do
+  # agents appear only where they need you or are off: no per-agent rows, no agent count
+  for s in "等：" "等 等" "ancient root" "done-1" "tuning kernel" "○ 空闲" "agent  ◔"; do
     ! printf '%s' "$b" | grep -Fq -- "$s" || die "selftest: brief shows '$s'"; done
   printf '%s' "$b" | grep -Eq '[▁▂▃▄▅▆▇█]{3}' || die "selftest: metric sparkline missing"
   bb snapshot | jq -e '.metric.value == 25 and ([.metric.history[].value] == [5, 10, 20, 25])
@@ -1355,8 +1343,8 @@ selftest() {
   AWB_DIR=$bd3 "$BIN" snapshot | jq -e '.metric.eta != null and (.metric.late | not)' >/dev/null \
     || die "selftest: an estimate inside the deadline hidden"
   ! AWB_DIR=$bd3 "$BIN" metric --by soon he 2 30 2>/dev/null || die "selftest: metric --by accepted a non-epoch"
-  [ "$(printf '%s\n' "$b" | grep -n '^需要你' | cut -d: -f1)" -lt "$(printf '%s\n' "$b" | grep -n '^agent' | cut -d: -f1)" ] \
-    || die "selftest: 需要你 not above the agents"
+  [ "$(printf '%s\n' "$b" | grep -n '^需要你' | cut -d: -f1)" -lt "$(printf '%s\n' "$b" | grep -n '^异常' | cut -d: -f1)" ] \
+    || die "selftest: 需要你 not above 异常"
 
   # single metric indicator under GOAL, render-only (the "#" id keeps it out
   # of the proven fold; `awb state` below proves no agent is created).
@@ -1588,8 +1576,8 @@ FT
   "$BIN" start zfb blk; "$BIN" now zfb "wait"; "$BIN" block zfb "remote job"
   printf 'zf 1 %s\nzfb 1 %s\n' "$(($(date +%s) - 1000))" "$(($(date +%s) - 1000))" > "$t/diffs"
   fr=$("$BIN" render)
-  printf '%s' "$fr" | grep -F " frozen " | grep -Fq "无改动 " || die "selftest: stale fingerprint not shown frozen"
-  ! printf '%s' "$fr" | grep -F " blk " | grep -Fq "无改动" || die "selftest: blocked agent marked frozen"
+  printf '%s' "$fr" | grep -Fq "frozen 无改动 " || die "selftest: stale fingerprint not shown frozen"
+  ! printf '%s' "$fr" | grep -Fq "blk 无改动" || die "selftest: blocked agent marked frozen"
   printf 'zf 1 %s\nzfb 1 %s\n' "$(date +%s)" "$(date +%s)" > "$t/diffs"
   ! "$BIN" render | grep -Fq "无改动 " || die "selftest: fresh fingerprint shown frozen"
   "$BIN" skill | grep -q "awb check" || die "selftest: skill manual not found"
@@ -1720,7 +1708,8 @@ FAKE
     lr sync --dry-run | jq -e '.schema == "2.0" and .header.title.content == "L"
       and (.header.subtitle.content | startswith("lboard · 更新于"))
       and ([.body.elements[] | select(.tag == "markdown") | .content] | any(startswith("**无需你处理")))
-      and ([.body.elements[] | select(.tag == "collapsible_panel") | .elements[].content] | any(test("\\*\\*kay\\*\\*")))' >/dev/null \
+      and ([.body.elements[] | select(.tag == "collapsible_panel") | .elements[].content] | any(test("first-news")))
+      and (tojson | test("carding") | not)' >/dev/null \
       || die "selftest: awb-lark card"
     lr sync; grep -c '+messages-send --chat-id oc_test --msg-type interactive' "$t/lark.log" | grep -qx 1 \
       || die "selftest: awb-lark did not create the topic once"
@@ -1764,7 +1753,7 @@ FAKE
     wp=$!
     i=0; until [ "$(grep -c 'messages patch' "$t/lark.log")" -ge 2 ]; do
       i=$((i + 1)); [ $i -lt 40 ] || { kill $wp; die "selftest: the board did not refresh its Lark card"; }; sleep 0.25; done
-    AWB_DIR=$lb "$BIN" now k1 "refresh-probe"; AWB_DIR=$lb "$BIN" news "news-while-watching"
+    AWB_DIR=$lb "$BIN" task rp wip "refresh-probe"; AWB_DIR=$lb "$BIN" news "news-while-watching"
     i=0; until grep -q 'refresh-probe' "$t/lark-last.json" 2>/dev/null && grep -q 'news-while-watching' "$t/lark-last.json"; do
       i=$((i + 1)); [ $i -lt 40 ] || { kill $wp; die "selftest: a refresh did not carry the new state"; }; sleep 0.25; done
     kill $wp; wait $wp 2>/dev/null || true

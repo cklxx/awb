@@ -28,7 +28,8 @@ the view is cut at the pane height:
 6. 异常, one line per agent: a bottleneck (an issue or PR, `#N`, two or more blocked agents
    wait for), no code change, a session that contradicts the report, a silent agent that has
    no Claude session to report for it, a board nobody writes to.
-7. Every agent, the last 24 hours in numbers, news and the task tree (folded on the card).
+7. The last 24 hours in numbers, news and the task tree (folded on the card). Agents show
+   only in 需要你 and 异常; `AWB_VIEW=full` lists every agent.
 
 ## Model
 
