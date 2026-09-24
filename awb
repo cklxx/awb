@@ -175,7 +175,8 @@ def wrap($n):
 ($w - 1) as $inner |
 
 . as $raw
-| ([$raw[] | select(type == "object" and .t == "metric")] | last // {}) as $metric
+# the newest reading by its time, so a backfilled older one (metric --at) does not replace it
+| ([$raw[] | select(type == "object" and .t == "metric")] | sort_by(.ep // 0) | last // {}) as $metric
 | ($raw | fold)
 
 # pane closed without a finish/fail event -> dead (empty pane = remote agent)
@@ -327,16 +328,18 @@ else
   | ([$s.agents[] | select(.status == "running")] | length) as $nrun
   # the metric and its history (same name); a linear ETA from the first reading, an estimate
   | (if ($metric.name // "") == "" then null
-     else ([$raw[] | select(type == "object" and .t == "metric" and .name == $metric.name)]) as $mh
+     else ([$raw[] | select(type == "object" and .t == "metric" and .name == $metric.name)] | sort_by(.ep // 0)) as $mh
        | ($metric.value | tonumber?) as $v | ($metric.target | tonumber?) as $tt
        | ($mh[0].value | tonumber?) as $v0 | (($metric.ep // $nowep) - ($mh[0].ep // $nowep)) as $el
        | {name:$metric.name, value:$v, target:$tt, note:($metric.note // ""),
           frac:(if $v != null and $tt != null and $tt > 0 then ([0, $v / $tt, 1] | sort | .[1]) else null end),
-          history:[$mh[] | {ep:(.ep // 0), value:(.value | tonumber?)} | select(.value != null)],
+          history:[$mh[] | {ep:(.ep // 0), value:(.value | tonumber?), x:(.x // null)} | select(.value != null)],
           v0:(if ($mh | length) >= 2 then $v0 else null end),
           since:(if ($mh | length) >= 2 then $nowep - ($mh[0].ep // $nowep) else null end),
-          eta:(if ($mh | length) >= 2 and $tt != null and $v != null and $v0 != null and $v > $v0 and $v < $tt and $el > 0
-               then ($tt - $v) / (($v - $v0) / $el) else null end)}
+          # an estimate needs readings spread over time: 10 minutes at least, and none under
+          # a minute (backfilled readings in one second once gave "0 minutes")
+          eta:(if ($mh | length) >= 2 and $tt != null and $v != null and $v0 != null and $v > $v0 and $v < $tt and $el >= 600
+               then (($tt - $v) / (($v - $v0) / $el)) | if . >= 60 then . else null end else null end)}
      end) as $M
   # needs you: a permission dialog, a failed or dead agent, a decision
   | ([ $s.agents[] | select(.wait) | {kind:"wait", id, name, text:.sess, age:null} ]
@@ -914,7 +917,12 @@ agent_panes() {
   { [ -s "$EV" ] && jq -R -r 'fromjson? | select(.t=="start" and (.pane // "") != "") | "\(.id) \(.pane)"' "$EV"
     [ -s "$AWB_DIR/panes" ] && awk 'NF >= 2 {print $1, $2}' "$AWB_DIR/panes"; } \
   | awk '{ p[$1] = $2; if (!($1 in o)) o[$1] = NR } END { for (i in p) print o[i], i, p[i] }' \
-  | sort -n | cut -d' ' -f2-
+  | sort -n | cut -d' ' -f2- \
+  | M=$(tm list-panes -a -F '#{session_name}:#{window_index}.#{pane_index} #{pane_id}' 2>/dev/null || true) \
+    awk 'BEGIN { n = split(ENVIRON["M"], L, "\n"); for (i = 1; i <= n; i++) { split(L[i], f, " "); id[f[1]] = f[2] } }
+         { print $1, (($2 in id) ? id[$2] : $2) }'
+  # ponytail: session:window.pane targets resolve to pane ids (%N), which tell, peers and the
+  # session registry use; other target forms (window names) pass through unresolved
 }
 agent_pane() { agent_panes | awk -v i="$1" '$1 == i {print $2}'; }
 
@@ -1159,7 +1167,7 @@ Chat-driven: you talk to one Claude (the main agent); it keeps the board and run
                                     and "ID MINUTES waiting" for agents on a permission dialog
   $PROG nudge [--once]              remind silent agents in their pane ($AWB_DIR/panes: "ID PANE")
   $PROG news TEXT                   one progress line (board shows last 5)
-  $PROG metric NAME VALUE TARGET [NOTE]
+  $PROG metric [--at EPOCH] [--step N] NAME VALUE TARGET [NOTE]
                                     single value/target bar under GOAL (brief view)
                                     board view: AWB_VIEW=brief (default) | full
                                     AWB_STALE=SECS: list agents silent that long (default 600)
@@ -1246,15 +1254,24 @@ selftest() {
     printf '{"t":"metric","name":"tps","value":10,"target":40,"ep":%s}\n' $((bn - 400000))
     printf '{"t":"metric","name":"tps","value":20,"target":40,"ep":%s}\n' $((bn - 200000)); } >> "$bd/events.jsonl"
   bb metric tps 25 40 "live"
+  # a backfilled older reading (--at) joins the history without replacing the newest
+  bb metric --at $((bn - 500000)) --step 100 tps 5 40
+  ! bb metric --at yesterday tps 1 40 2>/dev/null || die "selftest: metric --at accepted a non-epoch"
   b=$(bb render | sed 's/\x1b\[[0-9;]*m//g')
   for s in "tuning kernel" "等 review #9" "○ 空闲：idler" "另 2 项已完成" "另有 1 项已完成" \
-           "近 1 小时 里程碑 +" "起 10" "达标（估）" "? pick a config" "✓ done-4" \
+           "近 1 小时 里程碑 +" "达标（估）" "? pick a config" "✓ done-4" \
            "╭─ GOAL-TITLE" "│ what-it-is line" "▶ 需要你 1 件 · tps 25/40" "异常 1" "#9 卡住 waiter、waiter2" \
-           "下一步" "◔ open one" "24 小时：里程碑 +" "等 #9 合入"; do
+           "下一步" "◔ open one" "24 小时：里程碑 +" "等 #9 合入" "起 5"; do
     printf '%s' "$b" | grep -Fq -- "$s" || die "selftest: brief missing '$s'"; done
   for s in "等：" "等 等" "ancient root" "done-1"; do
     ! printf '%s' "$b" | grep -Fq -- "$s" || die "selftest: brief shows '$s'"; done
   printf '%s' "$b" | grep -Eq '[▁▂▃▄▅▆▇█]{3}' || die "selftest: metric sparkline missing"
+  bb snapshot | jq -e '.metric.value == 25 and ([.metric.history[].value] == [5, 10, 20, 25])
+    and ([.metric.history[].x] == [100, null, null, null])' >/dev/null || die "selftest: metric --at/--step history"
+  # readings all in one second give no time-to-target estimate
+  bd2=$t/brief2; mkdir -p "$bd2"
+  for v in 1 2 3; do AWB_DIR=$bd2 "$BIN" metric he $v 30; done
+  AWB_DIR=$bd2 "$BIN" snapshot | jq -e '.metric.eta == null' >/dev/null || die "selftest: an estimate from readings in one second"
   [ "$(printf '%s\n' "$b" | grep -n '^需要你' | cut -d: -f1)" -lt "$(printf '%s\n' "$b" | grep -n '^agent' | cut -d: -f1)" ] \
     || die "selftest: 需要你 not above the agents"
 
@@ -1392,7 +1409,8 @@ FT
     # positive: TUI needs 1 extra Enter; tell (default max 2) must succeed
     fp=$(ft_paste 1)
     printf 'ft %s\n' "$fp" > "$t/panes"
-    AWB_DIR=$t AWB_TMUX_SOCKET=$AWB_TMUX_SOCKET "$BIN" tell ft "ft-marker-ok-1234567890" \
+    # a loaded machine redraws slowly; the settle time is not what this case tests
+    AWB_DIR=$t AWB_TMUX_SOCKET=$AWB_TMUX_SOCKET AWB_TELL_SETTLE=1.5 "$BIN" tell ft "ft-marker-ok-1234567890" \
       || die "selftest: tell gave up on a TUI that submits on the 2nd Enter"
     sleep 0.6
     tmux -L "$S" capture-pane -J -p -t "$fp" | grep -Fq "FAKE_SUBMITTED_OK" \
@@ -1446,6 +1464,9 @@ FT
     ! ht render | grep -Fq "会话空闲" || die "selftest: running agent idle 10s flagged"
     "$BIN" finish z1
     [ "$(ht peers | grep '^z1 ')" = "z1 $zp zz-1 idle" ] || die "selftest: peers lost the session"
+    # a pane given as session:window.pane in .awb/panes resolves to the same session
+    printf 'zt %s\n' "$(tmux -L "$S" display-message -p -t "$zp" '#{session_name}:#{window_index}.#{pane_index}')" >> "$t/panes"
+    [ "$(ht peers | grep '^zt ')" = "zt $zp zz-1 idle" ] || die "selftest: a session:window.pane target was not resolved"
     unset AWB_TMUX_SOCKET
 
     # no-code-change detection drives the REAL freeze_once, not just render:
@@ -1694,7 +1715,13 @@ case "$cmd" in
             append '{t:"news",time:$time,ep:$ep,text:$text}' --arg text "$*" ;;
   goal)     [ $# -ge 1 ] || die "usage: $PROG goal TEXT"
             append '{t:"goal",time:$time,ep:$ep,text:$text}' --arg text "$*" ;;
-  metric)   [ $# -ge 3 ] || die "usage: $PROG metric NAME VALUE TARGET [NOTE]"
+  metric)   # --at EPOCH records a past reading at its own time; --step N is its x (a training step)
+            _at=; _x=
+            while :; do case "${1:-}" in
+              --at) _at=${2:-}; shift 2 || die "--at needs an epoch" ;;
+              --step) _x=${2:-}; shift 2 || die "--step needs a number" ;;
+              *) break ;; esac; done
+            [ $# -ge 3 ] || die "usage: $PROG metric [--at EPOCH] [--step N] NAME VALUE TARGET [NOTE]"
             # jq tonumber rejects '1.2.3'/'-'/''; the finite/self-equal guard
             # additionally rejects NaN/Infinity (jq 1.8 has no finite/0).
             _numok='tonumber as $n | $n == $n and $n < 1e309 and $n > -1e309'
@@ -1704,8 +1731,13 @@ case "$cmd" in
             # .agents[id]==null` arm (matching Lean parseLine's `_ => none`)
             # drops the unknown event, so it never reaches agent state; render
             # reads it from the same piped event array, not a second log read.
-            append '{t:"metric",time:$time,ep:$ep,name:$name,value:($value|tonumber),target:($target|tonumber),note:$note}' \
-              --arg name "$1" --arg value "$2" --arg target "$3" --arg note "${4-}" ;;
+            [ -z "$_at" ] || printf '%s' "$_at" | grep -Eqx '[0-9]{9,11}' || die "--at wants epoch seconds (got: $_at)"
+            [ -z "$_x" ] || printf '%s' "$_x" | jq -eR "$_numok" >/dev/null || die "--step must be numeric (got: $_x)"
+            append '{t:"metric", name:$name, value:($value|tonumber), target:($target|tonumber), note:$note}
+                    + (if $at == "" then {time:$time, ep:$ep}
+                       else ($at | tonumber) as $a | {time:($a | strflocaltime("%H:%M:%S")), ep:$a} end)
+                    + (if $x == "" then {} else {x:($x | tonumber)} end)' \
+              --arg name "$1" --arg value "$2" --arg target "$3" --arg note "${4-}" --arg at "$_at" --arg x "$_x" ;;
   now)      [ $# -ge 2 ] || die "usage: $PROG now ID MILESTONE"
             append '{t:"now",time:$time,ep:$ep,id:$id,text:$text}' --arg id "$1" --arg text "${2-}" ;;
   done)     [ $# -ge 1 ] || die "usage: $PROG done ID [TEXT]"
