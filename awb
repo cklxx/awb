@@ -1132,6 +1132,11 @@ selftest() {
   cleanup() { tmux -L "$S" kill-server 2>/dev/null || true; rm -rf "$t"; }
   trap cleanup EXIT
   export AWB_DIR=$t AWB_COLS=160 AWB_ROWS=200; EV=$t/events.jsonl
+  # never the user's Lark group: a test board's watch loop would mirror itself there. A
+  # guard lark-cli first on PATH records any call that escapes the fakes below.
+  XDG_CONFIG_HOME=$t/xdg-none; export XDG_CONFIG_HOME
+  mkdir -p "$t/guard"; printf '#!/bin/sh\necho "$*" >> %s/guard/calls\nexit 1\n' "$t" > "$t/guard/lark-cli"
+  chmod +x "$t/guard/lark-cli"; PATH=$t/guard:$PATH; export PATH
 
   ( cd "$t" && AWB_DIR=help-probe "$BIN" up --help >/dev/null ) || die "selftest: up --help failed"
   [ ! -e "$t/help-probe" ] || die "selftest: up --help created AWB_DIR"
@@ -1480,9 +1485,8 @@ CHK
     tmux -S "$t/sock" kill-server 2>/dev/null; tmux -L "${S}e" kill-server 2>/dev/null
     [ "$rows" -gt 24 ] || die "selftest: board sized from the awb socket's pane, not its own ($rows rows)"
   fi
-  # awb-lark: one board = one topic. A fake lark-cli records each call; the flow must create
-  # the topic once, patch the card after, reply only with news and needs-you items not
-  # posted before, and re-post the card in the topic when a patch fails (14-day limit).
+  # awb-lark: one board = one topic whose root card carries every update. A fake lark-cli
+  # records each call; the flow must create the topic once, then only patch that card.
   lk=$(dirname "$BIN")/awb-lark
   if [ -x "$lk" ]; then
     fb=$t/fakebin; lb=$t/lboard; mkdir -p "$fb" "$lb"
@@ -1493,7 +1497,7 @@ c=; p=; for a; do [ "$p" = --content ] && c=$a; [ "$p" = --data ] && c=$a; p=$a;
 [ -z "$c" ] || printf '%s\n' "$c" > "$d/lark-last.json"
 case "$*" in
   *is_in_chat*) echo true ;;
-  *"+messages-send"*) echo om_root ;;
+  *"+messages-send"*) if [ -e "$d/sent1" ]; then echo om_new; else : > "$d/sent1"; echo om_root; fi ;;
   *"messages patch"*) [ ! -e "$d/patchfail" ] ;;
   *"+messages-reply"*"interactive"*) echo om_card2 ;;
 esac
@@ -1508,18 +1512,25 @@ FAKE
       || die "selftest: awb-lark card"
     lr sync; grep -c '+messages-send --chat-id oc_test --msg-type interactive' "$t/lark.log" | grep -qx 1 \
       || die "selftest: awb-lark did not create the topic once"
-    jq -e '.root == "om_root" and .news == 1' "$lb/lark.json" >/dev/null || die "selftest: awb-lark mapping"
-    AWB_DIR=$lb "$BIN" news "second-news"; : > "$t/lark.log"; lr sync
+    jq -e '.root == "om_root"' "$lb/lark.json" >/dev/null || die "selftest: awb-lark mapping"
+    # every update lands on the one card: news and needs-you are patched in, never posted
+    AWB_DIR=$lb "$BIN" news "second-news"; AWB_DIR=$lb "$BIN" task q9 ask "pick-one"; : > "$t/lark.log"; lr sync
     grep -q 'messages patch --message-id om_root' "$t/lark.log" || die "selftest: awb-lark did not patch the card"
-    grep '+messages-reply' "$t/lark.log" | grep -q 'second-news' && ! grep '+messages-reply' "$t/lark.log" | grep -q 'first-news' \
-      || die "selftest: awb-lark news replies"
-    ! grep -q '+messages-send' "$t/lark.log" || die "selftest: awb-lark opened a second topic"
-    AWB_DIR=$lb "$BIN" task q9 ask "pick-one"; : > "$t/lark.log"; lr sync
-    grep '+messages-reply' "$t/lark.log" | grep -q '需要你' || die "selftest: awb-lark needs-you reply"
-    : > "$t/lark.log"; lr sync; ! grep '+messages-reply' "$t/lark.log" | grep -q '需要你' || die "selftest: awb-lark repeated a needs-you item"
-    : > "$t/patchfail"; lr sync
-    jq -e '.root == "om_root" and .card == "om_card2"' "$lb/lark.json" >/dev/null || die "selftest: awb-lark re-post after a failed patch"
-    rm -f "$t/patchfail"
+    grep -q 'second-news' "$t/lark-last.json" && grep -q 'pick-one' "$t/lark-last.json" \
+      || die "selftest: the patched card lacks the new news or needs-you item"
+    ! grep -q -e '+messages-send' -e '+messages-reply' "$t/lark.log" || die "selftest: an update posted a message"
+    # a failed patch fails that sync only: nothing is posted, and the next sync patches the same card
+    : > "$t/patchfail"; : > "$t/lark.log"; ! lr sync 2>/dev/null || die "selftest: a failed patch was reported as success"
+    ! grep -q -e '+messages-send' -e '+messages-reply' "$t/lark.log" || die "selftest: a failed patch posted a message"
+    rm -f "$t/patchfail"; : > "$t/lark.log"; lr sync
+    grep -q 'messages patch --message-id om_root' "$t/lark.log" || die "selftest: the sync after a failed patch did not retry the card"
+    # before Lark's 14-day patch limit the board moves to a new topic; the old card points there
+    jq '.card_ep = 1' "$lb/lark.json" > "$lb/lark.json.t" && mv "$lb/lark.json.t" "$lb/lark.json"
+    : > "$t/lark.log"; lr sync
+    jq -e '.root == "om_new"' "$lb/lark.json" >/dev/null || die "selftest: an old card did not roll to a new topic"
+    grep -q 'messages patch --message-id om_root' "$t/lark.log" && grep -q '新话题' "$t/lark-last.json" \
+      || die "selftest: the old card does not point to the new topic"
+    ! grep -q '+messages-reply' "$t/lark.log" || die "selftest: rolling over posted into the old topic"
     # a lock left by a killed sync must not stop refreshes for good
     mkdir "$lb/lock-lark"; touch -t 200001010000 "$lb/lock-lark"; : > "$t/lark.log"; lr sync
     grep -q 'messages patch' "$t/lark.log" || die "selftest: a stale awb-lark lock stopped the refresh"
@@ -1533,12 +1544,12 @@ FAKE
     i=0; until [ "$(grep -c 'messages patch' "$t/lark.log")" -ge 2 ]; do
       i=$((i + 1)); [ $i -lt 40 ] || { kill $wp; die "selftest: the board did not refresh its Lark card"; }; sleep 0.25; done
     AWB_DIR=$lb "$BIN" now k1 "refresh-probe"; AWB_DIR=$lb "$BIN" news "news-while-watching"
-    i=0; until grep -q 'refresh-probe' "$t/lark-last.json" 2>/dev/null && grep '+messages-reply' "$t/lark.log" | grep -q 'news-while-watching'; do
+    i=0; until grep -q 'refresh-probe' "$t/lark-last.json" 2>/dev/null && grep -q 'news-while-watching' "$t/lark-last.json"; do
       i=$((i + 1)); [ $i -lt 40 ] || { kill $wp; die "selftest: a refresh did not carry the new state"; }; sleep 0.25; done
     kill $wp; wait $wp 2>/dev/null || true
-    [ "$(grep '+messages-reply' "$t/lark.log" | grep -c 'news-while-watching')" = 1 ] || die "selftest: a news line was replied twice"
-    ! grep -q '+messages-send' "$t/lark.log" || die "selftest: a refresh opened a second topic"
+    ! grep -q -e '+messages-send' -e '+messages-reply' "$t/lark.log" || die "selftest: a refresh posted a message"
   fi
+  [ ! -s "$t/guard/calls" ] || die "selftest: a test reached lark-cli: $(head -1 "$t/guard/calls")"
   echo "selftest ok"
 }
 
