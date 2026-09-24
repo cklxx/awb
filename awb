@@ -339,9 +339,11 @@ else
                then ($tt - $v) / (($v - $v0) / $el) else null end)}
      end) as $M
   # needs you: a permission dialog, a failed or dead agent, a decision
-  | ([ $s.agents[] | select(.wait) | {kind:"wait", id, name, text:.sess} ]
-     + [ $s.agents[] | select((.wait | not) and (.status | IN("failed","dead"))) | {kind:"fail", id, name, text:(.reason // "")} ]
-     + [ $s.torder[] | $s.tasks[.] | select(.state == "ask") | {kind:"ask", id, name:"", text} ]) as $need
+  | ([ $s.agents[] | select(.wait) | {kind:"wait", id, name, text:.sess, age:null} ]
+     + [ $s.agents[] | select((.wait | not) and (.status | IN("failed","dead")))
+         | {kind:"fail", id, name, text:(.reason // ""), age:($nowep - (.endEp // .lastEp))} ]
+     + [ $s.torder[] | $s.tasks[.] | select(.state == "ask")
+         | {kind:"ask", id, name:"", text, age:($nowep - ($tep[.id] // $nowep))} ]) as $need
   # one record per working agent: what it does now, for how long, verified/claimed
   # milestones, flags (no code change, session disagrees); idle agents by name
   | (([ $diffs[] | {key:.id, value:.} ] | from_entries) as $df
@@ -353,12 +355,11 @@ else
          | {id:$a.id, name:$a.name, status:$a.status, idle:$idle, silent:$silent,
             dn:($a.done | length), dv:([$a.done[] | select(.text | startswith("⊢ "))] | length),
             age:(if $a.status == "running" and $a.current then $nowep - $a.current.ep else $idle end),
-            text:(if $a.status == "blocked" then "等 " + (($a.reason // "") | ltrimstr("等：") | ltrimstr("等:"))
+            text:(if $a.status == "blocked" then (($a.reason // "") | ltrimstr("等：") | ltrimstr("等:")
+                                                 | if startswith("等") then . else "等 " + . end)
                   elif $a.status == "running" and $a.current then ($a.current.text // "")
                   elif ($a.done | length) > 0 then "✓ " + ($a.done[-1].text // "") else ($a.reason // "") end),
-            flag:([ (if $silent and $a.status == "running" and $a.current and ($nowep - $a.current.ep) != $idle
-                      then "无更新 " + ($idle | sdur) else empty end),
-                    (if $a.status == "running" and $d != null and ($nowep - $d.ep) >= $frz
+            flag:([ (if $a.status == "running" and $d != null and ($nowep - $d.ep) >= $frz
                       then "无改动 " + (($nowep - $d.ep) | sdur) else empty end),
                     (if ($a.sess // "") != "" then "≠ " + $a.sess else empty end) ] | join(" · "))} ]
      | sort_by([(if .status == "blocked" then 0 elif .status == "running" then 1 else 2 end), -.idle])) as $act
@@ -373,9 +374,45 @@ else
                  | leaves($s.tasks; $s.torder; .) as $lv
                  | {text:$t.text, state:$t.state,
                     prog:(if ($lv | length) > 1 then prog($s.tasks; $lv) else null end)} ]} ]) as $trees
+  # the goal: its first line is the title, the rest says what it is
+  | (($s.goal | gsub("\r"; "") | split("\n")) as $gl
+     | {title:($gl[0] // ""), about:($gl[1:] | map(select(. != "")))}) as $G
+  | ([$raw[] | select(type == "object") | .ep // 0] | max // 0) as $lastEp
+  | ($nowep - $lastEp) as $quiet
+  # the last 24 hours in numbers
+  | ($nowep - 86400) as $d1
+  | ([$raw[] | select(type == "object" and (.ep // 0) >= $d1)]) as $day
+  | {milestones:([$day[] | select(.t == "done")] | length),
+     verified:([$day[] | select(.t == "done" and .verified == true)] | length),
+     tasks:([$day[] | select(.t == "task" and .state == "done") | .id] | unique | length),
+     metric:(if $M == null or ($M.history | length) < 2 or $M.value == null then null
+             else (([$M.history[] | select(.ep < $d1)] | last | .value) // $M.history[0].value) as $vd
+               | ($M.value - $vd) end)} as $D
+  # what is off: a bottleneck (an issue or PR, #N, that two or more blocked agents wait
+  # for), a silent running agent, no code change or a contradicting session, a board
+  # nobody has written to while agents run
+  | ([ $act[] | select(.status == "blocked")
+       | .name as $n | [(.text | match("#[0-9]+"; "g") | .string)] | unique[] | {ref:., name:$n} ]
+     | group_by(.ref) | map(select(length >= 2) | {ref:.[0].ref, names:map(.name)})) as $bott
+  | ([ ($bott[] | {kind:"bottleneck", text:"\(.ref) 卡住 \(.names | join("、"))"}),
+       ($act[] | select(.status == "running" and .silent) | {kind:"silent", text:"\(.name) \(.idle | sdur) 没有更新"}),
+       ($act[] | select(.flag != "") | {kind:"flag", text:"\(.name) \(.flag)"}),
+       (if $quiet >= ($stale | tonumber) and $nrun > 0
+        then {kind:"board", text:"看板 \($quiet | ago)没有新事件，主控可能停了"} else empty end) ]) as $anom
+  # the next open steps of the main line
+  | ([ $trees[] | .kids[] | select(.state | IN("done","drop") | not) ][:3]) as $next
+  | ([ (if ($need | length) > 0 then "需要你 \($need | length) 件" else "无需你处理" end),
+       (if $M != null then "\($M.name) \($M.value)/\($M.target)"
+            + (if $D.metric != null and $D.metric != 0
+               then "，24 小时 " + (if $D.metric > 0 then "+" else "" end) + ($D.metric * 100 | round / 100 | tostring) else "" end)
+            + (if $M.eta != null then "，约 \($M.eta | ago)达标（估）" else "" end)
+        else "进度 \($tp.d)/\($tp.t)" end),
+       (if ($anom | length) > 0 then "异常 \($anom | length)" else empty end) ] | join(" · ")) as $headline
   | if $view == "snapshot" then
-      [ {goal:$s.goal, now:$nowep, clock:$now, progress:$tp, hour:{milestones:$m1, tasks:$t1},
+      [ {goal:$s.goal, title:$G.title, about:$G.about, headline:$headline, quiet:$quiet,
+         now:$nowep, clock:$now, progress:$tp, hour:{milestones:$m1, tasks:$t1}, day:$D,
          verified:{v:$mver, n:($mdone | length)}, running:$nrun, metric:$M, need:$need,
+         anomalies:$anom, next:$next,
          agents:$act, idle:$idl, tasks:$trees, tasks_old:$nold,
          news:$s.news, checks:[$s.checks[] | {id, what, ok:(all(.steps[]; .state == "ok")),
            fail:any(.steps[]; .state == "fail"), startEp}]} | tojson ]
@@ -393,12 +430,18 @@ else
           + $dm + ($tr | clip([$bw - 50, 0] | max)) + $rs]
          + (if $M.note != "" then ["│   " + $dm + ($M.note | clip($bw - 6)) + $rs] else [] end)
      end) as $mlines
-  | ("╰─ 进度 " + bar($tp.d; $tp.t; 16) + " \($tp.d)/\($tp.t)" + "   " + $now) as $bfoot
+  | ("╰─ 进度 " + bar($tp.d; $tp.t; 16) + " \($tp.d)/\($tp.t)" + "   " + $now
+     + (if $quiet >= 60 then " · 更新于 \($quiet | ago)前" else "" end)) as $bfoot
+  | (if $G.title == "" then $top
+     else ($G.title | clip($bw - 6)) as $tt | "╭─ " + $tt + " " + ("─" * ([$bw - 5 - ($tt | dwidth), 2] | max)) end) as $btop
+  | ([$G.about[] | wrap($bw - 4)[] | "│ " + $dm + . + $rs]) as $babout
+  | ("│ " + (if ($need | length) > 0 then $y elif ($anom | length) > 0 then $cy else $g end) + "▶ " + $headline + $rs) as $bhead
   | ("   " + $move + $dm + " · 里程碑 已核 \($mver) / 自报 \(($mdone | length) - $mver)" + $rs) as $bstat
   | (if ($need | length) > 0 then ["", $y + "需要你（\($need | length)）" + $rs]
-       + [ $need[] | if .kind == "wait" then $y + "  ▲ " + $rs + (.name | clip(10) | pad(10)) + " " + (.text | clip($bw - 16))
-                     elif .kind == "fail" then $r + "  ✗ " + $rs + (.name | clip(10) | pad(10)) + " " + (.text | clip($bw - 16))
-                     else $y + "  ? " + $rs + (.text | clip($bw - 6)) end ]
+       + [ $need[] | (if .age != null then $dm + " · 已 \(.age | ago)" + $rs else "" end) as $ag
+                     | if .kind == "wait" then $y + "  ▲ " + $rs + (.name | clip(10) | pad(10)) + " " + (.text | clip($bw - 16))
+                       elif .kind == "fail" then $r + "  ✗ " + $rs + (.name | clip(10) | pad(10)) + " " + (.text | clip($bw - 26)) + $ag
+                       else $y + "  ? " + $rs + (.text | clip($bw - 16)) + $ag end ]
      else [] end) as $needb
   | (if ($act | length) + ($idl | length) == 0 then [] else
        ["", $cy + "agent" + $rs + $dm + "  ◔ \([$act[] | select(.status == "running")] | length)"
@@ -422,11 +465,19 @@ else
             | $ic[1] + $pre + $ic[0] + " " + ($t.text | clip($bw - 26) | pad($bw - 26)) + $rs
               + (if $t.prog then bar($t.prog.d; $t.prog.t; 6) + $dm + " \($t.prog.d)/\($t.prog.t)" + $rs else "" end)) ]
      + (if $nold > 0 then [$dm + "✓ 另有 \($nold) 项已完成（1 小时前）" + $rs] else [] end) end) as $tasksb
-  | ([$top] + [$goal_lines[] | "│ " + .] + $mlines + [($bfoot | clip($bw)), $bstat]
-     + $needb + $agb + $tasksb
+  | (if ($next | length) > 0 then ["", $cy + "下一步" + $rs]
+       + [ $next[] | ($TI[.state] // ["•",$dm]) as $ic | "  " + $ic[1] + $ic[0] + $rs + " " + (.text | clip($bw - 6)) ]
+     else [] end) as $nextb
+  | (if ($anom | length) > 0 then ["", $y + "异常（\($anom | length)）" + $rs]
+       + [ $anom[] | "  " + $y + "! " + $rs + (.text | clip($bw - 6)) ] else [] end) as $anomb
+  | ("   " + $dm + "24 小时：里程碑 +\($D.milestones)（已核 \($D.verified)） · 任务 +\($D.tasks)"
+     + (if $D.metric != null then " · \($M.name) " + (if $D.metric >= 0 then "+" else "" end) + ($D.metric * 100 | round / 100 | tostring) else "" end)
+     + $rs) as $bday
+  | ([$btop] + $babout + [$bhead] + $mlines + [($bfoot | clip($bw)), $bstat]
+     + $needb + $nextb + $anomb + $agb + ["", $bday]
      + (if ($s.news | length) > 0 then ["", $g + "进展" + $rs]
-          + [ $s.news[-5:] | reverse[] | "  ✓ " + $dm + .time[0:5] + $rs + " " + (.text | clip($bw - 12)) ] else [] end)
-     + $chk)
+          + [ $s.news[-3:] | reverse[] | "  ✓ " + $dm + .time[0:5] + $rs + " " + (.text | clip($bw - 12)) ] else [] end)
+     + $tasksb + $chk)
     end
 end
 | .[:$h] | .[]
@@ -1180,9 +1231,10 @@ selftest() {
   # you (above the agents), what each agent does now, what is folded away. Own log, so
   # the assertions below keep their state.
   bd=$t/brief; mkdir -p "$bd"; bb() { AWB_DIR=$bd "$BIN" "$@"; }; bn=$(date +%s)
-  bb goal "G"; bb start w1 worker; bb now w1 "tuning kernel"
+  bb goal "$(printf 'GOAL-TITLE\nwhat-it-is line')"; bb start w1 worker; bb now w1 "tuning kernel"
   bb start w2 waiter; bb now w2 "x"; bb block w2 "等：review #9"
   bb start w3 idler; bb finish w3 "shipped"
+  bb start w5 waiter2; bb now w5 "y"; bb block w5 "等 #9 合入"
   bb task main todo "main line"; for i in 1 2 3 4; do bb task "d$i" done "done-$i" main; done
   bb task o1 wip "open one" main; bb task q1 ask "pick a config"
   { printf '{"t":"task","id":"old","state":"done","text":"ancient root","ep":%s}\n' $((bn - 7200))
@@ -1191,9 +1243,11 @@ selftest() {
   bb metric tps 25 40 "live"
   b=$(bb render | sed 's/\x1b\[[0-9;]*m//g')
   for s in "tuning kernel" "等 review #9" "○ 空闲：idler" "另 2 项已完成" "另有 1 项已完成" \
-           "近 1 小时 里程碑 +" "起 10" "达标（估）" "? pick a config" "✓ done-4"; do
+           "近 1 小时 里程碑 +" "起 10" "达标（估）" "? pick a config" "✓ done-4" \
+           "╭─ GOAL-TITLE" "│ what-it-is line" "▶ 需要你 1 件 · tps 25/40" "异常 1" "#9 卡住 waiter、waiter2" \
+           "下一步" "◔ open one" "24 小时：里程碑 +" "等 #9 合入"; do
     printf '%s' "$b" | grep -Fq -- "$s" || die "selftest: brief missing '$s'"; done
-  for s in "等：" "ancient root" "done-1"; do
+  for s in "等：" "等 等" "ancient root" "done-1"; do
     ! printf '%s' "$b" | grep -Fq -- "$s" || die "selftest: brief shows '$s'"; done
   printf '%s' "$b" | grep -Eq '[▁▂▃▄▅▆▇█]{3}' || die "selftest: metric sparkline missing"
   [ "$(printf '%s\n' "$b" | grep -n '^需要你' | cut -d: -f1)" -lt "$(printf '%s\n' "$b" | grep -n '^agent' | cut -d: -f1)" ] \
@@ -1528,8 +1582,10 @@ FAKE
     lr setup oc_test >/dev/null && [ "$(cat "$t/xdg/awb/lark-chat")" = oc_test ] || die "selftest: awb-lark setup"
     AWB_DIR=$lb "$BIN" goal "L"; AWB_DIR=$lb "$BIN" start k1 kay; AWB_DIR=$lb "$BIN" now k1 "carding"
     AWB_DIR=$lb "$BIN" news "first-news"
-    lr sync --dry-run | jq -e '.schema == "2.0" and .header.title.content == "lboard"
-      and ([.body.elements[] | select(.tag == "table") | .rows[].a] == ["kay"])' >/dev/null \
+    lr sync --dry-run | jq -e '.schema == "2.0" and .header.title.content == "L"
+      and (.header.subtitle.content | startswith("lboard · 更新于"))
+      and ([.body.elements[] | select(.tag == "markdown") | .content] | any(startswith("**无需你处理")))
+      and ([.body.elements[] | select(.tag == "collapsible_panel") | .elements[].content] | any(test("\\*\\*kay\\*\\*")))' >/dev/null \
       || die "selftest: awb-lark card"
     lr sync; grep -c '+messages-send --chat-id oc_test --msg-type interactive' "$t/lark.log" | grep -qx 1 \
       || die "selftest: awb-lark did not create the topic once"
