@@ -15,4 +15,4 @@ jobs:
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" awb install.sh skills/awb-workbench/SKILL.md --title "awb $GITHUB_REF_NAME" --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" awb awb-lark install.sh skills/awb-workbench/SKILL.md --title "awb $GITHUB_REF_NAME" --generate-notes

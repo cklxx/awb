@@ -129,6 +129,23 @@ Status: ◔ running · ✓ done · ▲ blocked · ✗ failed · ■ dead (pane g
 `tmux -S .awb/sock attach -t awb` attaches from another terminal (for a deep project path the
 socket is `/tmp/awb-UID-HASH.sock`, since unix socket paths are limited to about 104 bytes).
 
+## Lark (Feishu) topics
+
+With [lark-cli](https://github.com/larksuite/cli) logged in as a bot, every board mirrors into
+its own topic of one Lark topic group. `install.sh` asks for the group (or reads
+`AWB_LARK_CHAT=oc_xxx`); `awb-lark setup oc_xxx` sets it later. The bot must be a member of
+the group.
+
+- One board = one topic. The topic's root message is a card: the metric with its trend chart,
+  task progress and the last hour's movement, what needs you, a table of agents (current
+  milestone, time, verified milestones), and the task tree and news folded underneath. The
+  card is patched in place; after 14 days (Lark's limit) a fresh card is posted in the topic.
+- New news lines and new "needs you" items are posted as replies in the topic, once each.
+- The board syncs by itself once a minute while `awb board` / `awb up` runs
+  (`AWB_LARK_EVERY`); `awb-lark sync` does it by hand, `--dry-run` prints the card JSON.
+- The mapping is `$AWB_DIR/lark.json` (chat, root message, live card), so it follows the
+  board. The card is built from `awb snapshot`, the same data as the brief view.
+
 ## Notify agents
 
 ```sh

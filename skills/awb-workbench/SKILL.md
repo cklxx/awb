@@ -52,6 +52,10 @@ type commands:
 5. Subagents you start with your Agent tool can be on the board too: `awb start <id> <name>`
    and `awb now` before starting, `awb done` when the result comes back.
 
+If `awb-lark` is set up (`awb-lark where` prints the group), the board's progress also appears
+as one topic in the user's Lark topic group, synced every minute while the board runs; no
+action is needed from you beyond keeping the board's events accurate.
+
 `awb peers` shows each agent's Claude session name and busy/idle/waiting. The board reads the
 same registry: `▲ 待批准` means the worker is on a permission dialog (tell the user; awb never
 types into it), and 会话实况 lists self-reports the session contradicts. `awb stale` prints
