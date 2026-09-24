@@ -190,6 +190,8 @@ def wrap($n):
 # permission dialog overrides the self-report; a self-report the session contradicts is flagged
 | .agents |= with_entries(($sess[.key] // null) as $x
     | if $x == null then .
+      else .value.live = $x.status end
+    | if $x == null then .
       elif $x.status == "waiting" then .value.wait = true
         | .value.sess = "待批准：" + (if $x.waiting != "" then $x.waiting else "对话框" end) + " " + (($nowep - $x.since) | sdur)
       elif $x.status == "busy" and (.value.status | IN("done","failed")) then
@@ -339,7 +341,11 @@ else
           # an estimate needs readings spread over time: 10 minutes at least, and none under
           # a minute (backfilled readings in one second once gave "0 minutes")
           eta:(if ($mh | length) >= 2 and $tt != null and $v != null and $v0 != null and $v > $v0 and $v < $tt and $el >= 600
-               then (($tt - $v) / (($v - $v0) / $el)) | if . >= 60 then . else null end else null end)}
+               then (($tt - $v) / (($v - $v0) / $el)) | if . >= 60 then . else null end else null end),
+          by:([$mh[] | .by // empty] | last)}
+     # an estimate past the deadline (metric --by) is not shown; the board says the trend misses it
+     | if .by != null and .value != null and .target != null and .value < .target
+          and (.eta == null or $nowep + .eta > .by) then .eta = null | .late = true else .late = false end
      end) as $M
   # needs you: a permission dialog, a failed or dead agent, a decision
   | ([ $s.agents[] | select(.wait) | {kind:"wait", id, name, text:.sess, age:null} ]
@@ -355,7 +361,7 @@ else
          | . as $a | ($nowep - $a.lastEp) as $idle
          | ($df[$a.id] // null) as $d
          | ($idle >= ($stale | tonumber) and ($a.status | IN("running","blocked"))) as $silent
-         | {id:$a.id, name:$a.name, status:$a.status, idle:$idle, silent:$silent,
+         | {id:$a.id, name:$a.name, status:$a.status, idle:$idle, silent:$silent, live:($a.live // null),
             dn:($a.done | length), dv:([$a.done[] | select(.text | startswith("⊢ "))] | length),
             age:(if $a.status == "running" and $a.current then $nowep - $a.current.ep else $idle end),
             text:(if $a.status == "blocked" then (($a.reason // "") | ltrimstr("等：") | ltrimstr("等:")
@@ -398,18 +404,24 @@ else
        | .name as $n | [(.text | match("#[0-9]+"; "g") | .string)] | unique[] | {ref:., name:$n} ]
      | group_by(.ref) | map(select(length >= 2) | {ref:.[0].ref, names:map(.name)})) as $bott
   | ([ ($bott[] | {kind:"bottleneck", text:"\(.ref) 卡住 \(.names | join("、"))"}),
-       ($act[] | select(.status == "running" and .silent) | {kind:"silent", text:"\(.name) \(.idle | sdur) 没有更新"}),
-       ($act[] | select(.flag != "") | {kind:"flag", text:"\(.name) \(.flag)"}),
+       # one line per agent: a flag (no code change, session disagrees) over silence; silence
+       # counts only for an agent with no Claude session, since a live session reports itself
+       ($act[] | if .flag != "" then {kind:"flag", text:"\(.name) \(.flag)"}
+                 elif .status == "running" and .silent and .live == null
+                 then {kind:"silent", text:"\(.name) \(.idle | sdur) 没有更新"} else empty end),
        (if $quiet >= ($stale | tonumber) and $nrun > 0
         then {kind:"board", text:"看板 \($quiet | ago)没有新事件，主控可能停了"} else empty end) ]) as $anom
   # the next open steps of the main line
   | ([ $trees[] | .kids[] | select(.state | IN("done","drop") | not) ][:3]) as $next
   | ([ (if ($need | length) > 0 then "需要你 \($need | length) 件" else "无需你处理" end),
-       (if $M != null then "\($M.name) \($M.value)/\($M.target)"
-            + (if $D.metric != null and $D.metric != 0
-               then "，24 小时 " + (if $D.metric > 0 then "+" else "" end) + ($D.metric * 100 | round / 100 | tostring) else "" end)
-            + (if $M.eta != null then "，约 \($M.eta | ago)达标（估）" else "" end)
-        else "进度 \($tp.d)/\($tp.t)" end),
+       # a judgement only: the numbers are on the metric line and the footer
+       (if $M == null or $M.value == null or $M.target == null then empty
+        elif $M.value >= $M.target then "\($M.name) 已达标"
+        elif $M.late then "\($M.name) 按当前趋势截止前达不到"
+        elif $D.metric == null then empty
+        elif $D.metric > 0 then "\($M.name) 24 小时在涨"
+        elif $D.metric < 0 then "\($M.name) 24 小时在降"
+        else "\($M.name) 24 小时没变" end),
        (if ($anom | length) > 0 then "异常 \($anom | length)" else empty end) ] | join(" · ")) as $headline
   | if $view == "snapshot" then
       [ {goal:$s.goal, title:$G.title, about:$G.about, headline:$headline, quiet:$quiet,
@@ -428,7 +440,8 @@ else
        | ([$M.history[].value] | .[-12:]) as $vals
        | (if ($vals | length) >= 2 then " " + ($vals | spark([$M.target // 0, max] | max)) else "" end) as $sp
        | (if $M.v0 != null then "  起 \($M.v0) · \($M.since | ago)前"
-            + (if $M.eta != null then " · 按均速约 \($M.eta | ago)达标（估）" else "" end) else "" end) as $tr
+            + (if $M.eta != null then " · 按均速约 \($M.eta | ago)达标（估）"
+               elif $M.late then " · 按当前趋势截止前达不到" else "" end) else "" end) as $tr
        | ["│ " + $cy + ($M.name | clip(14)) + $rs + " \($metric.value) / \($metric.target)" + $bar + $sp
           + $dm + ($tr | clip([$bw - 50, 0] | max)) + $rs]
          + (if $M.note != "" then ["│   " + $dm + ($M.note | clip($bw - 6)) + $rs] else [] end)
@@ -453,7 +466,7 @@ else
            | ({"blocked":["▲",$y],"running":["◔",$cy],"done":["✓",$g]}[$a.status] // ["•",$dm]) as $ic
            | ($bw - 30 - (if $a.flag == "" then 0 else ($a.flag | dwidth) + 1 end)) as $tw
            | "  " + $ic[1] + $ic[0] + $rs + " " + ($a.name | clip(10) | pad(10))
-             + (if $a.silent then $r else $dm end) + ($a.age | sdur | lpad(7)) + $rs
+             + (if $a.silent and $a.live == null then $r else $dm end) + ($a.age | sdur | lpad(7)) + $rs
              + $dm + " ⊢\($a.dv)/\($a.dn)" + $rs + " "
              + (if $a.flag != "" then $y + $a.flag + $rs + " " else "" end)
              + ($a.text | clip([$tw, 8] | max)) ]
@@ -1223,7 +1236,8 @@ Chat-driven: you talk to one Claude (the main agent); it keeps the board and run
                                     and "ID MINUTES waiting" for agents on a permission dialog
   $PROG nudge [--once]              remind silent agents in their pane ($AWB_DIR/panes: "ID PANE")
   $PROG news TEXT                   one progress line (board shows last 5)
-  $PROG metric [--at EPOCH] [--step N] NAME VALUE TARGET [NOTE]
+  $PROG metric [--at EPOCH] [--step N] [--by EPOCH] NAME VALUE TARGET [NOTE]
+                                    --by: deadline; an ETA past it is not shown
                                     single value/target bar under GOAL (brief view)
                                     board view: AWB_VIEW=brief (default) | full
                                     AWB_STALE=SECS: list agents silent that long (default 600)
@@ -1316,7 +1330,7 @@ selftest() {
   b=$(bb render | sed 's/\x1b\[[0-9;]*m//g')
   for s in "tuning kernel" "等 review #9" "○ 空闲：idler" "另 2 项已完成" "另有 1 项已完成" \
            "近 1 小时 里程碑 +" "达标（估）" "? pick a config" "✓ done-4" \
-           "╭─ GOAL-TITLE" "│ what-it-is line" "▶ 需要你 1 件 · tps 25/40" "异常 1" "#9 卡住 waiter、waiter2" \
+           "╭─ GOAL-TITLE" "│ what-it-is line" "▶ 需要你 1 件 · tps 24 小时在涨 · 异常" "异常 1" "#9 卡住 waiter、waiter2" \
            "下一步" "◔ open one" "24 小时：里程碑 +" "等 #9 合入" "起 5"; do
     printf '%s' "$b" | grep -Fq -- "$s" || die "selftest: brief missing '$s'"; done
   for s in "等：" "等 等" "ancient root" "done-1"; do
@@ -1328,6 +1342,19 @@ selftest() {
   bd2=$t/brief2; mkdir -p "$bd2"
   for v in 1 2 3; do AWB_DIR=$bd2 "$BIN" metric he $v 30; done
   AWB_DIR=$bd2 "$BIN" snapshot | jq -e '.metric.eta == null' >/dev/null || die "selftest: an estimate from readings in one second"
+  # the headline is a judgement; the numbers stay on the metric line
+  ! printf '%s\n' "$b" | grep '▶' | grep -Fq '25/40' || die "selftest: headline repeats the metric numbers"
+  # an estimate past the deadline (--by, given once) is replaced by "misses it"; a far deadline keeps it
+  bd3=$t/brief3; mkdir -p "$bd3"
+  AWB_DIR=$bd3 "$BIN" metric --at $((bn - 86400)) --by $((bn + 3600)) he 1 30
+  AWB_DIR=$bd3 "$BIN" metric he 2 30
+  AWB_DIR=$bd3 "$BIN" snapshot | jq -e '.metric.eta == null and .metric.late' >/dev/null \
+    || die "selftest: an estimate past the deadline shown"
+  AWB_DIR=$bd3 "$BIN" render | grep -Fq '截止前达不到' || die "selftest: a missed deadline not on the board"
+  AWB_DIR=$bd3 "$BIN" metric --by $((bn + 86400 * 400)) he 2 30
+  AWB_DIR=$bd3 "$BIN" snapshot | jq -e '.metric.eta != null and (.metric.late | not)' >/dev/null \
+    || die "selftest: an estimate inside the deadline hidden"
+  ! AWB_DIR=$bd3 "$BIN" metric --by soon he 2 30 2>/dev/null || die "selftest: metric --by accepted a non-epoch"
   [ "$(printf '%s\n' "$b" | grep -n '^需要你' | cut -d: -f1)" -lt "$(printf '%s\n' "$b" | grep -n '^agent' | cut -d: -f1)" ] \
     || die "selftest: 需要你 not above the agents"
 
@@ -1516,6 +1543,15 @@ FT
     "$BIN" now z1 "still going"
     reg idle "" 900
     ht render | grep -Fq "自报进行，会话空闲" || die "selftest: running agent idle 15m not flagged"
+    # anomalies: one line per agent, and silence counts only for an agent with no session
+    sleep 1.1
+    [ "$(AWB_STALE=1 ht snapshot | jq '[.anomalies[] | select(.text | startswith("demo "))] | length')" = 1 ] \
+      || die "selftest: a silent agent whose session disagrees has more than one anomaly"
+    reg busy
+    ! AWB_STALE=1 ht snapshot | jq -e '.anomalies[] | select(.text | startswith("demo "))' >/dev/null \
+      || die "selftest: a silent agent with a busy session listed as an anomaly"
+    AWB_STALE=1 "$BIN" snapshot | jq -e '.anomalies[] | select(.kind == "silent" and (.text | startswith("demo ")))' >/dev/null \
+      || die "selftest: a silent agent with no session not listed"
     reg idle "" 10
     ! ht render | grep -Fq "会话空闲" || die "selftest: running agent idle 10s flagged"
     "$BIN" finish z1
@@ -1785,12 +1821,13 @@ case "$cmd" in
   goal)     [ $# -ge 1 ] || die "usage: $PROG goal TEXT"
             append '{t:"goal",time:$time,ep:$ep,text:$text}' --arg text "$*" ;;
   metric)   # --at EPOCH records a past reading at its own time; --step N is its x (a training step)
-            _at=; _x=
+            _at=; _x=; _by=
             while :; do case "${1:-}" in
               --at) _at=${2:-}; shift 2 || die "--at needs an epoch" ;;
               --step) _x=${2:-}; shift 2 || die "--step needs a number" ;;
+              --by) _by=${2:-}; shift 2 || die "--by needs an epoch" ;;
               *) break ;; esac; done
-            [ $# -ge 3 ] || die "usage: $PROG metric [--at EPOCH] [--step N] NAME VALUE TARGET [NOTE]"
+            [ $# -ge 3 ] || die "usage: $PROG metric [--at EPOCH] [--step N] [--by EPOCH] NAME VALUE TARGET [NOTE]"
             # jq tonumber rejects '1.2.3'/'-'/''; the finite/self-equal guard
             # additionally rejects NaN/Infinity (jq 1.8 has no finite/0).
             _numok='tonumber as $n | $n == $n and $n < 1e309 and $n > -1e309'
@@ -1801,12 +1838,14 @@ case "$cmd" in
             # drops the unknown event, so it never reaches agent state; render
             # reads it from the same piped event array, not a second log read.
             [ -z "$_at" ] || printf '%s' "$_at" | grep -Eqx '[0-9]{9,11}' || die "--at wants epoch seconds (got: $_at)"
+            [ -z "$_by" ] || printf '%s' "$_by" | grep -Eqx '[0-9]{9,11}' || die "--by wants epoch seconds (got: $_by)"
             [ -z "$_x" ] || printf '%s' "$_x" | jq -eR "$_numok" >/dev/null || die "--step must be numeric (got: $_x)"
             append '{t:"metric", name:$name, value:($value|tonumber), target:($target|tonumber), note:$note}
                     + (if $at == "" then {time:$time, ep:$ep}
                        else ($at | tonumber) as $a | {time:($a | strflocaltime("%H:%M:%S")), ep:$a} end)
-                    + (if $x == "" then {} else {x:($x | tonumber)} end)' \
-              --arg name "$1" --arg value "$2" --arg target "$3" --arg note "${4-}" --arg at "$_at" --arg x "$_x" ;;
+                    + (if $x == "" then {} else {x:($x | tonumber)} end)
+                    + (if $by == "" then {} else {by:($by | tonumber)} end)' \
+              --arg name "$1" --arg value "$2" --arg target "$3" --arg note "${4-}" --arg at "$_at" --arg x "$_x" --arg by "$_by" ;;
   now)      [ $# -ge 2 ] || die "usage: $PROG now ID MILESTONE"
             append '{t:"now",time:$time,ep:$ep,id:$id,text:$text}' --arg id "$1" --arg text "${2-}" ;;
   done)     [ $# -ge 1 ] || die "usage: $PROG done ID [TEXT]"
