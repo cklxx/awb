@@ -133,8 +133,13 @@ sync() {
   [ -d "$AWB_DIR" ] || die "no board at $AWB_DIR"
   AWB_DIR=$(cd "$AWB_DIR" && pwd); export AWB_DIR
   map=$AWB_DIR/lark.json
-  # one sync per board at a time (the board's watch loop starts one every minute)
-  mkdir "$AWB_DIR/lock-lark" 2>/dev/null || return 0
+  # one sync per board at a time (the board's watch loop starts one every minute); a lock
+  # left by a killed sync is broken after AWB_LARK_STALE seconds, or refreshes stop for good
+  lk=$AWB_DIR/lock-lark
+  if [ -d "$lk" ] && [ $(($(date +%s) - $(stat -f %m "$lk" 2>/dev/null || stat -c %Y "$lk"))) -ge "${AWB_LARK_STALE:-300}" ]; then
+    rm -rf "$lk"
+  fi
+  mkdir "$lk" 2>/dev/null || return 0
   trap 'rm -rf "$AWB_DIR/lock-lark"' EXIT INT TERM
   snap=$("$AWB" snapshot)
   # topic title: the project directory for ./.awb, else the board directory's own name

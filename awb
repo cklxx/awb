@@ -595,7 +595,9 @@ nudge_once() {
 
 watch() {
   printf '\033[?1049h\033[H\033[2J'
-  trap 'printf "\033[?1049l"' EXIT INT TERM
+  # INT/TERM must end the loop (a bare trap on them ignored kill); EXIT restores the screen
+  trap 'printf "\033[?1049l"' EXIT
+  trap 'exit 130' INT TERM
   last=; synced=0
   # a board mirrored to Lark (awb-lark setup ran) syncs its topic once a minute, in the background
   lk=$(dirname "$(readlink "$BIN" 2>/dev/null || echo "$BIN")")/awb-lark
@@ -1517,6 +1519,25 @@ FAKE
     : > "$t/lark.log"; lr sync; ! grep '+messages-reply' "$t/lark.log" | grep -q '需要你' || die "selftest: awb-lark repeated a needs-you item"
     : > "$t/patchfail"; lr sync
     jq -e '.root == "om_root" and .card == "om_card2"' "$lb/lark.json" >/dev/null || die "selftest: awb-lark re-post after a failed patch"
+    rm -f "$t/patchfail"
+    # a lock left by a killed sync must not stop refreshes for good
+    mkdir "$lb/lock-lark"; touch -t 200001010000 "$lb/lock-lark"; : > "$t/lark.log"; lr sync
+    grep -q 'messages patch' "$t/lark.log" || die "selftest: a stale awb-lark lock stopped the refresh"
+    mkdir "$lb/lock-lark"; : > "$t/lark.log"; lr sync; rmdir "$lb/lock-lark"
+    ! grep -q 'messages patch' "$t/lark.log" || die "selftest: awb-lark ran two syncs of one board at once"
+    # the refresh itself: a running board (watch) patches the card on its own, again and
+    # again, and each patch carries the board's latest state
+    : > "$t/lark.log"
+    AWB_DIR=$lb XDG_CONFIG_HOME=$t/xdg PATH=$fb:$PATH AWB_LARK_EVERY=1 AWB_INTERVAL=0.2 "$BIN" watch >/dev/null 2>&1 &
+    wp=$!
+    i=0; until [ "$(grep -c 'messages patch' "$t/lark.log")" -ge 2 ]; do
+      i=$((i + 1)); [ $i -lt 40 ] || { kill $wp; die "selftest: the board did not refresh its Lark card"; }; sleep 0.25; done
+    AWB_DIR=$lb "$BIN" now k1 "refresh-probe"; AWB_DIR=$lb "$BIN" news "news-while-watching"
+    i=0; until grep -q 'refresh-probe' "$t/lark-last.json" 2>/dev/null && grep '+messages-reply' "$t/lark.log" | grep -q 'news-while-watching'; do
+      i=$((i + 1)); [ $i -lt 40 ] || { kill $wp; die "selftest: a refresh did not carry the new state"; }; sleep 0.25; done
+    kill $wp; wait $wp 2>/dev/null || true
+    [ "$(grep '+messages-reply' "$t/lark.log" | grep -c 'news-while-watching')" = 1 ] || die "selftest: a news line was replied twice"
+    ! grep -q '+messages-send' "$t/lark.log" || die "selftest: a refresh opened a second topic"
   fi
   echo "selftest ok"
 }
