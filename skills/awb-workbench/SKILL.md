@@ -146,7 +146,9 @@ not process, one per stage. Full rules: `awb skill`.
 - Concurrency: TLA+ specs in `model/tla/`, checked with TLC. `check` / `pr` are serialized per
   agent; a check verifies only the milestone it started on (if the agent ran `awb now`
   meanwhile, the check is rejected as stale); concurrent `tell`s into one pane take a per-pane
-  lock and separate buffers.
+  lock and separate buffers. `tell` re-reads the session registry before each keystroke and
+  never types into a dialog already reported (`AwbWait.tla`); a dialog opening between the
+  read and the key is not preventable, so message Claude workers with SendMessage.
 - Limits: agents append events, so the audit catches a forged `verified` but not an agent that
   also forges the check events; jq and the model are equal by test, not by proof.
 

@@ -147,7 +147,9 @@ non-git directories are skipped.
   only) and does not trust the self-report over it. A session on a permission dialog shows as
   `▲ 待批准` with the dialog kind and its age, and `awb stale` prints it as `ID MINUTES waiting`,
   whatever the agent last reported; `tell` and `nudge` refuse to type into it, since typed
-  text plus Enter would answer the dialog. A self-report the session contradicts is flagged
+  text plus Enter would answer the dialog. tell reads the registry again before the paste and
+  before Enter; a dialog that opens in the gap between a read and a keystroke still takes
+  it (TLC counterexample in `model/tla/AwbWaitRace.cfg`), so prefer SendMessage for Claude. A self-report the session contradicts is flagged
   under 会话实况: reported done or failed while the session is busy, or reported running
   while the session has been idle for `AWB_STALE` seconds. The dialog's own text is often
   scrolled off the pane by queued messages, so the registry state is used, not the screen.
@@ -188,6 +190,7 @@ proven model:
 | deliverables | `awb check` (tests, or Lean with kernel-checked theorems and standard axioms only) | `awb check` |
 | merge | `awb pr` refuses without a passing check or with audit violations, and logs the PR for the audit | `awb pr` |
 | dispatch/report loop (main ↔ worker) | TLA+ with liveness: no false done, no lost task | `model/tla/AwbLoop.tla` |
+| tell vs a permission dialog | TLA+: a dialog the registry reported before a keystroke is never typed into (registry re-read before the paste and every Enter); `AwbWaitRace.cfg` shows the window no check closes | `model/tla/AwbWait.tla` |
 | concurrency (check, pr, tell vs the agent) | TLA+, model-checked with TLC: `*Old.cfg` reproduces the races of 0.0.5, `*Fixed.cfg` passes | `model/tla/` |
 
 Races TLC found in 0.0.5, now fixed and covered by selftest: a check that passed after the

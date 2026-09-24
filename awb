@@ -783,9 +783,12 @@ tell() {
   _msg=$*
   _p=$(agent_pane "$_id")
   [ -n "$_p" ] && tm list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qx "$_p" || die "$_id has no live pane"
-  # typed text + Enter would answer a permission dialog (Enter picks the highlighted "Yes")
-  [ "$(sessions_json | jq -r --arg i "$_id" '.[$i].status // ""')" != waiting ] \
-    || die "$_id is waiting on a permission dialog; answer it in pane $_p, awb will not type into it"
+  # Typed text + Enter answers a permission dialog (Enter picks the highlighted "Yes"), so
+  # the registry is read again before every keystroke: a dialog reported before a key is
+  # never typed into (model/tla/AwbWait.tla). One that opens between the read and the key
+  # still takes it; no check can close that window.
+  _dialog() { [ "$(sessions_json | jq -r --arg i "$_id" '.[$i].status // ""')" = waiting ]; }
+  ! _dialog || die "$_id is waiting on a permission dialog; answer it in pane $_p, awb will not type into it"
   # one tell per pane at a time, each with its own buffer: concurrent tells merged or lost
   # messages otherwise (model/tla/AwbTell.tla)
   lock "tell-$_p"
@@ -814,12 +817,20 @@ tell() {
       *) return 1 ;;
     esac
   }
+  # every Enter re-reads the registry first (model/tla/AwbWait.tla, MaxEnter = 2)
+  _enter() {
+    if _dialog; then
+      echo "$PROG: $_id opened a permission dialog mid-tell; text left unsent in pane $_p" >&2
+      return 1
+    fi
+    tm send-keys -t "$_p" Enter
+  }
   sleep ${AWB_TELL_SETTLE:-0.5}
-  tm send-keys -t "$_p" Enter
+  _enter || { unlock "tell-$_p"; return 1; }
   while [ "$_try" -lt "$_max" ]; do
     sleep ${AWB_TELL_SETTLE:-0.5}
     _il=$(_inputline)
-    if _unsubmitted "$_il"; then _try=$((_try + 1)); tm send-keys -t "$_p" Enter
+    if _unsubmitted "$_il"; then _try=$((_try + 1)); _enter || { unlock "tell-$_p"; return 1; }
     else _try=$_max; fi
   done
   _il=$(_inputline)
@@ -1229,6 +1240,12 @@ FT
     ht render | grep -Fq "待批准：permission prompt" || die "selftest: permission dialog not on the board"
     ht stale | grep -Eq '^z1 [0-9]+ waiting$' || die "selftest: permission dialog not in stale"
     ! ht tell z1 "echo typed-into-dialog" 2>/dev/null || die "selftest: tell typed into a permission dialog"
+    # a dialog reported after the paste stops the Enter
+    reg idle; ( sleep 0.2; reg waiting "permission prompt" ) &
+    ! ht tell z1 "echo mid-tell-enter" 2>/dev/null || die "selftest: tell ignored a dialog opened mid-tell"
+    wait; sleep 0.3
+    ! tmux -L "$S" capture-pane -p -t "$zp" | grep -qx "mid-tell-enter" || die "selftest: tell pressed Enter into a dialog opened mid-tell"
+    tmux -L "$S" send-keys -t "$zp" C-u
     reg idle
     ! ht render | grep -Fq "待批准" || die "selftest: idle session shown as waiting for approval"
     ! ht stale | grep -q waiting || die "selftest: idle session listed as waiting"
