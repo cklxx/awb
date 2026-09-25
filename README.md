@@ -34,7 +34,8 @@ the view is cut at the pane height:
 ## Model
 
 - `.awb/events.jsonl` is the single source of truth: append-only events
-  (goal/start/now/done/status/task/news).
+  (goal/start/now/done/status/task/news). `hold`/`release` (shared resources) carry no agent
+  id, so like `metric` the proven fold drops them and only render reads them.
 - The board pane folds the events every second and redraws on change. It shows the goal,
   each agent's current and finished milestones, durations and idle time, never process output.
 - Agents report with the same `awb` CLI. The main agent changes content by appending
@@ -115,6 +116,9 @@ awb check a1 -- pytest -q ~/accept/test_a1.py       # any command, exit 0 = acce
 awb check a1 --lean proj ~/accept/ACCEPT.lean       # Lean 4: build, no sorry, theorems typecheck
                                                     # with standard axioms only
 awb pr a1                                           # open a PR for a1's branch, only after a pass
+awb merge 42 --watch                                # merge once the newest verdict on the head approves
+                                                    # and the required checks ran green
+awb hold gpu0 a1 "bench"; awb release gpu0          # one holder per shared resource
 awb render                                          # one-shot render, works outside tmux
 awb reset                                           # clear all events
 awb down                                            # kill the session
@@ -174,6 +178,11 @@ seconds (default 900) is reminded at most once per `AWB_NUDGE_EVERY` (default 90
 60 s poll is not the throttle) to commit a minimal change or `awb block`; blocked agents and
 non-git directories are skipped.
 
+- `nudge` also looks for a Claude worker whose session is idle for `AWB_STUCK_AFTER` (120 s)
+  with a tool call printed as text in its pane tail (`AWB_STUCK_RE`, default
+  `DSML|<invoke name=|</?function_calls>`): some models emit the call syntax instead of calling,
+  and the session then looks idle while the board says running. It is told to re-issue at most
+  once per `AWB_STUCK_EVERY` (600 s), and flagged under 异常 until the session works again.
 - `tell` works for any TUI agent (claude, codex, ...) and uses a named tmux buffer, so your
   own paste buffer is untouched. Claude queues it if a turn is running. After Enter it
   captures the pane (joined lines) and reads the last line starting with a prompt (`❯`
@@ -232,7 +241,7 @@ proven model:
 | brief view / Lark card (events → sections) | proven: every agent is shown in one section, and an agent with a rejected check is never shown idle; the jq snapshot is differentially tested against it (every 4th random log) | `model/Brief.lean` vs `awb snapshot` |
 | protocol audit | proven: the one-pass monitor reports nothing iff every event obeys the rules given its prefix (`audit_iff_clean`); corollary: every PR in a clean log followed a passing check | `model/Audit.lean` |
 | deliverables | `awb check` (tests, or Lean with kernel-checked theorems and standard axioms only) | `awb check` |
-| merge | `awb pr` refuses without a passing check or with audit violations, and logs the PR for the audit | `awb pr` |
+| merge | `awb pr` refuses without a passing check or with audit violations, and logs the PR for the audit; `awb merge` merges only on an approve of the current head (newest verdict wins, whole-line match) with the required checks green, pinned by `--match-head-commit` | `awb pr`, `awb merge` |
 | dispatch/report loop (main ↔ worker) | TLA+ with liveness: no false done, no lost task | `model/tla/AwbLoop.tla` |
 | tell vs a permission dialog | TLA+: a dialog the registry reported before a keystroke is never typed into (registry re-read before the paste and every Enter); `AwbWaitRace.cfg` shows the window no check closes | `model/tla/AwbWait.tla` |
 | Lark sync (ticks, manual syncs, crashes vs one topic) | TLA+: one topic per board and the card never goes back to an older state; `AwbLarkOld*.cfg` reproduce two topics and a regressed card from breaking the lock by age | `model/tla/AwbLark.tla` |

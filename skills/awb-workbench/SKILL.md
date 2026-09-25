@@ -99,6 +99,8 @@ socket is `/tmp/awb-UID-HASH.sock`).
 | `awb send ID TASK` / `awb reply ID KEY [RESULT]` | open a keyed task and print the message to send / close it when the reply echoes the key |
 | `awb idle ID` / `awb pending` | on an idle notice: print an ask once, then mark blocked / open tasks with keys and worker status |
 | `awb pr ID [gh args]` | push the current branch and open a PR; refused unless the agent's latest check passed; the body lists milestones and check steps |
+| `awb merge PR [--watch]` | merge only when the newest verdict on the current head approves (a PR review, or a comment whose first line names the head sha and matches `AWB_APPROVE_RE` in full) and at least `AWB_MIN_CHECKS` checks named by `AWB_REQUIRE_CHECKS` ran green; pinned with `--match-head-commit` |
+| `awb hold RES OWNER [NOTE]` / `awb release RES [OWNER]` / `awb holder RES` | one holder per shared resource (a GPU, a host); another owner is refused; a holder quiet for `AWB_STALE` shows under 异常 |
 | `awb tell ID MSG` | type a message into the agent's TUI pane and press Enter (claude/codex; Claude queues it when busy) |
 | `awb peers` | each agent's Claude session name and busy/idle |
 | `awb stale` / `awb nudge` | list agents silent ≥ `AWB_STALE` seconds / remind them in a loop |
@@ -120,6 +122,12 @@ States: ◔ running · ✓ done · ▲ blocked · ✗ failed · ■ dead; group 
 4. An agent's own `done` is only a claim. You choose the acceptance command and `awb check`
    runs it; after a rejected check the agent cannot become done until a later check passes.
 5. Keep acceptance files (tests, ACCEPT.lean) outside the worker's directory so it cannot edit them.
+6. A shared resource changes hands with `awb hold` / `awb release`, never by message alone;
+   scripts that must not disturb it (probes, deploys) check `awb holder RES` first.
+7. Merge with `awb merge PR`, not by reading the PR page: a retracted or conditional approve,
+   an approve of an older head, or a check that never started is not a green light.
+8. `awb nudge` also tells a Claude worker whose session stopped with a tool call printed as
+   text (`AWB_STUCK_RE`) to re-issue it; the board flags it until the session works again.
 
 Worker prompt template:
 
