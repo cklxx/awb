@@ -177,6 +177,12 @@ def wrap($n):
 . as $raw
 # the newest reading by its time, so a backfilled older one (metric --at) does not replace it
 | ([$raw[] | select(type == "object" and .t == "metric")] | sort_by(.ep // 0) | last // {}) as $metric
+# held resources (awb hold/release) and stuck-session nudges: no agent state, render only
+| ([$raw[] | select(type == "object" and (.t == "hold" or .t == "release") and (.res | type) == "string")]
+   | group_by(.res) | map(sort_by(.ep // 0) | last | select(.t == "hold")
+     | {res, owner:(.owner // ""), since:(.ep // 0), note:(.note // "")})) as $holds
+| ([$raw[] | select(type == "object" and .t == "nudge" and .why == "stuck" and (.id | type) == "string")]
+   | group_by(.id) | map(sort_by(.ep // 0) | last | {key:.id, value:.}) | from_entries) as $stk
 | ($raw | fold)
 
 # pane closed without a finish/fail event -> dead (empty pane = remote agent)
@@ -368,7 +374,10 @@ else
                                                  | if startswith("等") then . else "等 " + . end)
                   elif $a.status == "running" and $a.current then ($a.current.text // "")
                   elif ($a.done | length) > 0 then "✓ " + ($a.done[-1].text // "") else ($a.reason // "") end),
-            flag:([ (if $a.status == "running" and $d != null and ($nowep - $d.ep) >= $frz
+            flag:([ (($stk[$a.id] // null) as $n | ($sess[$a.id] // null) as $x
+                     | if $n != null and $x != null and $x.status != "busy" and $x.since <= $n.ep
+                       then "工具调用没执行，提醒后仍停着 " + (($nowep - $n.ep) | sdur) else empty end),
+                    (if $a.status == "running" and $d != null and ($nowep - $d.ep) >= $frz
                       then "无改动 " + (($nowep - $d.ep) | sdur) else empty end),
                     (if ($a.sess // "") != "" then "≠ " + $a.sess else empty end) ] | join(" · "))} ]
      | sort_by([(if .status == "blocked" then 0 elif .status == "running" then 1 else 2 end), -.idle])) as $act
@@ -409,6 +418,12 @@ else
        ($act[] | if .flag != "" then {kind:"flag", text:"\(.name) \(.flag)"}
                  elif .status == "running" and .silent and .live == null
                  then {kind:"silent", text:"\(.name) \(.idle | sdur) 没有更新"} else empty end),
+       # a held resource whose holder has not worked for AWB_STALE: the rest queue behind it
+       ($holds[] | . as $hd | ($s.agents[$hd.owner] // null) as $a | ($sess[$hd.owner] // null) as $x
+        | (if $x != null then (if $x.status == "busy" then 0 else $nowep - $x.since end)
+           elif $a != null then $nowep - $a.lastEp else 0 end) as $q
+        | select($q >= ($stale | tonumber))
+        | {kind:"hold", text:"\($hd.res) 被 \(($a.name) // $hd.owner) 占着 \(($nowep - $hd.since) | sdur)，它 \($q | sdur) 没在干活"}),
        (if $quiet >= ($stale | tonumber) and $nrun > 0
         then {kind:"board", text:"看板 \($quiet | ago)没有新事件，主控可能停了"} else empty end) ]) as $anom
   # the next open steps of the main line
@@ -440,7 +455,7 @@ else
       [ {goal:$s.goal, title:$G.title, about:$G.about, headline:$headline, quiet:$quiet,
          now:$nowep, clock:$now, progress:$tp, hour:{milestones:$m1, tasks:$t1}, day:$D,
          verified:{v:$mver, n:($mdone | length)}, running:$nrun, metric:$M, need:$need,
-         anomalies:$anom, next:$next,
+         anomalies:$anom, next:$next, holds:$holds,
          agents:$act, idle:$idl, tasks:$trees, tasks_old:$nold,
          news:$news, checks:[$s.checks[] | {id, what, ok:(all(.steps[]; .state == "ok")),
            fail:any(.steps[]; .state == "fail"), startEp}]} | tojson ]
@@ -466,6 +481,9 @@ else
   | ([$G.about[] | wrap($bw - 4)[] | "│ " + $dm + . + $rs]) as $babout
   | ("│ " + (if ($need | length) > 0 then $y elif ($anom | length) > 0 then $cy else $g end) + "▶ " + $headline + $rs) as $bhead
   | ("   " + $move + $dm + " · 里程碑 已核 \($mver) / 自报 \(($mdone | length) - $mver)" + $rs) as $bstat
+  | ([ $holds[] | "   " + $dm + "资源 " + $rs + .res + " → " + (($s.agents[.owner].name) // .owner)
+       + $dm + " · 占 " + (($nowep - .since) | sdur) + (if .note != "" then " · " + .note else "" end) + $rs
+       | clip($bw) ]) as $holdb
   | (if ($need | length) > 0 then ["", $y + "需要你（\($need | length)）" + $rs]
        + [ $need[] | (if .age != null then $dm + " · 已 \(.age | ago)" + $rs else "" end) as $ag
                      | if .kind == "wait" then $y + "  ▲ " + $rs + (.name | clip(10) | pad(10)) + " " + (.text | clip($bw - 16))
@@ -489,7 +507,7 @@ else
   | ("   " + $dm + "24 小时：里程碑 +\($D.milestones)（已核 \($D.verified)） · 任务 +\($D.tasks)"
      + (if $D.metric != null then " · \($M.name) " + (if $D.metric >= 0 then "+" else "" end) + ($D.metric * 100 | round / 100 | tostring) else "" end)
      + $rs) as $bday
-  | ([$btop] + $babout + [$bhead] + $mlines + [($bfoot | clip($bw)), $bstat]
+  | ([$btop] + $babout + [$bhead] + $mlines + [($bfoot | clip($bw)), $bstat] + $holdb
      + $needb + $nextb + $anomb + ["", $bday]
      + (if ($news | length) > 0 then ["", $g + "进展" + $rs]
           + [ $news[-3:] | reverse[] | "  ✓ " + $dm + .time[0:5] + $rs + " " + (.text | clip($bw - 12)) ] else [] end)
@@ -636,6 +654,7 @@ freeze_once() {
 # at most once per AWB_NUDGE_EVERY. Panes map: $AWB_DIR/panes, lines "ID PANE".
 nudge_once() {
   freeze_once
+  stuck_once
   [ -s "$AWB_DIR/panes" ] || return 0
   now=$(date +%s)
   { [ -s "$EV" ] && cat "$EV" || true; } | jq -R -s -r \
@@ -657,6 +676,26 @@ nudge_once() {
     msg="[看板自动提醒] 你（${id}）已 ${mins} 分钟没更新看板。请现在报一句结果：AWB_DIR=$AWB_DIR awb now $id \"<结果>\"；卡住用 awb block $id \"<原因>\"；做完用 awb finish $id \"<成果>\"。"
     tell "$id" "$msg" 2>/dev/null || continue
     append '{t:"nudge",time:$time,ep:$ep,id:$id}' --arg id "$id"
+  done
+}
+
+# a Claude session that stopped with an unexecuted tool call printed as text (a model that
+# emits its call syntax instead of calling) looks idle, not silent: it may have reported a
+# minute ago. Its pane tail matches AWB_STUCK_RE while the registry says idle for
+# AWB_STUCK_AFTER seconds; it is told to re-issue, at most once per AWB_STUCK_EVERY.
+stuck_once() {
+  re=${AWB_STUCK_RE-DSML|<invoke name=|</?function_calls>}
+  [ -n "$re" ] || return 0
+  now=$(date +%s); sj=$(sessions_json)
+  agent_panes | while read -r id pane; do
+    since=$(printf '%s' "$sj" | jq -r --arg i "$id" '.[$i] | select(.status == "idle") | .since')
+    [ -n "$since" ] && [ $((now - since)) -ge "${AWB_STUCK_AFTER:-120}" ] || continue
+    hit=$(tm capture-pane -p -t "$pane" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -15 | grep -Eo "$re" | tail -1)
+    [ -n "$hit" ] || continue     # the pipeline's status is tail's, so test the match itself
+    last=$(grep -F "\"id\":\"$id\"" "$EV" 2>/dev/null | grep -F '"why":"stuck"' | tail -1 | jq -R -r 'fromjson? | .ep' || true)
+    [ $((now - ${last:-0})) -ge "${AWB_STUCK_EVERY:-600}" ] || continue
+    tell "$id" "[看板自动提醒] 你上一条输出里的工具调用（${hit}）被打印成了文本，没有执行，会话已停。请重新发出那条调用，然后继续。" 2>/dev/null || continue
+    append '{t:"nudge",time:$time,ep:$ep,id:$id,why:"stuck",hit:$h}' --arg id "$id" --arg h "$hit"
   done
 }
 
@@ -960,6 +999,78 @@ pr() {
   append '{t:"pr",time:$time,ep:$ep,id:$id,url:$u}' --arg id "$id" --arg u "$url"
 }
 
+# shared resources (a GPU card, a staging host): one holder at a time. hold/release events
+# carry no agent id, so the proven fold drops them like metric; render reads them for the board.
+holder() {   # "OWNER EP NOTE" of RES; exit 1 when free
+  init_dir
+  _h=$({ [ -s "$EV" ] && cat "$EV" || true; } | jq -R -r --arg r "$1" 'fromjson?
+    | select(type == "object" and (.t == "hold" or .t == "release") and .res == $r)
+    | "\(.t) \(.owner // "-") \(.ep // 0) \(.note // "")"' | tail -1)
+  case $_h in hold\ *) printf '%s\n' "${_h#hold }" ;; *) return 1 ;; esac
+}
+hold() {
+  [ $# -ge 2 ] || die "usage: $PROG hold RES OWNER [NOTE]"
+  res=$1; own=$2; shift 2; init_dir
+  lock "res-$res"
+  if cur=$(holder "$res"); then
+    o=${cur%% *}
+    [ "$o" = "$own" ] || die "$res is held by $o since $(date -r "$(echo "$cur" | cut -d' ' -f2)" +%H:%M 2>/dev/null || echo '?'); ask $o, or: $PROG release $res $o"
+  fi
+  append '{t:"hold",time:$time,ep:$ep,res:$r,owner:$o,note:$n}' --arg r "$res" --arg o "$own" --arg n "$*"
+  unlock "res-$res"
+}
+release() {
+  [ $# -ge 1 ] || die "usage: $PROG release RES [OWNER]"
+  res=$1; init_dir
+  lock "res-$res"
+  cur=$(holder "$res") || { echo "$res is free"; unlock "res-$res"; return 0; }
+  o=${cur%% *}
+  [ -z "${2:-}" ] || [ "$2" = "$o" ] || die "$res is held by $o, not $2"
+  append '{t:"release",time:$time,ep:$ep,res:$r,owner:$o}' --arg r "$res" --arg o "$o"
+  unlock "res-$res"
+}
+
+# merge a PR only when the newest verdict on its CURRENT head approves and the required checks
+# actually ran green. A verdict is a PR review on the head, or a comment whose first line names
+# the head's short sha; a comment verdict counts only when that whole line matches
+# AWB_APPROVE_RE, so "APPROVE ... with one fix" or a later correction does not. A check that
+# never started is not green: at least AWB_MIN_CHECKS successes named by AWB_REQUIRE_CHECKS.
+merge() {
+  [ $# -ge 1 ] || die "usage: $PROG merge PR [--watch]"
+  n=$1; _watch=0; [ "${2:-}" != --watch ] || _watch=1; init_dir
+  for _i in $(seq 1 "${AWB_MERGE_POLLS:-240}"); do
+    j=$(gh pr view "$n" --json state,headRefOid,reviews,comments,statusCheckRollup) || die "gh cannot read PR $n"
+    v=$(printf '%s' "$j" | jq -r --arg re "${AWB_APPROVE_RE:-^\\*\\*APPROVE \\([^)]*\\)\\*\\*\$}" \
+          --arg req "${AWB_REQUIRE_CHECKS:-.}" --argjson min "${AWB_MIN_CHECKS:-1}" '
+      .headRefOid as $sha | $sha[:8] as $h
+      | ([(.reviews // [])[] | select((.commit.oid // "") == $sha and (.state | IN("APPROVED","CHANGES_REQUESTED")))
+          | {ep:.submittedAt, ok:(.state == "APPROVED")}]
+         + [(.comments // [])[] | (.body | split("\n")[0]) as $l
+            | select(($l | contains($h)) and ($l | test("APPROVE|REQUEST CHANGES|CHANGES REQUESTED")))
+            | {ep:.createdAt, ok:($l | test($re))}]
+         | sort_by(.ep) | last) as $v
+      | [(.statusCheckRollup // [])[] | {name:(.name // .context // ""), c:((.conclusion // "") | if . == "" then null else . end) // (.state // "")}] as $cs
+      | ([$cs[] | select(.c | IN("","PENDING","EXPECTED","QUEUED","IN_PROGRESS"))] | length) as $pend
+      | ([$cs[] | select(.c | IN("FAILURE","ERROR","CANCELLED","TIMED_OUT","ACTION_REQUIRED","STARTUP_FAILURE"))] | length) as $bad
+      | ([$cs[] | select(.c == "SUCCESS" and (.name | test($req)))] | length) as $good
+      | (if $v == null then "none" elif $v.ok then "approve" else "changes" end) as $vd
+      | (if $bad > 0 then "red" elif $pend > 0 then "pending" elif $good < $min then "missing" else "green" end) as $ck
+      | "\(.state) \($sha) \($vd) \($ck) \($good)/\($min)"')
+    set -- $v
+    echo "#$n $(date +%H:%M) head ${2%"${2#????????}"} verdict $3 checks $4 ($5 required-green)"
+    [ "$1" != MERGED ] || return 0
+    if [ "$3" = approve ] && [ "$4" = green ]; then
+      gh pr merge "$n" "--${AWB_MERGE_METHOD:-merge}" --match-head-commit "$2" || die "merge of #$n refused"
+      append '{t:"news",time:$time,ep:$ep,text:$x}' --arg x "PR #$n merged (head ${2%"${2#????????}"})"
+      echo "#$n merged"; return 0
+    fi
+    [ "$4" != red ] || [ "$3" != approve ] || die "#$n: approved but checks are red"
+    [ "$_watch" = 1 ] || return 1
+    sleep "${AWB_MERGE_POLL:-60}"
+  done
+  die "#$n not mergeable after ${AWB_MERGE_POLLS:-240} polls"
+}
+
 # board beside the current tmux pane (the conversation), for chat-driven use
 board() {
   init_dir; [ -f "$EV" ] || : > "$EV"
@@ -1258,6 +1369,11 @@ Chat-driven: you talk to one Claude (the main agent); it keeps the board and run
   $PROG idle ID                     on an idle notice: prints an ask once, then marks blocked
   $PROG pending                     open tasks with keys and worker session/status
   $PROG pr ID [gh args...]          push this branch and open a PR, only after a passing check
+  $PROG merge PR [--watch]          merge only when the newest verdict on the current head approves
+                                    and required checks ran green (AWB_APPROVE_RE, AWB_REQUIRE_CHECKS,
+                                    AWB_MIN_CHECKS); --watch polls until then (AWB_MERGE_POLL/POLLS)
+  $PROG hold RES OWNER [NOTE]       take a shared resource (refused while another owner holds it)
+  $PROG release RES [OWNER]         give it back;  $PROG holder RES: "OWNER EP NOTE", exit 1 if free
   $PROG board                       split a board pane beside the current tmux pane
   $PROG state | audit               jq fold per agent | protocol violations (Lean monitor)
   $PROG version | skill             version | the agent operating manual (SKILL.md)
@@ -1364,6 +1480,45 @@ selftest() {
   AWB_DIR=$bd3 "$BIN" snapshot | jq -e '.metric.eta != null and (.metric.late | not)' >/dev/null \
     || die "selftest: an estimate inside the deadline hidden"
   ! AWB_DIR=$bd3 "$BIN" metric --by soon he 2 30 2>/dev/null || die "selftest: metric --by accepted a non-epoch"
+  # a shared resource has one holder: another owner is refused, the holder renews, release
+  # frees it; the fold never sees it, and a holder quiet for AWB_STALE is an anomaly
+  hd=$t/hold; mkdir -p "$hd"; hb() { AWB_DIR=$hd "$BIN" "$@"; }
+  hb start h1 perf1 >/dev/null; hb hold gpu h1 "bench"
+  ! hb hold gpu h2 2>/dev/null || die "selftest: a held resource was taken by another owner"
+  hb hold gpu h1 "renew" || die "selftest: the holder could not renew"
+  [ "$(hb holder gpu | cut -d' ' -f1)" = h1 ] || die "selftest: holder lost"
+  ! hb release gpu h2 2>/dev/null || die "selftest: a non-holder released the resource"
+  [ "$(hb state)" = "h1 running false - 0 0" ] || die "selftest: hold events reached the fold: $(hb state)"
+  AWB_STALE=0 hb snapshot | jq -e '.holds[0].owner == "h1" and any(.anomalies[]; .kind == "hold")' >/dev/null \
+    || die "selftest: a quiet holder is not an anomaly"
+  hb render | grep -Fq "gpu → perf1" || die "selftest: the held resource is not on the board"
+  hb release gpu; ! hb holder gpu >/dev/null || die "selftest: release did not free the resource"
+  AWB_STALE=0 hb snapshot | jq -e '(.holds | length) == 0 and (any(.anomalies[]; .kind == "hold") | not)' >/dev/null \
+    || die "selftest: a released resource still shown"
+  # merge: only the newest verdict naming the current head counts, a conditional or retracted
+  # approve does not, and checks that never ran are not green (fake gh replays each PR state)
+  mkdir -p "$t/fgh"; printf '#!/bin/sh\ncase "$1 $2" in "pr view") cat %s/fgh/pr.json ;; "pr merge") echo "$*" >> %s/fgh/log ;; esac\n' "$t" "$t" > "$t/fgh/gh"
+  chmod +x "$t/fgh/gh"; : > "$t/fgh/log"
+  mh=891472afdeadbeef00000000000000000000beef
+  mpr() { printf '{"state":"OPEN","headRefOid":"%s","reviews":[],"comments":[%s],"statusCheckRollup":[%s]}' "$mh" "$1" "$2" > "$t/fgh/pr.json"; }
+  mc() { printf '{"createdAt":"2026-01-01T0%s:00:00Z","body":"%s"}' "$1" "$2"; }
+  mg() { printf '{"name":"gate (%s)","conclusion":"%s"},{"name":"gate (%s2)","conclusion":"%s"}' "$1" "$1" "$1" "$2"; }
+  mm() { PATH=$t/fgh:$PATH AWB_DIR=$hd AWB_REQUIRE_CHECKS='^gate' AWB_MIN_CHECKS=2 "$BIN" merge 7 >/dev/null 2>&1; }
+  ok='**APPROVE (rev, head 891472af)**'
+  mpr "$(mc 1 '**APPROVE (rev, head 891472af) with one doc fix**'),$(mc 2 'REQUEST CHANGES (rev) head 891472af')" "$(mg SUCCESS SUCCESS)"
+  ! mm || die "selftest: merge took a retracted approve"
+  mpr "$(mc 1 '**APPROVE (rev, head 891472af) with one doc fix**')" "$(mg SUCCESS SUCCESS)"
+  ! mm || die "selftest: merge took a conditional approve"
+  mpr "$(mc 1 "$ok")" '{"name":"GitGuardian","conclusion":"SUCCESS"}'
+  ! mm || die "selftest: merge took checks that never ran as green"
+  mpr "$(mc 1 "$ok")" "$(mg SUCCESS "")"
+  ! mm || die "selftest: merge did not wait for a pending check"
+  mpr "$(mc 1 '**APPROVE (rev, head 1c56633a)**')" "$(mg SUCCESS SUCCESS)"
+  ! mm || die "selftest: merge took an approve of an older head"
+  [ ! -s "$t/fgh/log" ] || die "selftest: merge called gh pr merge before it was ready"
+  mpr "$(mc 1 'REQUEST CHANGES (rev, head 891472af)'),$(mc 2 "$ok")" "$(mg SUCCESS SUCCESS)"
+  mm || die "selftest: merge refused an exact approve with green checks"
+  grep -qx "pr merge 7 --merge --match-head-commit $mh" "$t/fgh/log" || die "selftest: merge not pinned to the head: $(cat "$t/fgh/log")"
   [ "$(printf '%s\n' "$b" | grep -n '^需要你' | cut -d: -f1)" -lt "$(printf '%s\n' "$b" | grep -n '^异常' | cut -d: -f1)" ] \
     || die "selftest: 需要你 not above 异常"
 
@@ -1563,6 +1718,24 @@ FT
       || die "selftest: a silent agent with no session not listed"
     reg idle "" 10
     ! ht render | grep -Fq "会话空闲" || die "selftest: running agent idle 10s flagged"
+    # a session stopped with a tool call printed as text is told to re-issue it, once per
+    # AWB_STUCK_EVERY, and flagged until it works again; an idle pane without one is left alone
+    reg idle "" 300
+    ht nudge --once >/dev/null 2>&1
+    ! grep -F '"why":"stuck"' "$EV" | grep -qF '"id":"z1"' || die "selftest: an idle session with no printed call was told it is stuck"
+    tmux -L "$S" send-keys -t "$zp" "echo '<invoke name=\"Bash\">'" Enter; sleep 0.4
+    ht nudge --once >/dev/null 2>&1
+    [ "$(grep -F '"why":"stuck"' "$EV" | grep -cF '"id":"z1"')" = 1 ] || die "selftest: a stuck session was not told to re-issue"
+    sleep 0.6; tmux -L "$S" capture-pane -p -t "$zp" | grep -Fq "被打印成了文本" || die "selftest: the stuck reminder was not typed"
+    ht snapshot | jq -e '.agents[] | select(.id == "z1") | .flag | contains("工具调用没执行")' >/dev/null \
+      || die "selftest: a stuck session is not flagged"
+    ht nudge --once >/dev/null 2>&1
+    [ "$(grep -F '"why":"stuck"' "$EV" | grep -cF '"id":"z1"')" = 1 ] || die "selftest: the stuck reminder is not throttled"
+    reg busy
+    ! ht snapshot | jq -e '.agents[] | select(.id == "z1") | .flag | contains("工具调用没执行")' >/dev/null \
+      || die "selftest: a working session still flagged stuck"
+    tmux -L "$S" send-keys -t "$zp" C-u; tmux -L "$S" send-keys -t "$zp" clear Enter
+    reg idle "" 10
     "$BIN" finish z1
     [ "$(ht peers | grep '^z1 ')" = "z1 $zp zz-1 idle" ] || die "selftest: peers lost the session"
     # a pane given as session:window.pane in .awb/panes resolves to the same session
@@ -1885,6 +2058,10 @@ case "$cmd" in
   _leave)   _leave "${1:-0}" ;;
   check)    check "$@" ;;
   pr)       pr "$@" ;;
+  merge)    merge "$@" ;;
+  hold)     hold "$@" ;;
+  release)  release "$@" ;;
+  holder)   [ $# -ge 1 ] || die "usage: $PROG holder RES"; holder "$1" ;;
   send)     send "$@" ;;
   reply)    reply "$@" ;;
   idle)     idle "$@" ;;
