@@ -1507,6 +1507,8 @@ selftest() {
   ok='**APPROVE (rev, head 891472af)**'
   mpr "$(mc 1 '**APPROVE (rev, head 891472af) with one doc fix**'),$(mc 2 'REQUEST CHANGES (rev) head 891472af')" "$(mg SUCCESS SUCCESS)"
   ! mm || die "selftest: merge took a retracted approve"
+  mpr "$(mc 1 '**APPROVE (rev, head 891472af) with one doc fix**')" "$(mg SUCCESS SUCCESS)"
+  ! mm || die "selftest: merge took a conditional approve"
   mpr "$(mc 1 "$ok")" '{"name":"GitGuardian","conclusion":"SUCCESS"}'
   ! mm || die "selftest: merge took checks that never ran as green"
   mpr "$(mc 1 "$ok")" "$(mg SUCCESS "")"
