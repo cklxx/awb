@@ -125,7 +125,10 @@ awb down                                            # kill the session
 ```
 
 Board knobs: `AWB_VIEW=brief|full` (default brief), `AWB_STALE=SECS` lists agents silent
-that long (default 600), `AWB_INTERVAL` refresh seconds (default 1), `AWB_FROZEN=SECS`
+that long (default 600), `AWB_INTERVAL` refresh seconds (default 1), `AWB_METRIC_STALE=SECS` shows the latest reading's
+age and drops the time-to-target estimate once that reading is older (default 21600; the
+estimate itself counts from the latest reading), `AWB_TASK_STALE=SECS` tags an open task root
+nobody updated that long (default 21600), `AWB_FROZEN=SECS`
 flags a running agent whose git working tree is unchanged that long (default 900).
 
 Keep acceptance files outside the agent's working directory so the agent cannot edit them.

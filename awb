@@ -348,7 +348,12 @@ else
           # a minute (backfilled readings in one second once gave "0 minutes")
           eta:(if ($mh | length) >= 2 and $tt != null and $v != null and $v0 != null and $v > $v0 and $v < $tt and $el >= 600
                then (($tt - $v) / (($v - $v0) / $el)) | if . >= 60 then . else null end else null end),
-          by:([$mh[] | .by // empty] | last)}
+          by:([$mh[] | .by // empty] | last),
+          age:($nowep - ($metric.ep // $nowep))}
+     # the estimate runs from the latest reading, not from now: count the time since it, and
+     # none at all from a reading older than AWB_METRIC_STALE (a day-old trend is not a forecast)
+     | .stale = (.age >= $mstale)
+     | .eta = (if .eta == null or .stale then null else (.eta - .age) | if . >= 60 then . else null end end)
      # an estimate past the deadline (metric --by) is not shown; the board says the trend misses it
      | if .by != null and .value != null and .target != null and .value < .target
           and (.eta == null or $nowep + .eta > .by) then .eta = null | .late = true else .late = false end
@@ -387,7 +392,10 @@ else
        | kids($s.tasks; $s.torder; $root) as $k0
        | [$k0[] | select($s.tasks[.].state == "done")] as $dk
        | ($dk[:-2]) as $fold
+       | (if $rp.d < $rp.t then $nowep - ([$root, leaves($s.tasks; $s.torder; $root)[]] | map($tep[.] // 0) | max)
+          else 0 end) as $tage
        | {text:$rt.text, d:$rp.d, t:$rp.t, folded:($fold | length),
+          quiet:(if $tage >= $tstale then $tage else null end),
           kids:[ $k0[] | select(. as $x | $fold | index($x) | not) | $s.tasks[.] as $t
                  | leaves($s.tasks; $s.torder; .) as $lv
                  | {text:$t.text, state:$t.state,
@@ -467,9 +475,11 @@ else
      else (if $M.frac != null then " ▕" + bar($M.frac; 1; 10) + "▏" + (($M.frac * 100) | floor | tostring) + "%" else "" end) as $bar
        | ([$M.history[].value] | .[-12:]) as $vals
        | (if ($vals | length) >= 2 then " " + ($vals | spark([$M.target // 0, max] | max)) else "" end) as $sp
+       | (if $M.stale then "  最新读数 \($M.age | ago)前" else "" end) as $old
        | (if $M.v0 != null then "  起 \($M.v0) · \($M.since | ago)前"
             + (if $M.eta != null then " · 按均速约 \($M.eta | ago)达标（估）"
                elif $M.late then " · 按当前趋势截止前达不到" else "" end) else "" end) as $tr
+       | ($old + $tr) as $tr
        | ["│ " + $cy + ($M.name | clip(14)) + $rs + " \($metric.value) / \($metric.target)" + $bar + $sp
           + $dm + ($tr | clip([$bw - 50, 0] | max)) + $rs]
          + (if $M.note != "" then ["│   " + $dm + ($M.note | clip($bw - 6)) + $rs] else [] end)
@@ -492,7 +502,8 @@ else
      else [] end) as $needb
   | (if ($trees | length) + $nold == 0 then [] else [""]
      + [ $trees[] | . as $tr
-         | $cy + "■ " + ($tr.text | clip($bw - 25) | pad($bw - 25)) + $rs + " " + bar($tr.d; $tr.t; 12) + $dm + " \($tr.d)/\($tr.t)" + $rs,
+         | $cy + "■ " + ($tr.text | clip($bw - 25) | pad($bw - 25)) + $rs + " " + bar($tr.d; $tr.t; 12) + $dm + " \($tr.d)/\($tr.t)"
+           + (if $tr.quiet then " · \($tr.quiet | ago)没更新" else "" end) + $rs,
            (if $tr.folded > 0 then $dm + "  ├─ ✓ 另 \($tr.folded) 项已完成" + $rs else empty end),
            (range(0; $tr.kids | length) as $i | $tr.kids[$i] as $t | ($TI[$t.state] // ["•",$dm]) as $ic
             | (if $i == ($tr.kids | length) - 1 then "  └─ " else "  ├─ " end) as $pre
@@ -579,7 +590,8 @@ render() {
     --argjson w "$cols" --argjson h "$rows" \
     --arg now "$(date +$TS_FMT)" --argjson nowep "$(date +%s)" \
     --arg prog "$PROG" --argjson live "$live" --arg view "${AWB_VIEW:-brief}" --arg stale "${AWB_STALE:-600}" \
-    --argjson diffs "$diffs" --argjson frz "${AWB_FROZEN:-900}" --argjson sess "$(sessions_json)" \
+    --argjson diffs "$diffs" --argjson frz "${AWB_FROZEN:-900}" \
+    --argjson mstale "${AWB_METRIC_STALE:-21600}" --argjson tstale "${AWB_TASK_STALE:-21600}" --argjson sess "$(sessions_json)" \
     --arg g  "${ESC}[32m"  --arg cy "${ESC}[36m" --arg y "${ESC}[33m" \
     --arg r  "${ESC}[31m"  --arg dm "${ESC}[2m"  --arg rs "${ESC}[0m" \
     "$JQ_RENDER"
@@ -1480,6 +1492,21 @@ selftest() {
   AWB_DIR=$bd3 "$BIN" snapshot | jq -e '.metric.eta != null and (.metric.late | not)' >/dev/null \
     || die "selftest: an estimate inside the deadline hidden"
   ! AWB_DIR=$bd3 "$BIN" metric --by soon he 2 30 2>/dev/null || die "selftest: metric --by accepted a non-epoch"
+  # an estimate counts from the latest reading, and a reading older than AWB_METRIC_STALE gives
+  # none: a day-old "30 minutes to target" once sat on the card as if it were current
+  bd5=$t/brief5; mkdir -p "$bd5"; n5=$(date +%s)
+  AWB_DIR=$bd5 "$BIN" metric --at $((n5 - 1200)) m 10 40; AWB_DIR=$bd5 "$BIN" metric --at $((n5 - 600)) m 20 40
+  AWB_DIR=$bd5 "$BIN" snapshot | jq -e '.metric.eta > 540 and .metric.eta < 660 and (.metric.stale | not)' >/dev/null \
+    || die "selftest: the estimate does not count from the latest reading: $(AWB_DIR=$bd5 "$BIN" snapshot | jq -c .metric.eta)"
+  bd6=$t/brief6; mkdir -p "$bd6"
+  AWB_DIR=$bd6 "$BIN" metric --at $((n5 - 108000)) m 10 40; AWB_DIR=$bd6 "$BIN" metric --at $((n5 - 25200)) m 20 40
+  AWB_DIR=$bd6 "$BIN" snapshot | jq -e '.metric.eta == null and .metric.stale' >/dev/null || die "selftest: an estimate from a day-old reading"
+  AWB_DIR=$bd6 "$BIN" render | grep -Fq "最新读数" || die "selftest: a stale reading does not say its age"
+  # an open task root nobody touched for AWB_TASK_STALE says so; a fresh one does not
+  printf '{"t":"task","time":"00:00:00","ep":%s,"id":"old","state":"wip","text":"old root","parent":"","owner":""}\n' $((n5 - 30000)) >> "$bd6/events.jsonl"
+  AWB_DIR=$bd6 "$BIN" task new wip "new root"
+  AWB_DIR=$bd6 "$BIN" snapshot | jq -e '([.tasks[] | select(.text == "old root") | .quiet] == [30000] or ([.tasks[] | select(.text == "old root") | .quiet][0] >= 30000))
+    and ([.tasks[] | select(.text == "new root") | .quiet] == [null])' >/dev/null || die "selftest: task root quiet time wrong"
   # a shared resource has one holder: another owner is refused, the holder renews, release
   # frees it; the fold never sees it, and a holder quiet for AWB_STALE is an anomaly
   hd=$t/hold; mkdir -p "$hd"; hb() { AWB_DIR=$hd "$BIN" "$@"; }
