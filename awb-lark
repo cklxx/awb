@@ -75,7 +75,8 @@ card() {
            columns:(
              (if $s.metric then
                 [tile($s.metric.name | clip(20); "**\($s.metric.value)** / \($s.metric.target)";
-                      (if $s.metric.eta then "按均速约 \($s.metric.eta | ago)达标（估）" elif $s.metric.late then "按当前趋势截止前达不到" else "" end)),
+                      (if $s.metric.stale then "最新读数 \($s.metric.age | ago)前"
+                       elif $s.metric.eta then "按均速约 \($s.metric.eta | ago)达标（估）" elif $s.metric.late then "按当前趋势截止前达不到" else "" end)),
                  tile("达成"; (if $s.metric.frac then "\($s.metric.frac * 100 | floor)%" else "—" end);
                       (if $s.metric.v0 then "起 \($s.metric.v0) · \($s.metric.since | ago)前" else "" end))]
               else [tile("任务"; "\($s.progress.d) / \($s.progress.t)"; "")] end)
@@ -108,7 +109,7 @@ card() {
                  [{tag:"markdown", content:("**最近进展**\n" + ([$s.news[-5:] | reverse[] | ("\(.time[0:5])" | grey) + "　\(.text | clip(100))"] | join("\n")))}]
                 else [] end)
              + [ $s.tasks[] | {tag:"markdown", content:(
-                 "**\(.text | clip(60))**　\(.d)/\(.t)"
+                 "**\(.text | clip(60))**　\(.d)/\(.t)" + (if .quiet then "　" + ("\(.quiet | ago)没更新" | grey) else "" end)
                  + (if .folded > 0 then "\n✓ 另 \(.folded) 项已完成" else "" end)
                  + ([.kids[] | "\n" + ($TI[.state] // "•") + " " + (.text | clip(70)) + (if .prog then "　\(.prog.d)/\(.prog.t)" else "" end)] | join("")))} ]
              + (if $s.tasks_old > 0 then [{tag:"markdown", content:("✓ 另有 \($s.tasks_old) 项已完成" | grey)}] else [] end))}]
