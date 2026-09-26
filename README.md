@@ -75,7 +75,7 @@ awb selftest
 
 This installs `awb` (needs sh, tmux, jq) to `~/.local/bin` and the agent skill to
 `~/.claude/skills/awb-workbench`, from the latest release. Run `./install.sh` in a clone to
-symlink both instead. Agents without a skill mechanism (codex, ...) read the same manual
+symlink both instead. `AWB_BIN_DIR` and `AWB_SKILL_DIR` change the two locations. Agents without a skill mechanism (codex, ...) read the same manual
 with `awb skill`; `awb` itself points agents there.
 
 ## Chat-driven: main agent + awb + session socket
