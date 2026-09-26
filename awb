@@ -1730,7 +1730,7 @@ selftest() {
   # in its trend; it is drawn by step beside it, one point per step (a re-sent step replaces)
   rf=$t/ref; mkdir -p "$rf"; rb() { AWB_DIR=$rf "$BIN" metric "$@"; }
   rb --step 2000 "he 0926" 6 30
-  i=1; while [ $i -le 3 ]; do rb --at $((bn + i)) --step $((i * 2000)) "base 0923" $((i * 3)) 30; i=$((i + 1)); done
+  i=1; while [ $i -le 3 ]; do rb --at $((bn - 100 + i)) --step $((i * 2000)) "base 0923" $((i * 3)) 30; i=$((i + 1)); done
   rb --ref --step 4000 "base 0923" 7 30
   AWB_DIR=$rf "$BIN" snapshot | jq -e '.metric.name == "he 0926" and .day.metric == null and .metric.since == null
     and .refs == [{name:"base 0923", target:30, history:[{x:2000, value:3}, {x:4000, value:7}, {x:6000, value:9}]}]' >/dev/null \
