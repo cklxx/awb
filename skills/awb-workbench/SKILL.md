@@ -24,8 +24,9 @@ Claude's configuration changes (no hooks), and workers need not know awb.
 When you are the Claude the user talks to, follow this protocol and do not ask the user to
 type commands:
 
-1. Board: `awb board` (opens right of your tmux pane; outside tmux, ask the user to run
-   `awb watch` in another terminal), then `awb goal "<goal>"`. The goal holds only the goal:
+1. Board: `awb board` (opens right of your tmux pane). Outside tmux, run `awb up` yourself:
+   it makes a tmux session with the board and a work pane, where `awb tui` opens workers, and
+   prints the one command the user runs to watch it. Then `awb goal "<goal>"`. The goal holds only the goal:
    its first line is the title of the board and of the Lark card, short; further lines say
    what it is (definition, how it is measured, scope). Status never goes into the goal; it
    goes into `awb news` or tasks.
