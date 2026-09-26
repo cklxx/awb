@@ -246,6 +246,53 @@ JQ_RENDER=$JQ_FOLD$JQ_DEFS'
 | ($s.gseen | map({g:., ids:$s.gorder[.]})) as $groups
 | ([$s.agents[]] | length) as $n
 | ([$s.agents[] | .status] | group_by(.) | map({key:.[0], value:length}) | from_entries) as $c
+# what needs you and what is off, computed once for both views (the full view used to show
+# neither, so a short full-view pane could hide every failure)
+| ([$raw[] | select(type == "object" and .t == "task" and .id != null)]
+   | group_by(.id) | map({key:.[0].id, value:(map(.ep // 0) | max)}) | from_entries) as $tep
+| ([$s.agents[] | select(.status == "running")] | length) as $nrun
+| (if ([$raw[] | select(type == "object")] | length) == 0 then 0
+   else $nowep - ([$raw[] | select(type == "object") | .ep // 0] | max // 0) end) as $quiet
+| ([ $s.agents[] | select(.wait) | {kind:"wait", id, name, text:.sess, age:null} ]
+   + [ $s.agents[] | select((.wait | not) and (.status | IN("failed","dead")))
+       | {kind:"fail", id, name, text:(.reason // ""), age:($nowep - (.endEp // .lastEp))} ]
+   + [ $s.torder[] | $s.tasks[.] | select(.state == "ask")
+       | {kind:"ask", id, name:"", text, age:($nowep - ($tep[.id] // $nowep))} ]) as $need
+| (([ $diffs[] | {key:.id, value:.} ] | from_entries) as $df
+   | [ $s.agents[] | select((.wait | not)
+          and ((.status | IN("running","blocked")) or ((.sess // "") != "")))
+       | . as $a | ($nowep - $a.lastEp) as $idle
+       | ($df[$a.id] // null) as $d
+       | ($idle >= $silent and ($a.status | IN("running","blocked"))) as $sil
+       | {id:$a.id, name:$a.name, status:$a.status, idle:$idle, silent:$sil, live:($a.live // null),
+          dn:($a.done | length), dv:([$a.done[] | select(.text | startswith("⊢ "))] | length),
+          age:(if $a.status == "running" and $a.current then $nowep - $a.current.ep else $idle end),
+          text:(if $a.status == "blocked" then (($a.reason // "") | ltrimstr("等：") | ltrimstr("等:")
+                                               | if startswith("等") then . else "等 " + . end)
+                elif $a.status == "running" and $a.current then ($a.current.text // "")
+                elif ($a.done | length) > 0 then "✓ " + ($a.done[-1].text // "") else ($a.reason // "") end),
+          flag:([ (($stk[$a.id] // null) as $n | ($sess[$a.id] // null) as $x
+                   | if $n != null and $x != null and $x.status != "busy" and $x.since <= $n.ep
+                     then "工具调用没执行，提醒后仍停着 " + (($nowep - $n.ep) | sdur) else empty end),
+                  (if $a.status == "running" and $d != null and ($nowep - $d.ep) >= $frz
+                    then "无改动 " + (($nowep - $d.ep) | sdur) else empty end),
+                  (if ($a.sess // "") != "" then "≠ " + $a.sess else empty end) ] | join(" · "))} ]
+   | sort_by([(if .status == "blocked" then 0 elif .status == "running" then 1 else 2 end), -.idle])) as $act
+| ([ $act[] | select(.status == "blocked")
+     | .name as $n | [(.text | match("#[0-9]+"; "g") | .string)] | unique[] | {ref:., name:$n} ]
+   | group_by(.ref) | map(select(length >= 2) | {ref:.[0].ref, names:map(.name)})) as $bott
+| ([ ($bott[] | {kind:"bottleneck", text:"\(.ref) 卡住 \(.names | join("、"))"}),
+     ([ $s.tasks[] | select(.probe != null and (.state | IN("wip","review"))) | .owner ] as $pw
+      | $act[] | if .flag != "" then {kind:"flag", text:"\(.name) \(.flag)"}
+               elif .status == "running" and .silent and .live == null and ((.id | IN($pw[])) | not)
+               then {kind:"silent", text:"\(.name) \(.idle | sdur) 没有更新"} else empty end),
+     ($holds[] | . as $hd | ($s.agents[$hd.owner] // null) as $a | ($sess[$hd.owner] // null) as $x
+      | (if $x != null then (if $x.status == "busy" then 0 else $nowep - $x.since end)
+         elif $a != null then $nowep - $a.lastEp else 0 end) as $q
+      | select($q >= ($stale | tonumber))
+      | {kind:"hold", text:"\($hd.res) 被 \(($a.name) // $hd.owner) 占着 \(($nowep - $hd.since) | sdur)，它 \($q | sdur) 没在干活"}),
+     (if $quiet >= $silent and $nrun > 0
+      then {kind:"board", text:"看板 \($quiet | ago)没有新事件，主控可能停了"} else empty end) ]) as $anom
 | (if $s.goal == "" then "(no goal yet:  " + $prog + " goal \"ship it\")" else $s.goal end) as $goal
 | (($goal | gsub("\r";"") | split("\n") | map(wrap($inner - 4)) | add)) as $goal_lines
 | ("╭─ GOAL " + ("─" * ($inner - 8))) as $top
@@ -265,13 +312,13 @@ JQ_RENDER=$JQ_FOLD$JQ_DEFS'
        | (if any($ss[]; .state == "fail") then ["✗",$r] elif any($ss[]; .state == "run") then ["◔",$cy]
           else ["⊢",$g] end) as $ov
        | ([$ss[] | (.ep1 // $nowep) - .ep0] | add // 0) as $el
-       | ([ $ss[] | ({"ok":["✓",$g],"fail":["✗",$r],"run":["◔",$cy]}[.state] // ["·",$dm]) as $i
-            | $i[1] + .s + " " + $i[0] + $rs
-              + (if .state == "run" then $dm + " " + (($nowep - .ep0) | sdur) + $rs else "" end) ]
-          | join($dm + " → " + $rs)) as $chain
+       | ([ $ss[] | ({"ok":"✓","fail":"✗","run":"◔"}[.state] // "·") as $i
+            | .s + " " + $i + (if .state == "run" then " " + (($nowep - .ep0) | sdur) else "" end) ]
+          | join(" → ")) as $chain
        | ([$ss[] | select(.state == "fail") | .note] | first // "") as $why
        | "  " + $ov[1] + $ov[0] + $rs + " " + ((($s.agents[.id].name) // .id) | clip(10) | pad(10)) + " "
-         + $dm + (.what | clip(18) | pad(18)) + $rs + " " + $chain + $dm + "  " + ($el | sdur) + $rs
+         + $dm + (.what | clip(18) | pad(18)) + $rs + " "
+         + ($chain | clip([$inner - 43, 10] | max)) + $dm + "  " + ($el | sdur) + $rs
        , (if $why != "" then "    " + $r + "└ " + ($why | clip($inner - 8)) + $rs else empty end) ]
    end) as $chk
 | ($viol | split("\n") | map(select(. != "") | split(" "))) as $vs
@@ -291,7 +338,21 @@ JQ_RENDER=$JQ_FOLD$JQ_DEFS'
          | $ic[1] + .pre + $ic[0] + " " + ($n.t.text | clip($inner - $n.depth - 6 - ($ow | dwidth)))
            + $dm + $ow + $rs ]
    ] | add // []) as $ttree
+# what needs you and what is off, in the head of the full view too (the full view used to
+# show neither); up to three of each, then a count of the rest
+| ((if ($need | length) > 0 then ["", $y + "需要你（\($need | length)）" + $rs]
+      + [ $need[] | (if .age != null then $dm + " · 已 " + (.age | ago) + $rs else "" end) as $ag
+          | if .kind == "wait" then $y + "  ▲ " + $rs + (.name | clip(10) | pad(10)) + " " + (.text | clip($inner - 16))
+            elif .kind == "fail" then $r + "  ✗ " + $rs + (.name | clip(10) | pad(10)) + " " + (.text | clip($inner - 26)) + $ag
+            else $y + "  ? " + $rs + (.text | clip($inner - 16)) + $ag end ][:3]
+      + (if ($need | length) > 3 then [$dm + "    还有 \($need[3:] | length) 件" + $rs] else [] end)
+    else [] end)
+   + (if ($anom | length) > 0 then ["", $y + "异常（\($anom | length)）" + $rs]
+      + [ $anom[] | "  " + $y + "! " + $rs + (.text | clip($inner - 6)) ][:3]
+      + (if ($anom | length) > 3 then [$dm + "    还有 \($anom[3:] | length) 条" + $rs] else [] end)
+    else [] end)) as $warn
 | ([$top] + [$goal_lines[] | "│ " + .] + [($foot | clip($inner))] + [""]
+   + $warn
    + (if ($ttree | length) > 0 then $ttree + [""] else [] end) + (if ($chk | length) > 0 then $chk[1:] + [""] else [] end)) as $head
 
 | ([ $groups[] as $gr
@@ -300,7 +361,7 @@ JQ_RENDER=$JQ_FOLD$JQ_DEFS'
     | ([$as[] | select(live)] | length) as $go
     | ([$as[] | select(.status == "blocked")] | length) as $gb
     | ($as | length) as $na
-    | [[$cy + "◆ " + $gr.g + $rs + "  " + bar($gd; $gd + $go; 10)
+    | [[$cy + "◆ " + ($gr.g | clip([$inner - 30, 4] | max)) + $rs + "  " + bar($gd; $gd + $go; 10)
         + $dm + "  \($gd)/\($gd + $go)  " + "\($na) agents" + (if $gb > 0 then "  ▲\($gb)" else "" end) + $rs]]
     + [ range(0; $na) as $i | $as[$i] as $a | ($i == $na - 1) as $last
       | (if $last then "└─ " else "├─ " end) as $br
@@ -354,8 +415,6 @@ else
   # the view is cut at the pane height. The same data, as JSON, is the snapshot view
   # (awb snapshot) that awb-lark turns into a card.
   ([$inner, 100] | min) as $bw
-  | ([$raw[] | select(type == "object" and .t == "task" and .id != null)]
-     | group_by(.id) | map({key:.[0].id, value:(map(.ep // 0) | max)}) | from_entries) as $tep
   | ([ kids($s.tasks; $s.torder; "")[] as $root
        | leaves($s.tasks; $s.torder; $root) as $lv | prog($s.tasks; $lv) as $rp
        | ([$root, $lv[]] | map($tep[.] // 0) | max) as $last
@@ -369,7 +428,6 @@ else
      | unique | length) as $t1
   | ([$s.agents[].done[]? | .text // ""]) as $mdone
   | ([$mdone[] | select(startswith("⊢ "))] | length) as $mver
-  | ([$s.agents[] | select(.status == "running")] | length) as $nrun
   # the metric and its history (same name); a linear ETA from the first reading, an estimate
   | (if ($metric.name // "") == "" then null
      else ([$raw[] | select(type == "object" and .t == "metric" and .name == $metric.name)] | sort_by(.ep // 0)) as $mh
@@ -442,8 +500,9 @@ else
   # the goal: its first line is the title, the rest says what it is
   | (($s.goal | gsub("\r"; "") | split("\n")) as $gl
      | {title:($gl[0] // ""), about:($gl[1:] | map(select(. != "")))}) as $G
-  | ([$raw[] | select(type == "object") | .ep // 0] | max // 0) as $lastEp
-  | ($nowep - $lastEp) as $quiet
+  | (if ([$raw[] | select(type == "object")] | length) == 0 then null
+     else [$raw[] | select(type == "object") | .ep // 0] | max // 0 end) as $lastEp
+  | (if $lastEp == null then 0 else $nowep - $lastEp end) as $quiet
   # the last 24 hours in numbers
   | ($nowep - 86400) as $d1
   | ([$raw[] | select(type == "object" and (.ep // 0) >= $d1)]) as $day
@@ -520,32 +579,48 @@ JQ_BRIEF=$JQ_DEFS'
   "done":["✓",$g],"drop":["–",$dm],"ask":["?",$y],"unknown":["?",$r]}) as $TI
 | ([$w - 1, 100] | min) as $bw
 | . as $S | .metric as $M | .day as $D
-| (if $S.title == "" then "╭─ GOAL " + ("─" * ($bw - 8))
+| (if $S.title == "" then "╭" + ("─" * ($bw - 2)) + "╮"
    else ($S.title | clip($bw - 6)) as $tt | "╭─ " + $tt + " " + ("─" * ([$bw - 5 - ($tt | dwidth), 2] | max)) end) as $btop
 | ([$S.about[] | wrap($bw - 4)[] | "│ " + $dm + . + $rs]) as $babout
 | ("│ " + (if ($S.need | length) > 0 then $y elif ($S.anomalies | length) > 0 then $cy else $g end)
    + "▶ " + $S.headline + $rs) as $bhead
 | (if $M == null then []
    else (if $M.frac != null then " ▕" + bar($M.frac; 1; 10) + "▏" + (($M.frac * 100) | floor | tostring) + "%" else "" end) as $bar
+     | (if $M.stale then "  最新读数 \($M.age | ago)前" else "" end) as $old
+     # narrow panes keep the verdict (stale reading / ETA / misses deadline); the start
+     # point and then the sparkline are dropped whole before the verdict is clipped
+     | (if $M.eta != null then " · 按均速约 \($M.eta | ago)达标（估）"
+        elif $M.late then " · 按当前趋势截止前达不到" else "" end) as $verdict
+     | (if $M.v0 != null then "  起 \($M.v0) · \($M.since | ago)前" else "" end) as $start
+     | ("│ " + ($M.name | clip(14)) + " \($M.value) / \($M.target)" + $bar) as $braw
      | ([$M.history[].value] | .[-12:]) as $vals
      | (if ($vals | length) >= 2 then " " + ($vals | spark([$M.target // 0, max] | max)) else "" end) as $sp
-     | (if $M.stale then "  最新读数 \($M.age | ago)前" else "" end) as $old
-     | (if $M.v0 != null then "  起 \($M.v0) · \($M.since | ago)前"
-          + (if $M.eta != null then " · 按均速约 \($M.eta | ago)达标（估）"
-             elif $M.late then " · 按当前趋势截止前达不到" else "" end) else "" end) as $tr
-     | ["│ " + $cy + ($M.name | clip(14)) + $rs + " \($M.value) / \($M.target)" + $bar + $sp
-        + $dm + (($old + $tr) | clip([$bw - 50, 0] | max)) + $rs]
+     | ($bw - ($braw | dwidth)) as $room
+     # verdict first (stale reading / ETA / misses deadline), then the start point, then the
+     # sparkline; each whole segment is dropped before the verdict is clipped to the pane
+     | (reduce [{t:($dm + $old + $verdict + $rs)}, {t:($dm + $start)}, {t:$sp}][] as $z
+         ({r:$room, out:[]};
+          . as $acc
+          | ($z.t | gsub("\u001b\\[[0-9;]*m"; "")) as $vis
+          | if ($vis | dwidth) == 0 then $acc
+            elif ($vis | dwidth) <= $acc.r then {r:($acc.r - ($vis | dwidth)), out:($acc.out + [$z.t])}
+            elif ($acc.out | length) == 0 then {r:0, out:[($vis | clip($acc.r))]}
+            else $acc end)
+         | .out | join("")) as $tail
+     | ["│ " + $cy + ($M.name | clip(14)) + $rs + " \($M.value) / \($M.target)" + $bar + $tail]
        + (if $M.note != "" then ["│   " + $dm + ($M.note | clip($bw - 6)) + $rs] else [] end)
    end) as $mlines
 | ("╰─ 进度 " + bar($S.progress.d; $S.progress.t; 16) + " \($S.progress.d)/\($S.progress.t)" + "   " + $S.clock
-   + (if $S.quiet >= 60 then " · 更新于 \($S.quiet | ago)前" else "" end)) as $bfoot
+   + (if ($S.quiet // 0) >= 60 then " · 更新于 \($S.quiet | ago)前" else "" end)) as $bfoot
 # movement, one line: the last hour, the last 24 hours, and how much of it is verified
 | ((if $S.hour.milestones + $S.hour.tasks > 0 then $g + "近 1 小时 里程碑 +\($S.hour.milestones) 任务 +\($S.hour.tasks)" + $rs
     elif $S.running > 0 then $y + "近 1 小时无新里程碑" + $rs
     else $dm + "近 1 小时无变化" + $rs end)
    + $dm + " · 24 小时 里程碑 +\($D.milestones) 任务 +\($D.tasks)"
    + (if $D.metric != null then " \($M.name) " + (if $D.metric >= 0 then "+" else "" end) + ($D.metric * 100 | round / 100 | tostring) else "" end)
-   + " · 里程碑已核 \($S.verified.v)/\($S.verified.n)" + $rs) as $move
+   + " · 里程碑已核 \($S.verified.v)/\($S.verified.n)" + $rs) as $move0
+| (($move0 | gsub("\u001b\\[[0-9;]*m"; "") | dwidth) as $mw
+   | if $mw <= ($bw - 3) then $move0 else ($move0 | gsub("\u001b\\[[0-9;]*m"; "") | clip($bw - 3)) end) as $move
 | (if ($S.need | length) > 0 then ["", $y + "需要你（\($S.need | length)）" + $rs]
      + [ $S.need[] | (if .age != null then $dm + " · 已 \(.age | ago)" + $rs else "" end) as $ag
          | if .kind == "wait" then $y + "  ▲ " + $rs + (.name | clip(10) | pad(10)) + " " + (.text | clip($bw - 16))
@@ -561,8 +636,10 @@ JQ_BRIEF=$JQ_DEFS'
      + [ $S.news[-3:] | reverse[] | "  ✓ " + $dm + .time[0:5] + $rs + " " + (.text | clip($bw - 12)) ] else [] end) as $newsb
 | (if ($S.tasks | length) + $S.tasks_old == 0 then [] else [""]
    + [ $S.tasks[] | . as $tr
-       | $cy + "■ " + ($tr.text | clip($bw - 25) | pad($bw - 25)) + $rs + " " + bar($tr.d; $tr.t; 12) + $dm + " \($tr.d)/\($tr.t)"
-         + (if $tr.quiet then " · \($tr.quiet | ago)没更新" else "" end) + $rs,
+       | ((if $tr.quiet then " · \($tr.quiet | ago)没更新" else "" end)) as $qs
+       | ($bw - 25 - ($qs | dwidth)) as $tw
+       | $cy + "■ " + ($tr.text | clip([$tw, 10] | max) | pad($tw)) + $rs + " " + bar($tr.d; $tr.t; 12) + $dm + " \($tr.d)/\($tr.t)"
+         + $qs + $rs,
          (if $tr.folded > 0 then $dm + "  ├─ ✓ 另 \($tr.folded) 项已完成" + $rs else empty end),
          (range(0; $tr.kids | length) as $i | $tr.kids[$i] as $t | ($TI[$t.state] // ["•",$dm]) as $ic
           | (if $i == ($tr.kids | length) - 1 then "  └─ " else "  ├─ " end) as $pre
@@ -573,24 +650,47 @@ JQ_BRIEF=$JQ_DEFS'
    | (if ($cks | length) == 0 then [] else ["", $g + "验收" + $rs]
       + [ $cks[] | .steps as $ss
           | (if .fail then ["✗",$r] elif any($ss[]; .state == "run") then ["◔",$cy] else ["⊢",$g] end) as $ov
-          | ([ $ss[] | ({"ok":["✓",$g],"fail":["✗",$r],"run":["◔",$cy]}[.state] // ["·",$dm]) as $i
-               | $i[1] + .s + " " + $i[0] + $rs + (if .state == "run" then $dm + " " + (.el | sdur) + $rs else "" end) ]
-             | join($dm + " → " + $rs)) as $chain
+          | ([ $ss[] | ({"ok":"✓","fail":"✗","run":"◔"}[.state] // "·") as $i
+               | .s + " " + $i + (if .state == "run" then " " + (.el | sdur) else "" end) ]
+             | join(" → ")) as $chain
           | ([$ss[] | select(.state == "fail") | .note] | first // "") as $why
-          | "  " + $ov[1] + $ov[0] + $rs + " " + (.name | clip(10) | pad(10)) + " "
-            + $dm + (.what | clip(18) | pad(18)) + $rs + " " + $chain + $dm + "  " + ([$ss[].el] | add // 0 | sdur) + $rs,
-            (if $why != "" then "    " + $r + "└ " + ($why | clip($bw - 8)) + $rs else empty end) ] end)
+          | ("  " + $ov[1] + $ov[0] + $rs + " " + (.name | clip(10) | pad(10)) + " "
+            + $dm + (.what | clip(18) | pad(18)) + $rs + " "
+            + ($chain | clip([$bw - 43, 10] | max)) + $dm + "  " + ([$ss[].el] | add // 0 | sdur) + $rs,
+            (if $why != "" then "    " + $r + "└ " + ($why | clip($bw - 8)) + $rs else empty end)) ] end)
    + (if ($S.violations | length) == 0 then [] else ["", $r + "审计违规（Lean 监控）" + $rs]
       + [ $S.violations[] | "  " + $r + "✗ " + $rs + (.name | clip(10) | pad(10)) + " "
           + ({"verified-without-passing-check":"验收标记前没有通过的验收（疑似伪造）",
               "pr-without-passing-check":"没有通过的验收就开了 PR",
               "done-while-check-rejected":"验收被拒后仍报完成"}[.kind] // .kind) ] end)) as $chk
-| [$btop] + $babout + [$bhead] + $mlines + [($bfoot | clip($bw)), "   " + $move]
-  + $needb + $nextb + $anomb + $newsb + $tasksb + $chk
-| .[:$h] | .[]
+| ([$btop] + $babout + [$bhead] + $mlines + [($bfoot | clip($bw)), "   " + $move]) as $fx
+# needs and anomalies are packed against the pane height: the header always shows, as many
+# items as fit, then a "还有 N" line (a short pane used to cut the rest with no trace)
+| (def pack($title; $items; $label; $cur):
+     ($h - $cur) as $bud
+     | (if ($items | length) == 0 or $bud < 2 then []
+        else (if $bud > 2 then [""] else [] end) as $gap
+          | ($bud - ($gap | length) - 1) as $cap
+          | (if $cap < 1 then 0
+             elif ($items | length) <= $cap then ($items | length)
+             else [($cap - 1), 1] | max end) as $k
+          | $gap + [$title] + ($items[:$k])
+            + (if $k < ($items | length) then [$dm + "    还有 \((($items | length) - $k)) " + $label + $rs] else [] end)
+        end);
+   pack($needb[1]; $needb[2:]; "件"; ($fx | length)) as $pb
+   | pack($anomb[1]; $anomb[2:]; "条"; (($fx | length) + ($pb | length) + ($nextb | length))) as $ab
+   | ($fx + $pb + $nextb + $ab) as $core
+   | ($core + $newsb + $tasksb + $chk) as $all
+   # needs/anomalies already carry their own "还有 N" count when packed; a global scroll hint
+   # is added only when the cut falls on news/tasks/checks below them
+   | if ($all | length) <= $h then $all
+     elif ($core | length) >= $h then $all[:$h]
+     else $all[:($h - 1)] + [$dm + "↓ 还有 \((($all | length) - ($h - 1))) 行 · j/k ↑↓ 滚轮 · 空格翻页" + $rs] end)
+   | .[]
 '
 
 dims() {
+  _d=$(
   if [ -n "${AWB_ROWS:-}" ] && [ -n "${AWB_COLS:-}" ]; then
     echo "$AWB_COLS $AWB_ROWS"
   elif [ -n "${TMUX:-}" ] && [ -n "${TMUX_PANE:-}" ]; then
@@ -599,7 +699,13 @@ dims() {
     tmux display-message -p -t "$TMUX_PANE" '#{pane_width} #{pane_height}' 2>/dev/null
   else
     stty size 2>/dev/null | awk '{print $2, $1}'
-  fi || echo "80 24"
+  fi ) || _d=""
+  set -- ${_d:-80 24}
+  # a width under 40 is a bad probe (a pane id on another tmux server, a non-tty pipe), not a
+  # real pane: the brief view used to draw 4 columns. Fall back to 80 instead.
+  case $1 in ''|*[!0-9]*) set -- 80 24;; esac
+  [ "$1" -lt 40 ] 2>/dev/null && set -- 80 "${2:-24}"
+  echo "$1 $2"
 }
 
 # the log as a JSON array, tolerating a half-appended line from a concurrent writer
@@ -1052,6 +1158,10 @@ watch() {
     fi
     n=$(printf '%s\n' "$full" | wc -l | tr -d ' ')
     if [ "$n" -le "$rows" ]; then off=0; out=$full
+    elif [ "$off" -eq 0 ]; then
+      # the first screen renders at the real pane height so the brief view packs needs/anomalies
+      # and prints its own "还有 N 行" line; $full (5000 rows) is only for scrolling below
+      out=$(AWB_COLS=$cols AWB_ROWS=$rows render)
     else
       max=$((n - rows + 1)); [ "$off" -le "$max" ] || off=$max; [ "$off" -ge 0 ] || off=0
       out=$(printf '%s\n' "$full" | sed -n "$((off + 1)),$((off + rows - 1))p")
@@ -1979,10 +2089,10 @@ selftest() {
 ╭─ G ─────────────────────────────────────────────────────────────────────────
 │ what it is
 │ ▶ 需要你 1 件 · m 按当前趋势截止前达不到 · 异常 1
-│ m 3 / 10 ▕███░░░░░░░▏30% ▁▃  最新读数 8小时前  起 1 · 1…
+│ m 3 / 10 ▕███░░░░░░░▏30%  最新读数 8小时前 · 按当前趋势截止前达不到 ▁▃
 │   n1
 ╰─ 进度 ████████░░░░░░░░ 1/2   12:00:00 · 更新于 2分钟前
-   近 1 小时 里程碑 +1 任务 +0 · 24 小时 里程碑 +3 任务 +2 m +1.5 · 里程碑已核 1/3
+   近 1 小时 里程碑 +1 任务 +0 · 24 小时 里程碑 +3 任务 +2 m +1.5 · 里程碑已核…
 
 需要你（1）
   ? pick one · 已 10分钟
@@ -2009,6 +2119,56 @@ GOLD
 $want
 EOF
     die "selftest: the brief view of the fixture snapshot changed (got: $t/brief.got)"; }
+
+  # UX-review fixes: no rendered line is wider than the pane in either view
+  WDEF=$(sed -n "/^JQ_DEFS='\$/,/^'\$/p" "$BIN" | sed '1d;$d')
+  wmax() { jq -Rn "$WDEF"'[inputs | ([explode[] | cw(.)] | add // 0)] | max // 0'; }
+  stripansi() { sed 's/\x1b\[[0-9;]*m//g'; }
+  wd=$t/width; mkdir -p "$wd"; ww() { AWB_DIR=$wd "$BIN" "$@"; }
+  ww start f1 "f1-agent" agent "a-group-name-long-enough-to-overflow-sixty-columns" >/dev/null
+  ww now f1 m >/dev/null
+  _ep=$(date +%s)
+  for j in 1 2; do printf '{"t":"chk","ep":%s,"id":"f1","run":"r1","what":"pytest --with-a-very-long-suite-name --flag","step":"%s","state":"run","note":""}\n' $_ep "a-very-long-step-name-that-overflows-the-pane-width-$j" >> "$wd/events.jsonl"; done
+  printf '{"t":"chk","ep":%s,"id":"f1","run":"r1","what":"pytest --with-a-very-long-suite-name --flag","step":"a-very-long-step-name-that-overflows-the-pane-width-2","state":"fail","note":"E assertion failure with a long reason text that also used to overflow the row"}\n' $_ep >> "$wd/events.jsonl"
+  for view in brief full; do
+    AWB_VIEW=$view AWB_COLS=60 AWB_ROWS=50 ww render | stripansi > "$t/w-$view"
+    mx=$(wmax < "$t/w-$view"); [ "$mx" -le 60 ] || die "selftest: $view view has a line wider than 60 ($mx)"
+  done
+  # in a narrow pane the metric verdict (ETA) survives while start point and sparkline drop
+  wn=$t/narrow; mkdir -p "$wn"; nnow=$(date +%s)
+  AWB_DIR=$wn "$BIN" goal G >/dev/null
+  AWB_DIR=$wn "$BIN" metric --at $((nnow - 1800)) acc 0.5 1 >/dev/null
+  AWB_DIR=$wn "$BIN" metric --by $((nnow + 86400)) acc 0.55 1 >/dev/null
+  AWB_DIR=$wn AWB_COLS=60 "$BIN" render | stripansi > "$t/n60"
+  grep -Fq "按均速约" "$t/n60" || die "selftest: the metric ETA is lost at 60 columns"
+  ! grep -Fq "起 0.5" "$t/n60" || die "selftest: 60 columns kept the start point instead of the ETA"
+  mx=$(wmax < "$t/n60"); [ "$mx" -le 60 ] || die "selftest: metric line overflows at 60 columns ($mx)"
+  AWB_DIR=$wn AWB_COLS=120 "$BIN" render | stripansi | grep -Fq "起 0.5" || die "selftest: the start point is missing at 120 columns"
+  # a short pane shows how many needs/anomalies are hidden, and the full view shows needs too
+  wh=$t/short; mkdir -p "$wh"; i=1
+  while [ $i -le 8 ]; do AWB_DIR=$wh "$BIN" start "f$i" "f$i" >/dev/null; AWB_DIR=$wh "$BIN" now "f$i" "m$i" >/dev/null
+    AWB_DIR=$wh "$BIN" fail "f$i" "reason $i" >/dev/null; i=$((i + 1)); done
+  AWB_DIR=$wh AWB_COLS=60 AWB_ROWS=12 "$BIN" render | stripansi > "$t/sh12"
+  grep -Fq "需要你（8）" "$t/sh12" && grep -Eq "还有 [0-9]+ 件" "$t/sh12" && grep -Fq "✗ f1 " "$t/sh12" \
+    || die "selftest: a 12-row pane hides needs without a count: $(cat "$t/sh12")"
+  [ "$(wc -l < "$t/sh12" | tr -d ' ')" -le 12 ] || die "selftest: 12-row render exceeds the pane height"
+  AWB_DIR=$wh AWB_VIEW=full AWB_COLS=60 AWB_ROWS=24 "$BIN" render | stripansi | grep -Fq "需要你（8）" \
+    || die "selftest: the full view shows no needs-you section"
+  # an empty board shows no stale epoch time and no GOAL placeholder
+  we=$t/empty; mkdir -p "$we"
+  AWB_DIR=$we "$BIN" render | stripansi > "$t/empty.out"
+  ! grep -Fq "更新于" "$t/empty.out" || die "selftest: empty board shows an epoch-0 stale time"
+  ! grep -Fq "GOAL" "$t/empty.out" || die "selftest: empty board shows the GOAL placeholder"
+  AWB_DIR=$we "$BIN" snapshot | jq -e '.quiet == 0 and .title == ""' >/dev/null || die "selftest: empty snapshot quiet/title"
+  # awb view takes COLS ROWS positionally (the brief view never goes below 12 rows); an
+  # empty non-tty stdin with an unreachable pane falls back to 80 columns instead of that width
+  AWB_DIR=$wh "$BIN" snapshot 2>/dev/null | env -u TMUX -u TMUX_PANE "$BIN" view 50 13 | stripansi > "$t/v50"
+  [ "$(wc -l < "$t/v50" | tr -d ' ')" -eq 13 ] || die "selftest: awb view ignored ROWS"
+  mx=$(wmax < "$t/v50"); [ "$mx" -le 50 ] || die "selftest: awb view ignored COLS ($mx > 50)"
+  printf '' >/dev/null
+  AWB_DIR=$wh "$BIN" snapshot 2>/dev/null | env -u AWB_COLS -u AWB_ROWS TMUX=/nonexistent,0,0 TMUX_PANE=%1 "$BIN" view 2>/dev/null | stripansi > "$t/vfb"
+  [ "$(wmax < "$t/vfb")" -gt 10 ] && [ "$(wmax < "$t/vfb")" -le 80 ] \
+    || die "selftest: awb view with an unreachable pane did not fall back to 80 columns"
 
   # single metric indicator under GOAL, render-only (the "#" id keeps it out
   # of the proven fold; `awb state` below proves no agent is created).
@@ -2506,6 +2666,24 @@ FAKE
     AWB_DIR=$rf AWB=$BIN "$lk" sync --dry-run | jq -e '[.body.elements[] | select(.tag == "chart") | .chart_spec]
       | length == 1 and (.[0].data.values | map(.s) | unique) == ["base 0923", "he 0926"] and (.[0].axes[1].type == "linear")' >/dev/null \
       || die "selftest: the card chart lacks the reference series"
+    # two readings of the metric at the same step collapse to one point on the chart
+    dp=$t/dup; mkdir -p "$dp"; dpn=$(date +%s)
+    AWB_DIR=$dp "$BIN" goal D >/dev/null
+    AWB_DIR=$dp "$BIN" metric --at $((dpn - 3600)) --step 500 du 1 10 >/dev/null
+    AWB_DIR=$dp "$BIN" metric --step 500 du 1.2 10 "manual current reading" >/dev/null
+    AWB_DIR=$dp AWB=$BIN "$lk" sync --dry-run > "$t/dup.json"
+    jq -e '[.body.elements[] | select(.tag == "chart") | .chart_spec.data.values[]
+             | select(.s == "du" and .t == 500)] | length == 1' "$t/dup.json" >/dev/null \
+      || die "selftest: duplicate metric steps are not deduplicated on the chart"
+    # the 24-hour tile names the metric its delta belongs to
+    jq -e '[.body.elements[] | select(.tag == "column_set") | .. | .content? // empty]
+            | any(test("du \\+0\\.2"))' "$t/dup.json" >/dev/null || die "selftest: the 24h metric delta has no metric name"
+    # an empty board omits the empty folded panel and the epoch-0 stale time
+    eb=$t/ecard; mkdir -p "$eb"
+    AWB_DIR=$eb AWB=$BIN "$lk" sync --dry-run > "$t/ecard.json"
+    jq -e '([.body.elements[] | select(.tag == "collapsible_panel")] | length == 0)
+            and (.header.subtitle.content | endswith("更新于 刚刚"))' "$t/ecard.json" >/dev/null \
+      || die "selftest: an empty card has a folded panel or a stale time"
     lr sync --dry-run | jq -e '.schema == "2.0" and .header.title.content == "L"
       and (.header.subtitle.content | startswith("lboard · 更新于"))
       and ([.body.elements[] | select(.tag == "markdown") | .content] | any(startswith("**无需你处理")))
@@ -2685,7 +2863,9 @@ case "$cmd" in
             : > "$EV" ;;
   render)   init_dir; render ;;
   replay)   replay "$@" ;;
-  view)     set -- $(dims); brief_view "${1:-80}" "${2:-24}" ;;   # a snapshot on stdin, drawn as the brief view
+  view)     if printf '%s %s' "${1:-}" "${2:-}" | grep -Eq '^[0-9]+ [0-9]+$'; then _vc=$1; _vr=$2
+              else set -- $(dims); _vc=$1; _vr=$2; fi
+            brief_view "$_vc" "$_vr" ;;   # a snapshot on stdin, drawn as the brief view (awb view [COLS] [ROWS])
   snapshot) init_dir; ( AWB_VIEW=snapshot AWB_COLS=100 AWB_ROWS=200; export AWB_VIEW AWB_COLS AWB_ROWS; render ) ;;
   watch)    init_dir; watch ;;
   _enter)   _enter ;;

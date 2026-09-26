@@ -82,16 +82,18 @@ card() {
               else [tile("任务"; "\($s.progress.d) / \($s.progress.t)"; "")] end)
              + [tile("24 小时"; "里程碑 +\($s.day.milestones)";
                      "已核 \($s.day.verified) · 任务 +\($s.day.tasks)"
-                     + (if $s.day.metric then " · \(if $s.day.metric >= 0 then "+" else "" end)\($s.day.metric * 100 | round / 100)" else "" end))])}]
+                     + (if $s.day.metric then " · \($s.metric.name) \(if $s.day.metric >= 0 then "+" else "" end)\($s.day.metric * 100 | round / 100)" else "" end))])}]
        # the chart: the metric, and by step each reference series (metric --ref) beside it; a
-       # reference makes one reading enough to draw
+       # reference makes one reading enough. Two readings at the same t (a manual current
+       # reading on top of an hourly probe) collapse to the newest, so the line shows one point
        + (($s.metric.history // []) as $mh
           | (($mh | length) > 0 and all($mh[]; .x != null)) as $steps
           | (if $steps then [($s.refs // [])[] | select((.history | length) > 0)] else [] end) as $rf
           | if $s.metric and (($mh | length) >= 2 or (($mh | length) >= 1 and ($rf | length) > 0)) then
               ((if $steps then [$mh[] | {t:.x, v:.value, s:$s.metric.name}]
                   + [$rf[] | .name as $n | .history[] | {t:.x, v:.value, s:$n}]
-                else [$mh[] | {t:(.ep | strflocaltime("%m-%d %H:%M")), v:.value, s:$s.metric.name}] end)) as $pts
+                else [$mh[] | {t:(.ep | strflocaltime("%m-%d %H:%M")), v:.value, s:$s.metric.name}] end)
+               | group_by([.t, .s]) | map(last)) as $pts
               | [{tag:"chart", height:"200px", chart_spec:{
                   type:"line", data:{values:$pts},
                   xField:"t", yField:"v", seriesField:"s", point:{visible:true},
@@ -107,19 +109,21 @@ card() {
        + (if ($s.anomalies | length) > 0 then
            [box("yellow-50"; "**异常**\n" + ([$s.anomalies[] | "! \(.text | clip(100))"] | join("\n")))]
           else [] end)
-       # 5. the rest, folded: news and the task tree; agents show only in 需要你 and 异常
-       + [{tag:"collapsible_panel", expanded:false,
-           header:{title:{tag:"markdown", content:("**进展与任务**　" + ("里程碑已核 \($s.verified.v)/\($s.verified.n)" | grey))}},
-           vertical_spacing:"8px",
-           elements:(
-             (if ($s.news | length) > 0 then
+       # 5. the rest, folded: news and the task tree; agents show only in 需要你 and 异常.
+       # With neither news nor tasks the panel itself is omitted (an empty folded panel showed nothing).
+       + (
+           (((if ($s.news | length) > 0 then
                  [{tag:"markdown", content:("**最近进展**\n" + ([$s.news[-5:] | reverse[] | ("\(.time[0:5])" | grey) + "　\(.text | clip(100))"] | join("\n")))}]
                 else [] end)
              + [ $s.tasks[] | {tag:"markdown", content:(
                  "**\(.text | clip(60))**　\(.d)/\(.t)" + (if .quiet then "　" + ("\(.quiet | ago)没更新" | grey) else "" end)
                  + (if .folded > 0 then "\n✓ 另 \(.folded) 项已完成" else "" end)
                  + ([.kids[] | "\n" + ($TI[.state] // "•") + " " + (.text | clip(70)) + (if .prog then "　\(.prog.d)/\(.prog.t)" else "" end)] | join("")))} ]
-             + (if $s.tasks_old > 0 then [{tag:"markdown", content:("✓ 另有 \($s.tasks_old) 项已完成" | grey)}] else [] end))}]
+             + (if $s.tasks_old > 0 then [{tag:"markdown", content:("✓ 另有 \($s.tasks_old) 项已完成" | grey)}] else [] end)) as $pe
+           | if ($pe | length) == 0 then []
+             else [{tag:"collapsible_panel", expanded:false,
+                    header:{title:{tag:"markdown", content:("**进展与任务**　" + ("里程碑已核 \($s.verified.v)/\($s.verified.n)" | grey))}},
+                    vertical_spacing:"8px", elements:$pe}] end))
        + [{tag:"markdown", content:("\($path)" | grey), text_size:"notation"}])}}'
 }
 
