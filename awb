@@ -227,7 +227,9 @@ JQ_RENDER=$JQ_FOLD$JQ_DEFS'
         | .value.sess = "待批准：" + (if $x.waiting != "" then $x.waiting else "对话框" end) + " " + (($nowep - $x.since) | sdur)
       elif $x.status == "busy" and (.value.status | IN("done","failed")) then
         .value.sess = "自报" + {"done":"完成","failed":"失败"}[.value.status] + "，会话在忙"
-      elif $x.status == "idle" and .value.status == "running" and ($nowep - $x.since) >= $silent then
+      # only an agent that claims work (a milestone or a sent task open): a worker idle
+      # between tasks, or started and waiting for its first, is not a contradiction
+      elif $x.status == "idle" and .value.status == "running" and .value.current != null and ($nowep - $x.since) >= $silent then
         .value.sess = "自报进行，会话空闲 " + (($nowep - $x.since) | sdur)
       else . end)
 
@@ -567,7 +569,7 @@ JQ_BRIEF=$JQ_DEFS'
      | ["│ " + $cy + ($M.name | clip(14)) + $rs + " \($M.value) / \($M.target)" + $bar + $tail]
        + (if $M.note != "" then ["│   " + $dm + ($M.note | clip($bw - 6)) + $rs] else [] end)
    end) as $mlines
-| ("╰─ 进度 " + bar($S.progress.d; $S.progress.t; 16) + " \($S.progress.d)/\($S.progress.t)" + "   " + $S.clock
+| ("╰─ " + (if $S.progress.t > 0 then "进度 " + bar($S.progress.d; $S.progress.t; 16) + " \($S.progress.d)/\($S.progress.t)   " else "" end) + $S.clock
    + (if ($S.quiet // 0) >= 60 then " · 更新于 \($S.quiet | ago)前" else "" end)) as $bfoot
 # movement, one line: the last hour, the last 24 hours, and how much of it is verified
 | ((if $S.hour.milestones + $S.hour.tasks > 0 then $g + "近 1 小时 里程碑 +\($S.hour.milestones) 任务 +\($S.hour.tasks)" + $rs
@@ -2313,6 +2315,10 @@ FT
     ! ht render | grep -Fq "会话在忙" || die "selftest: done agent with an idle session flagged"
     "$BIN" now z1 "still going"
     reg idle "" 4000
+    ht snapshot | jq -e '.anomalies | any(.text | contains("会话空闲"))' >/dev/null || die "selftest: a running agent's idle session not in anomalies"
+    "$BIN" done z1
+    ! ht snapshot | jq -e '.anomalies | any(.text | contains("会话空闲"))' >/dev/null || die "selftest: an idle worker with no milestone flagged"
+    "$BIN" now z1 "still going"; reg idle "" 4000
     ht render | grep -Fq "自报进行，会话空闲" || die "selftest: running agent idle past AWB_SILENT not flagged"
     # anomalies: one line per agent, and silence counts only for an agent with no session
     sleep 1.1
