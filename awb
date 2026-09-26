@@ -1099,6 +1099,8 @@ ${ESC}[2m  ${hint}${ESC}[0m"
 
 up() {
   command -v tmux >/dev/null || die "tmux not installed"
+  # inside tmux the board opens beside this pane; a nested attach does not work there
+  if [ -n "${TMUX:-}" ] && [ -n "${TMUX_PANE:-}" ]; then board; return; fi
   init_dir
   SOCK=$(sock_path)
   # without a terminal (an agent runs awb up) the session is made and the user attaches later
@@ -1282,16 +1284,6 @@ idle() {
     printf '[awb %s#%s] 请汇报这个任务的结果：以 [awb %s#%s] 开头回复一行。\n' "$id" "$k" "$id" "$k"
   fi
 }
-pending() {
-  init_dir
-  st=$(peers)
-  for id in $(agent_panes | cut -d' ' -f1; [ -s "$EV" ] && jq -R -r 'fromjson? | select(.t == "start") | .id' "$EV"); do echo "$id"; done | awk '!s[$0]++' |
-  while read -r id; do
-    k=$(open_key "$id"); [ -n "$k" ] || continue
-    printf '%s #%s %s\n' "$id" "$k" "$(printf '%s\n' "$st" | awk -v i="$id" '$1 == i {print $3, $4}')"
-  done
-}
-
 # open a PR for an agent's work from the current git checkout, only when the agent's
 # latest `awb check` passed; the body lists its milestones and that check's steps
 pr() {
@@ -1546,15 +1538,39 @@ sessions_json() {
     | from_entries' 2>/dev/null || echo '{}'
 }
 
-# awb agents that are Claude Code sessions: ID PANE SESSION-NAME STATUS. A main Claude
-# agent messages them over Claude's own session socket with SendMessage(to: SESSION-NAME).
+# "ID MINUTES" for running agents that reported nothing for AWB_STALE seconds
+silent_min() {
+  now=$(date +%s)
+  { [ -s "$EV" ] && cat "$EV" || true; } | jq -R -s -r --argjson now "$now" --argjson stale "${AWB_STALE:-600}" '
+    rtrimstr("\n") | if . == "" then [] else split("\n") | map(fromjson? | select(type == "object")) end
+    | reduce .[] as $e ({};
+        if $e.id == null or $e.t == "nudge" then .
+        elif $e.t == "status" then .[$e.id].last = $e.ep | .[$e.id].st = $e.status
+        elif $e.t == "now" then .[$e.id].last = $e.ep | .[$e.id].st = (if .[$e.id].st == "done" then "running" else (.[$e.id].st // "running") end)
+        elif ($e.t | IN("start","done")) then .[$e.id].last = $e.ep | .[$e.id].st = (.[$e.id].st // "running")
+        else . end)
+    | to_entries[] | select(.value.st == "running" and $now - .value.last >= $stale)
+    | "\(.key) \((($now - .value.last) / 60) | floor)"'
+}
+
+# every agent, one line: ID PANE SESSION STATUS [#KEY] [silent MINm]. SESSION is the Claude
+# session a main Claude agent messages with SendMessage(to: SESSION), - if none; STATUS is
+# busy|idle|waiting|shell, not-claude, gone, or - for an agent without a pane; #KEY its open
+# task (awb send); silent when running with no report for AWB_STALE seconds. It answers, in
+# one command, what the main agent needs after a restart (it replaced stale and pending).
 peers() {
   init_dir
-  _s=$(sessions_json); _l=$(tm list-panes -a -F '#{pane_id}' 2>/dev/null || true)
-  agent_panes | while read -r id pane; do
-      printf '%s\n' "$_l" | grep -Fxq "$pane" || { echo "$id $pane - gone"; continue; }
-      printf '%s' "$_s" | jq -r --arg i "$id" --arg p "$pane" \
-        '.[$i] | if . then "\($i) \($p) \(.name) \(.status)" else "\($i) \($p) - not-claude" end'
+  _s=$(sessions_json); _l=$(tm list-panes -a -F '#{pane_id}' 2>/dev/null || true); _ap=$(agent_panes); _q=$(silent_min)
+  { printf '%s\n' "$_ap" | cut -d' ' -f1; [ -s "$EV" ] && jq -R -r 'fromjson? | select(.t == "start") | .id' "$EV"; } \
+  | awk 'NF && !s[$0]++' | while read -r id; do
+      pane=$(printf '%s\n' "$_ap" | awk -v i="$id" '$1 == i {print $2}')
+      if [ -z "$pane" ]; then l="$id - - -"
+      elif ! printf '%s\n' "$_l" | grep -Fxq "$pane"; then l="$id $pane - gone"
+      else l=$(printf '%s' "$_s" | jq -r --arg i "$id" --arg p "$pane" \
+               '.[$i] | if . then "\($i) \($p) \(.name) \(.status)" else "\($i) \($p) - not-claude" end'); fi
+      k=$(open_key "$id"); [ -z "$k" ] || l="$l #$k"
+      m=$(printf '%s\n' "$_q" | awk -v i="$id" '$1 == i {print $2}'); [ -z "$m" ] || l="$l silent ${m}m"
+      echo "$l"
     done
 }
 
@@ -1671,13 +1687,12 @@ $PROG $VERSION — tmux agent workbench (events in .awb/events.jsonl)
 Agents: read the operating manual with '$PROG skill' before driving the board.
 
 Chat-driven: you talk to one Claude (the main agent); it keeps the board and runs workers:
-  $PROG board                       board beside the main agent's tmux pane
+  $PROG up                          the board: beside this pane inside tmux, else its own session
   $PROG tui ID NAME                 start a Claude worker; prints its session name
   msg=\$($PROG send ID "task"); SendMessage(to: <session>, message: \$msg, notify_when_idle: true);
   on a reply "[awb ID#KEY] ...": $PROG reply ID KEY "result"; on an idle notice: $PROG idle ID.
   Several boards: one .awb per project dir, or \$AWB_DIR.
 
-  $PROG up                          tmux session: milestone board + work area
   $PROG down                        kill the session
   $PROG run [-g GROUP] ID NAME -- CMD...
                                     split a pane for any agent (claude, codex, ...)
@@ -1686,8 +1701,6 @@ Chat-driven: you talk to one Claude (the main agent); it keeps the board and run
                                     (AWB_TUI_CMD, default claude-db if on PATH else claude)
   $PROG start ID NAME [KIND] [GROUP]  register a non-pane / remote agent
   $PROG goal TEXT                   set the overall goal
-  $PROG stale                       print "ID MINUTES" for running agents silent >= AWB_STALE,
-                                    and "ID MINUTES waiting" for agents on a permission dialog
   $PROG nudge [--once]              remind silent agents in their pane (\$AWB_DIR/panes: "ID PANE")
   $PROG news [--key KEY] TEXT       one progress line (board shows last 3); one KEY = one fact, latest shown
   $PROG metric [--at EPOCH] [--step N] [--by EPOCH] [--ref] NAME VALUE TARGET [NOTE]
@@ -1696,7 +1709,7 @@ Chat-driven: you talk to one Claude (the main agent); it keeps the board and run
                                     beside the metric, never counted in its trend
                                     single value/target bar under GOAL (brief view)
                                     board view: AWB_VIEW=brief (default) | full
-                                    AWB_STALE=SECS: list agents silent that long (default 600)
+                                    AWB_STALE=SECS: an agent silent that long is nudged (default 600)
                                     AWB_SILENT=SECS: silence shown as an anomaly (default 3600)
   $PROG task ID STATE [TEXT] [PARENT] [OWNER] [--probe CMD]
                                     task tree node; STATE todo|wip|review|blocked|done|drop|ask;
@@ -1707,25 +1720,22 @@ Chat-driven: you talk to one Claude (the main agent); it keeps the board and run
   $PROG probe log PATH REGEX        built-in probe: last matching line, n/total from two groups
   $PROG now ID MILESTONE            set agent's current objective
   $PROG done ID [TEXT]              milestone achieved
-  $PROG block ID REASON             mark blocked
-  $PROG unblock ID                  back to running
+  $PROG block ID REASON             mark blocked; the next now clears it
   $PROG fail ID REASON
   $PROG finish ID [NOTE]            close milestone + mark done
   $PROG tell ID MESSAGE             type a message into the agent's TUI pane (claude, codex, ...)
-  $PROG peers                       agents that are Claude sessions: ID PANE SESSION STATUS
-                                    (message them with SendMessage from a Claude main agent)
+  $PROG peers                       every agent: ID PANE SESSION STATUS [#KEY] [silent MINm]
+                                    SESSION: SendMessage to it; #KEY: open task; silent >= AWB_STALE
   $PROG send ID TASK                open a keyed task; prints the message for SendMessage
   $PROG reply ID KEY [RESULT]       close the task whose key the worker's reply echoes
   $PROG idle ID                     on an idle notice: prints an ask once, then marks blocked
-  $PROG pending                     open tasks with keys and worker session/status
   $PROG pr ID [gh args...]          push this branch and open a PR, only after a passing check
   $PROG merge PR [--watch]          merge only when the newest verdict on the current head approves
                                     and required checks ran green (AWB_APPROVE_RE, AWB_REQUIRE_CHECKS,
                                     AWB_MIN_CHECKS); --watch polls until then (AWB_MERGE_POLL/POLLS)
   $PROG hold RES OWNER [NOTE]       take a shared resource (refused while another owner holds it)
   $PROG release RES [OWNER]         give it back;  $PROG holder RES: "OWNER EP NOTE", exit 1 if free
-  $PROG board                       split a board pane beside the current tmux pane
-  $PROG state | audit               jq fold per agent | protocol violations (Lean monitor)
+  $PROG audit                       protocol violations (Lean monitor)
   $PROG version | skill             version | the agent operating manual (SKILL.md)
   $PROG check ID -- CMD...          acceptance gate: CMD exit 0 -> milestone done (⊢), else failed
   $PROG check ID --lean DIR [ACCEPT.lean]
@@ -1733,7 +1743,6 @@ Chat-driven: you talk to one Claude (the main agent); it keeps the board and run
                                     typecheck with standard axioms only
   $PROG render | watch              one-shot render | render loop (board pane)
   $PROG snapshot                    the brief view as JSON (awb-lark builds its card from it)
-  $PROG view                        draw a snapshot from stdin as the brief view
   $PROG replay [STEP]               anomalies over the log history, one snapshot every STEP s
                                     (default 1800), as episodes: judge rule thresholds on real logs
   $PROG reset                       clear all events (fresh board)
@@ -1872,6 +1881,9 @@ selftest() {
   sd=$t/sent; mkdir -p "$sd"; sn() { AWB_DIR=$sd "$BIN" "$@"; }
   sn start d1 reviewer >/dev/null; sm=$(sn send d1 "review the manual" 2>/dev/null); sk=$(printf '%s' "$sm" | sed -n '1s/^\[awb d1#\([0-9]*\)\].*/\1/p')
   sn now d1 "reading"; sn done d1 "read"    # the worker's own milestones keep the task open
+  sn peers | grep -Eq "^d1 - - - #$sk\$" || die "selftest: peers does not show the open task: $(sn peers)"
+  [ "$(AWB_DIR=$sd AWB_STALE=0 "$BIN" peers)" = "d1 - - - #$sk silent 0m" ] \
+    || die "selftest: peers does not show a silent agent: $(AWB_DIR=$sd AWB_STALE=0 "$BIN" peers)"
   sn snapshot | jq -e '[.next[].text] == ["reviewer：review the manual"]' >/dev/null || die "selftest: a dispatched task is not under 下一步"
   sn reply d1 "$sk" "3 findings" >/dev/null
   sn snapshot | jq -e '.next == []' >/dev/null || die "selftest: a replied task is still under 下一步"
@@ -2175,7 +2187,7 @@ FT
     ht peers | grep -Eq "^z1 $zp - not-claude$" || die "selftest: another server's session with the same pane id matched"
     reg waiting "permission prompt"
     ht render | grep -Fq "待批准：permission prompt" || die "selftest: permission dialog not on the board"
-    ht stale | grep -Eq '^z1 [0-9]+ waiting$' || die "selftest: permission dialog not in stale"
+    ht peers | grep -Eq "^z1 $zp zz-1 waiting" || die "selftest: permission dialog not in peers"
     ! ht tell z1 "echo typed-into-dialog" 2>/dev/null || die "selftest: tell typed into a permission dialog"
     # a dialog reported after the paste stops the Enter
     reg idle; ( sleep 0.2; reg waiting "permission prompt" ) &
@@ -2185,7 +2197,7 @@ FT
     tmux -L "$S" send-keys -t "$zp" C-u
     reg idle
     ! ht render | grep -Fq "待批准" || die "selftest: idle session shown as waiting for approval"
-    ! ht stale | grep -q waiting || die "selftest: idle session listed as waiting"
+    ! ht peers | grep -q ' waiting' || die "selftest: idle session listed as waiting"
     reg busy        # z1 reported done
     ht render | grep -Fq "自报完成，会话在忙" || die "selftest: done agent with a busy session not flagged"
     reg idle
@@ -2463,6 +2475,7 @@ CHK
     bsock=${bk% *}; bpane=${bk#* }
     TMUX=$bsock TMUX_PANE=$bpane AWB_DIR=$sb "$BIN" board >/dev/null
     TMUX=$bsock TMUX_PANE=$bpane AWB_DIR=$sb "$BIN" board | grep -q "already open" || die "selftest: a second awb board did not reuse the open one"
+    TMUX=$bsock TMUX_PANE=$bpane AWB_DIR=$sb "$BIN" up | grep -q "already open" || die "selftest: awb up inside tmux did not act as awb board"
     nb=$(tmux -L "${S}b" list-panes -a -F '#{pane_start_command}' | grep -c ' watch' || true)
     tmux -L "${S}b" kill-server 2>/dev/null || true
     [ "$nb" = 1 ] || die "selftest: awb board opened $nb boards for one .awb"
@@ -2600,20 +2613,6 @@ case "$cmd" in
               --arg id "$1" --arg st "$2" --arg text "${3:-}" --arg par "${4:-}" --arg own "${5:-}" \
               --arg pc "$pcmd" --arg pd "$pdir" ;;
   probe)    probe "$@" ;;
-  stale)    init_dir; now=$(date +%s)
-            { [ -s "$EV" ] && cat "$EV" || true; } | jq -R -s -r --argjson now "$now" --argjson stale "${AWB_STALE:-600}" '
-              rtrimstr("\n") | if . == "" then [] else split("\n") | map(fromjson? | select(type == "object")) end
-              | reduce .[] as $e ({};
-                  if $e.id == null or $e.t == "nudge" then .
-                  elif $e.t == "status" then .[$e.id].last = $e.ep | .[$e.id].st = $e.status
-                  elif $e.t == "now" then .[$e.id].last = $e.ep | .[$e.id].st = (if .[$e.id].st == "done" then "running" else (.[$e.id].st // "running") end)
-                  elif ($e.t | IN("start","done")) then .[$e.id].last = $e.ep | .[$e.id].st = (.[$e.id].st // "running")
-                  else . end)
-              | to_entries[] | select(.value.st == "running" and $now - .value.last >= $stale)
-              | "\(.key) \((($now - .value.last) / 60) | floor)"'
-            # agents on a permission dialog, whatever they reported: "ID MINUTES waiting"
-            sessions_json | jq -r --argjson now "$now" 'to_entries[] | select(.value.status == "waiting")
-              | "\(.key) \((($now - .value.since) / 60) | floor) waiting"' ;;
   nudge)    init_dir; if [ "${1:-}" = "--once" ]; then nudge_round
             else while :; do nudge_round; sleep "${AWB_NUDGE_POLL:-60}"; done; fi ;;
   news)     _nk=; if [ "${1:-}" = --key ]; then _nk=${2:-}; shift 2 || die "--key needs a key"; fi
@@ -2700,9 +2699,9 @@ case "$cmd" in
   send)     send "$@" ;;
   reply)    reply "$@" ;;
   idle)     idle "$@" ;;
-  pending)  pending ;;
+  stale|pending) peers ;;   # merged into peers
   state)    state ;;
-  board)    board ;;
+  board)    up ;;   # merged into up
   audit)    audit ;;
   version|--version|-V) echo "$PROG $VERSION" ;;
   skill)    skill ;;
