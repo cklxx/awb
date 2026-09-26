@@ -33,7 +33,14 @@ since the view is cut at the pane height:
 5. 下一步: the main line's next open steps.
 6. 异常, one line per agent: a bottleneck (an issue or PR, `#N`, two or more blocked agents
    wait for), no code change, a session that contradicts the report, a silent agent that has
-   no Claude session to report for it, a board nobody writes to.
+   no Claude session to report for it, a board nobody writes to. Silence counts after
+   `AWB_SILENT` (3600 s), not the nudge threshold `AWB_STALE` (600 s): on a real three-day log
+   the median gap between two updates of one agent was 772 s.
+
+`awb replay [STEP]` judges these rules on a real log: it renders the board as of every STEP
+seconds (`AWB_NOW`, from the log alone) and lists each anomaly as an episode with its start
+and length. Session state, pane liveness and code fingerprints are not in the log, so rules
+that need them do not fire in a replay.
 7. News (the last 3; lines with one `--key` are one fact, the latest shows), the task tree
    without the steps already under 下一步 (folded on the card), acceptance runs. Agents show
    only in 需要你 and 异常; `AWB_VIEW=full` lists every agent.

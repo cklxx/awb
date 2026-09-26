@@ -213,7 +213,7 @@ JQ_RENDER=$JQ_FOLD$JQ_DEFS'
         | .value.sess = "待批准：" + (if $x.waiting != "" then $x.waiting else "对话框" end) + " " + (($nowep - $x.since) | sdur)
       elif $x.status == "busy" and (.value.status | IN("done","failed")) then
         .value.sess = "自报" + {"done":"完成","failed":"失败"}[.value.status] + "，会话在忙"
-      elif $x.status == "idle" and .value.status == "running" and ($nowep - $x.since) >= ($stale | tonumber) then
+      elif $x.status == "idle" and .value.status == "running" and ($nowep - $x.since) >= $silent then
         .value.sess = "自报进行，会话空闲 " + (($nowep - $x.since) | sdur)
       else . end)
 
@@ -393,8 +393,11 @@ else
             and ((.status | IN("running","blocked")) or ((.sess // "") != "")))
          | . as $a | ($nowep - $a.lastEp) as $idle
          | ($df[$a.id] // null) as $d
-         | ($idle >= ($stale | tonumber) and ($a.status | IN("running","blocked"))) as $silent
-         | {id:$a.id, name:$a.name, status:$a.status, idle:$idle, silent:$silent, live:($a.live // null),
+         # silence is an anomaly after AWB_SILENT (3600 s), not AWB_STALE (600 s, the nudge):
+         # on a real three-day log (awb replay) the median gap between two updates of one agent
+         # was 772 s, so half of all normal gaps crossed 600 s
+         | ($idle >= $silent and ($a.status | IN("running","blocked"))) as $sil
+         | {id:$a.id, name:$a.name, status:$a.status, idle:$idle, silent:$sil, live:($a.live // null),
             dn:($a.done | length), dv:([$a.done[] | select(.text | startswith("⊢ "))] | length),
             age:(if $a.status == "running" and $a.current then $nowep - $a.current.ep else $idle end),
             text:(if $a.status == "blocked" then (($a.reason // "") | ltrimstr("等：") | ltrimstr("等:")
@@ -456,7 +459,7 @@ else
            elif $a != null then $nowep - $a.lastEp else 0 end) as $q
         | select($q >= ($stale | tonumber))
         | {kind:"hold", text:"\($hd.res) 被 \(($a.name) // $hd.owner) 占着 \(($nowep - $hd.since) | sdur)，它 \($q | sdur) 没在干活"}),
-       (if $quiet >= ($stale | tonumber) and $nrun > 0
+       (if $quiet >= $silent and $nrun > 0
         then {kind:"board", text:"看板 \($quiet | ago)没有新事件，主控可能停了"} else empty end) ]) as $anom
   # the next open steps of the main line
   | ([ $trees[] | .kids[] | select(.state | IN("done","drop") | not) ][:3]) as $next
@@ -617,6 +620,15 @@ audit() {
 render() {
   set -- $(dims)
   cols=${1:-80}; rows=${2:-24}
+  # AWB_NOW=EPOCH renders the board as of that time from the log alone (awb replay): the
+  # live facts below (panes, sessions, code fingerprints, audit) describe now, so none is read
+  nowep=${AWB_NOW:-$(date +%s)}
+  if [ -n "${AWB_NOW:-}" ]; then
+    live=null; viol=; diffs='[]'; sess='{}'
+    render_jq "$(jq -nr --argjson t "$nowep" '$t | strflocaltime("%H:%M:%S")')"
+    return
+  fi
+  sess=$(sessions_json)
   # live panes of the server awb uses; no reachable server = liveness unknown (null)
   if live=$(tm list-panes -a -F '#{pane_id}' 2>/dev/null); then
     live=$(printf '%s\n' "$live" | jq -Rn '[inputs | select(. != "")]')
@@ -630,18 +642,63 @@ render() {
     diffs=$(jq -Rn '[inputs | select(length > 0) | split(" ")
              | {id:.[0], hash:.[1], ep:(.[2] | tonumber)}]' < "$AWB_DIR/diffs")
   else diffs='[]'; fi
+  render_jq "$(date +$TS_FMT)"
+}
+
+# the render program over the log; the caller sets cols rows nowep live viol diffs sess
+render_jq() {
   # the brief view is drawn from the snapshot only; the full view renders the fold itself
   _v=${AWB_VIEW:-brief}; [ "$_v" = full ] || _v=snapshot
   events_json | jq -r --arg viol "$viol" \
     --argjson w "$cols" --argjson h "$rows" \
-    --arg now "$(date +$TS_FMT)" --argjson nowep "$(date +%s)" \
+    --arg now "$1" --argjson nowep "$nowep" \
     --arg prog "$PROG" --argjson live "$live" --arg view "$_v" --arg stale "${AWB_STALE:-600}" \
     --argjson diffs "$diffs" --argjson frz "${AWB_FROZEN:-900}" --argjson fresh "${AWB_PROBE_FRESH:-600}" \
-    --argjson mstale "${AWB_METRIC_STALE:-21600}" --argjson tstale "${AWB_TASK_STALE:-21600}" --argjson sess "$(sessions_json)" \
+    --argjson silent "${AWB_SILENT:-3600}" \
+    --argjson mstale "${AWB_METRIC_STALE:-21600}" --argjson tstale "${AWB_TASK_STALE:-21600}" --argjson sess "$sess" \
     --arg g  "${ESC}[32m"  --arg cy "${ESC}[36m" --arg y "${ESC}[33m" \
     --arg r  "${ESC}[31m"  --arg dm "${ESC}[2m"  --arg rs "${ESC}[0m" \
     "$JQ_RENDER" |
   if [ "${AWB_VIEW:-brief}" = brief ]; then brief_view "$cols" "$rows"; else cat; fi
+}
+
+# replay: the board's anomalies over the log's history, one snapshot every STEP seconds as of
+# that time (AWB_NOW), grouped into episodes (one anomaly on consecutive snapshots). This is
+# how a rule's thresholds are judged against what really happened, not by guess.
+replay() {
+  init_dir
+  step=${1:-1800}
+  printf '%s' "$step" | grep -Eqx '[0-9]+' && [ "$step" -ge 60 ] || die "usage: $PROG replay [STEP-SECONDS >= 60]"
+  [ -s "$EV" ] || return 0
+  set -- $(events_json | jq -r '[.[] | .ep // empty | numbers] | "\(min // 0) \(max // 0)"')
+  _t=$1; _end=$2; _rd=$(mktemp -d "${TMPDIR:-/tmp}/awb-replay.XXXXXX"); _n=0
+  # ponytail: one full fold per step, O(steps x log); fine for days of hourly steps
+  while [ "$_t" -le "$_end" ] && [ "$_n" -lt "${AWB_REPLAY_MAX:-2000}" ]; do
+    _t=$((_t + step)); _n=$((_n + 1))
+    jq -Rc --argjson T "$_t" 'fromjson? | select(type == "object" and (.ep // 0) <= $T)' < "$EV" > "$_rd/events.jsonl"
+    AWB_DIR=$_rd AWB_NOW=$_t "$BIN" snapshot | jq -c --argjson T "$_t" '{T:$T, a:.anomalies}'
+  done > "$_rd/series"
+  jq -rs --argjson step "$step" '
+    def at: strflocaltime("%m-%d %H:%M");
+    def dur: if . >= 86400 then "\((. / 8640 | floor) / 10)天" elif . >= 3600 then "\((. / 360 | floor) / 10)小时"
+             else "\(. / 60 | floor)分钟" end;
+    . as $S
+    | [ $S[] | .T as $T | .a[] | {T:$T, kind, text,
+          key:(.kind + " " + (.text | gsub("[0-9]+([:.][0-9]+)*(s|分钟|小时|天)?"; "#")))} ]
+    | group_by(.key)
+    | [ .[] | sort_by(.T)
+        | reduce .[] as $x ([]; if length > 0 and $x.T - .[-1].last <= $step
+                               then .[-1].last = $x.T else . + [{kind:$x.kind, text:$x.text, first:$x.T, last:$x.T}] end)[]
+        | . + {span:(.last - .first + $step)} ] as $E
+    | "回放 \($S[0].T - $step | at) → \($S[-1].T | at)，每 \($step / 60 | floor) 分钟一个时间点，共 \($S | length) 个",
+      "只用日志：会话状态、pane 存活、代码指纹不在日志里，依赖它们的规则不会触发；\"没有更新\"对 Claude 会话会多报",
+      "",
+      "规则\t段数\t累计时长",
+      ( $E | group_by(.kind)[] | "\(.[0].kind)\t\(length)\t\([.[].span] | add | dur)" ),
+      "",
+      "开始\t持续\t规则\t异常（第一次出现时的文字）",
+      ( $E | sort_by(.first)[] | "\(.first | at)\t\(.span | dur)\t\(.kind)\t\(.text)" )' "$_rd/series"
+  rm -rf "$_rd"
 }
 
 # the brief view of a snapshot on stdin (awb snapshot | awb brief-view renders the same board)
@@ -1513,6 +1570,7 @@ Chat-driven: you talk to one Claude (the main agent); it keeps the board and run
                                     single value/target bar under GOAL (brief view)
                                     board view: AWB_VIEW=brief (default) | full
                                     AWB_STALE=SECS: list agents silent that long (default 600)
+                                    AWB_SILENT=SECS: silence shown as an anomaly (default 3600)
   $PROG task ID STATE [TEXT] [PARENT] [OWNER] [--probe CMD]
                                     task tree node; STATE todo|wip|review|blocked|done|drop;
                                     re-issue to update (empty args keep old values);
@@ -1549,6 +1607,8 @@ Chat-driven: you talk to one Claude (the main agent); it keeps the board and run
   $PROG render | watch              one-shot render | render loop (board pane)
   $PROG snapshot                    the brief view as JSON (awb-lark builds its card from it)
   $PROG view                        draw a snapshot from stdin as the brief view
+  $PROG replay [STEP]               anomalies over the log history, one snapshot every STEP s
+                                    (default 1800), as episodes: judge rule thresholds on real logs
   $PROG reset                       clear all events (fresh board)
   $PROG selftest
 EOF
@@ -1631,6 +1691,19 @@ selftest() {
   bd2=$t/brief2; mkdir -p "$bd2"
   for v in 1 2 3; do AWB_DIR=$bd2 "$BIN" metric he $v 30; done
   AWB_DIR=$bd2 "$BIN" snapshot | jq -e '.metric.eta == null' >/dev/null || die "selftest: an estimate from readings in one second"
+  # replay: the board as of each step, from the log alone. An agent silent for two hours is
+  # one silent episode; a board AWB_NOW renders never reads the live registry or panes.
+  rd=$t/replay; mkdir -p "$rd"; r0=$((bn - 20000))
+  { printf '{"t":"start","time":"x","ep":%s,"id":"q1","name":"quiet"}\n' "$r0"
+    printf '{"t":"now","time":"x","ep":%s,"id":"q1","text":"x"}\n' "$r0"
+    printf '{"t":"start","time":"x","ep":%s,"id":"q2","name":"busy"}\n' "$r0"
+    i=1; while [ $i -le 12 ]; do printf '{"t":"now","time":"x","ep":%s,"id":"q2","text":"t%s"}\n' $((r0 + i * 600)) $i; i=$((i + 1)); done
+    printf '{"t":"finish","time":"x","ep":%s,"id":"q1"}\n' $((r0 + 7200)); } > "$rd/events.jsonl"
+  rp=$(AWB_DIR=$rd "$BIN" replay 600)
+  [ "$(printf '%s\n' "$rp" | grep -c "	silent	quiet ")" = 1 ] || die "selftest: replay did not find one silent episode: $rp"
+  ! printf '%s\n' "$rp" | grep -q "	silent	busy " || die "selftest: replay flagged an agent that kept reporting"
+  AWB_DIR=$rd AWB_NOW=$((r0 + 600)) "$BIN" snapshot | jq -e '.clock != "" and (.agents | length) == 2' >/dev/null \
+    || die "selftest: AWB_NOW did not render the board as of that time"
   # news: lines with one key are one fact, the latest shows; lines without a key all show
   bd4=$t/brief4; mkdir -p "$bd4"; nb() { AWB_DIR=$bd4 "$BIN" news "$@"; }
   nb "no key"; nb --key val@15000 "feed: val 1.888"; nb "other"; nb --key val@15000 "val 1.888, grad ok"; nb --key ck "saved"
@@ -1933,16 +2006,16 @@ FT
     reg idle
     ! ht render | grep -Fq "会话在忙" || die "selftest: done agent with an idle session flagged"
     "$BIN" now z1 "still going"
-    reg idle "" 900
-    ht render | grep -Fq "自报进行，会话空闲" || die "selftest: running agent idle 15m not flagged"
+    reg idle "" 4000
+    ht render | grep -Fq "自报进行，会话空闲" || die "selftest: running agent idle past AWB_SILENT not flagged"
     # anomalies: one line per agent, and silence counts only for an agent with no session
     sleep 1.1
-    [ "$(AWB_STALE=1 ht snapshot | jq '[.anomalies[] | select(.text | startswith("demo "))] | length')" = 1 ] \
+    [ "$(AWB_SILENT=1 ht snapshot | jq '[.anomalies[] | select(.text | startswith("demo "))] | length')" = 1 ] \
       || die "selftest: a silent agent whose session disagrees has more than one anomaly"
     reg busy
-    ! AWB_STALE=1 ht snapshot | jq -e '.anomalies[] | select(.text | startswith("demo "))' >/dev/null \
+    ! AWB_SILENT=1 ht snapshot | jq -e '.anomalies[] | select(.text | startswith("demo "))' >/dev/null \
       || die "selftest: a silent agent with a busy session listed as an anomaly"
-    AWB_STALE=1 "$BIN" snapshot | jq -e '.anomalies[] | select(.kind == "silent" and (.text | startswith("demo ")))' >/dev/null \
+    AWB_SILENT=1 "$BIN" snapshot | jq -e '.anomalies[] | select(.kind == "silent" and (.text | startswith("demo ")))' >/dev/null \
       || die "selftest: a silent agent with no session not listed"
     reg idle "" 10
     ! ht render | grep -Fq "会话空闲" || die "selftest: running agent idle 10s flagged"
@@ -2036,7 +2109,7 @@ FT
   pev "$pn" pw "$pn" 0 review "CI pending 1/2"
   printf '{"t":"start","time":"x","ep":%s,"id":"%s","name":"%s"}\n' $((pn - 2000)) waiter waiter \
     $((pn - 2000)) idler idler >> "$pt/events.jsonl"
-  ps_=$(pb snapshot | jq -r '.anomalies[] | select(.kind == "silent") | .text')
+  ps_=$(AWB_SILENT=600 pb snapshot | jq -r '.anomalies[] | select(.kind == "silent") | .text')
   printf '%s' "$ps_" | grep -Fq idler || die "selftest: silent agent missing from anomalies"
   ! printf '%s' "$ps_" | grep -Fq waiter || die "selftest: owner of a waiting probed task listed silent"
   # built-in probes against stub gh/git
@@ -2347,6 +2420,7 @@ case "$cmd" in
               --arg id "$1" --arg st "$2" --arg r "${3:-}" ;;
   reset)    init_dir; : > "$EV" ;;
   render)   init_dir; render ;;
+  replay)   replay "$@" ;;
   view)     set -- $(dims); brief_view "${1:-80}" "${2:-24}" ;;   # a snapshot on stdin, drawn as the brief view
   snapshot) init_dir; ( AWB_VIEW=snapshot AWB_COLS=100 AWB_ROWS=200; export AWB_VIEW AWB_COLS AWB_ROWS; render ) ;;
   watch)    init_dir; watch ;;
