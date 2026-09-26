@@ -287,7 +287,7 @@ proven model:
 | protocol audit | proven: the one-pass monitor reports nothing iff every event obeys the rules given its prefix (`audit_iff_clean`); corollary: every PR in a clean log followed a passing check | `model/Audit.lean` |
 | deliverables | `awb check` (tests, or Lean with kernel-checked theorems and standard axioms only) | `awb check` |
 | merge | `awb pr` refuses without a passing check or with audit violations, and logs the PR for the audit; `awb merge` merges only on an approve of the current head (newest verdict wins, whole-line match) with the required checks green, pinned by `--match-head-commit` | `awb pr`, `awb merge` |
-| dispatch/report loop (main ↔ worker) | TLA+ with liveness: no false done, no lost task | `model/tla/AwbLoop.tla` |
+| dispatch/report loop (main ↔ worker) | TLA+ with liveness: no false done, every task ends replied or blocked, also when the worker's session holds messages or the worker crashes and is restarted (7,110 states). `AwbLoopStage.cfg` and `AwbLoopRestart.cfg` reproduce the 0.0.8 bugs: a worker's own stage report closed its task, a restarted worker's lost task stayed open. Until 0.0.9 `AwbLoopFixed.cfg` stopped on a TLC error (a tuple compared with a string) and never checked its liveness | `model/tla/AwbLoop.tla` |
 | tell vs a permission dialog | TLA+: a dialog the registry reported before a keystroke is never typed into (registry re-read before the paste and every Enter); `AwbWaitRace.cfg` shows the window no check closes | `model/tla/AwbWait.tla` |
 | Lark sync (ticks, manual syncs, crashes vs one topic) | TLA+: one topic per board and the card never goes back to an older state; `AwbLarkOld*.cfg` reproduce two topics and a regressed card from breaking the lock by age | `model/tla/AwbLark.tla` |
 | probe fold (readings → task state) | proven: the accepted reading is the newest parsed one, a failed read changes nothing, `done` shows only from a done reading, expired readings show unknown; jq = Lean by the same differential test | `model/Probe.lean` |
@@ -302,8 +302,8 @@ message. Fixes: a per-agent lock around `check` and `pr`, a check verifies only 
 it started on (otherwise it is rejected as stale), and `tell` uses a per-call buffer under a
 per-pane lock. In 0.0.7 a process that had unlocked still removed that lock on exit, after
 another had taken it, and two tells merged; `AwbTellExitTrap.cfg` reproduces it and `unlock`
-now forgets the lock. Run TLC with
-`java -cp tla2tools.jar tlc2.TLC -config AwbCheckFixed.cfg -deadlock AwbCheck` in `model/tla/`.
+now forgets the lock. `model/tla/tlc.sh` runs TLC on every config (`TLA2TOOLS` = the path of
+`tla2tools.jar`): each `*Fixed.cfg` must pass and every other config must reproduce its bug.
 
 Audit rules, per agent: a verified milestone must follow a passing check (forged `verified`
 events are caught), a PR must follow a passing check, and `done` must not be claimed while a

@@ -40,7 +40,8 @@ follow this and do not ask the user to type commands:
      with notify_when_idle). The second time it marks the task blocked: tell the user, since the
      worker's session is probably holding your message for its user's approval. Never mark a
      task done from an idle notice alone (`model/tla/AwbLoop.tla`: that marks undone work done).
-   - The worker exited → `awb fail <id> "exited"`; `awb tui` with the same id restarts it.
+   - The worker exited → `awb fail <id> "exited"`; `awb tui` with the same id restarts it; then
+     send its lost task again with `awb send` (a new key: a late reply to the old one is stale).
    - After a restart or compaction, `awb peers` lists every agent with its session, status,
      open task key and silence; continue with `awb idle` for each open task.
 5. Acceptance: a worker's claim is not a result. You choose the command and
@@ -171,6 +172,7 @@ Fix it and open a PR. Do not edit the installed copy in use and do not push to m
 gh repo clone cklxx/awb /tmp/awb-fix-<slug> -- -q      # without write access: gh repo fork cklxx/awb --clone
 cd /tmp/awb-fix-<slug> && git switch -c fix/<slug>
 # fix it and add a selftest() assertion that fails on the bug; sync model/AwbModel.lean if the fold changes
+# and model/tla/ if a protocol changes (model/tla/tlc.sh checks every spec)
 export AWB_DIR=$PWD/.awb                         # this board, never the one your pane belongs to
 ./awb start fix-<slug> fixer && ./awb now fix-<slug> "<the problem in one line>"
 git commit -am "<English summary>"              # no attribution trailers

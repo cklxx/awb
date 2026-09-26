@@ -1,3 +1,4 @@
 .awb/
 .wb/
 model/.lake
+model/tla/*_TTrace_*
