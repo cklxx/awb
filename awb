@@ -1103,7 +1103,9 @@ up() {
 agent_split() {
   set -- -P -F '#{pane_id}' -e "AWB_DIR=$AWB_DIR" -e "AWB_TMUX_SOCKET=$sock" -e "AWB_TMUX_FOR=$AWB_DIR" \
     -e "AWB_GROUP=$group" -e "AWB_AGENT_ID=$id" -e "AWB_AGENT_NAME=$name" -e "AWB_AGENT_KIND=$1" "$2"
-  tm split-window -h -t "$work" "$@" 2>/dev/null || tm new-window -a -d -t "$work" "$@"
+  tm split-window -h -t "$work" "$@" 2>/dev/null \
+    || tm new-window -a -d -t "$(tm display-message -p -t "$work" '#{window_id}')" "$@"
+  # ponytail: one window per agent past a full one; split the newest window first if it matters
 }
 # a second agent with a live id took over its events, and the first ran on untracked
 not_running() {
