@@ -83,16 +83,23 @@ card() {
              + [tile("24 小时"; "里程碑 +\($s.day.milestones)";
                      "已核 \($s.day.verified) · 任务 +\($s.day.tasks)"
                      + (if $s.day.metric then " · \(if $s.day.metric >= 0 then "+" else "" end)\($s.day.metric * 100 | round / 100)" else "" end))])}]
-       + (if $s.metric and ($s.metric.history | length) >= 2 then
-           [{tag:"chart", height:"180px", chart_spec:{
-              type:"line",
-              # x is the training step when every reading has one (metric --step), else the time
-              data:{values:(all($s.metric.history[]; .x != null) as $steps
-                | [$s.metric.history[] | {t:(if $steps then "step \(.x)" else (.ep | strflocaltime("%m-%d %H:%M")) end), v:.value}])},
-              xField:"t", yField:"v", point:{visible:true},
-              axes:[{orient:"left", min:0, max:([$s.metric.target, ([$s.metric.history[].value] | max)] | max)}],
-              markLine:[{y:$s.metric.target, label:{text:"目标 \($s.metric.target)"}}]}}]
-          else [] end)
+       # the chart: the metric, and by step each reference series (metric --ref) beside it; a
+       # reference makes one reading enough to draw
+       + (($s.metric.history // []) as $mh
+          | (($mh | length) > 0 and all($mh[]; .x != null)) as $steps
+          | (if $steps then [($s.refs // [])[] | select((.history | length) > 0)] else [] end) as $rf
+          | if $s.metric and (($mh | length) >= 2 or (($mh | length) >= 1 and ($rf | length) > 0)) then
+              ((if $steps then [$mh[] | {t:.x, v:.value, s:$s.metric.name}]
+                  + [$rf[] | .name as $n | .history[] | {t:.x, v:.value, s:$n}]
+                else [$mh[] | {t:(.ep | strflocaltime("%m-%d %H:%M")), v:.value, s:$s.metric.name}] end)) as $pts
+              | [{tag:"chart", height:"200px", chart_spec:{
+                  type:"line", data:{values:$pts},
+                  xField:"t", yField:"v", seriesField:"s", point:{visible:true},
+                  legends:{visible:(($rf | length) > 0), orient:"bottom"},
+                  axes:([{orient:"left", min:0, max:([$s.metric.target, ([$pts[].v] | max)] | max)}]
+                        + (if $steps then [{orient:"bottom", type:"linear", title:{visible:true, text:"step"}}] else [] end)),
+                  markLine:[{y:$s.metric.target, label:{text:"目标 \($s.metric.target)"}}]}}]
+            else [] end)
        + (if ($s.next | length) > 0 then
            [{tag:"markdown", content:("**下一步**\n" + ([$s.next[] | "\($TI[.state] // "•") \(.text | clip(90))"] | join("\n")))}]
           else [] end)

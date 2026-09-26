@@ -186,8 +186,16 @@ JQ_RENDER=$JQ_FOLD$JQ_DEFS'
 ($w - 1) as $inner |
 
 . as $raw
-# the newest reading by its time, so a backfilled older one (metric --at) does not replace it
-| ([$raw[] | select(type == "object" and .t == "metric")] | sort_by(.ep // 0) | last // {}) as $metric
+# the newest reading by its time, so a backfilled older one (metric --at) does not replace it.
+# A series whose newest reading says ref (metric --ref) is a reference: drawn beside the
+# metric on the chart, never the metric itself nor part of its trend
+| ([$raw[] | select(type == "object" and .t == "metric" and (.name | type) == "string")] | sort_by(.ep // 0)) as $mev
+| ([$mev | group_by(.name)[] | select(last.ref == true) | .[0].name]) as $refn
+| ([$mev[] | select(.name | IN($refn[]) | not)] | last // {}) as $metric
+| ([$mev | group_by(.name)[] | select(last.ref == true)
+    | {name:.[0].name, target:(last.target | tonumber?),
+       history:([.[] | select(.x != null) | {x, value:(.value | tonumber?)} | select(.value != null)]
+                | group_by(.x) | map(last))}]) as $refs
 # held resources (awb hold/release) and stuck-session nudges: no agent state, render only
 | ([$raw[] | select(type == "object" and (.t == "hold" or .t == "release") and (.res | type) == "string")]
    | group_by(.res) | map(sort_by(.ep // 0) | last | select(.t == "hold")
@@ -485,7 +493,7 @@ else
        verified:{v:$mver, n:($mdone | length)}, running:$nrun, metric:$M, need:$need,
        anomalies:$anom, next:$next, holds:$holds,
        agents:$act, idle:$idl, tasks:$trees, tasks_old:$nold,
-       news:$news,
+       news:$news, refs:$refs,
        checks:[$s.checks[] | {id, name:(($s.agents[.id].name) // .id), what, startEp,
          ok:(all(.steps[]; .state == "ok")), fail:any(.steps[]; .state == "fail"),
          steps:[.steps[] | {s, state, el:((.ep1 // $nowep) - .ep0), note}]}],
@@ -1590,8 +1598,10 @@ Chat-driven: you talk to one Claude (the main agent); it keeps the board and run
                                     and "ID MINUTES waiting" for agents on a permission dialog
   $PROG nudge [--once]              remind silent agents in their pane ($AWB_DIR/panes: "ID PANE")
   $PROG news [--key KEY] TEXT       one progress line (board shows last 3); one KEY = one fact, latest shown
-  $PROG metric [--at EPOCH] [--step N] [--by EPOCH] NAME VALUE TARGET [NOTE]
+  $PROG metric [--at EPOCH] [--step N] [--by EPOCH] [--ref] NAME VALUE TARGET [NOTE]
                                     --by: deadline; an ETA past it is not shown
+                                    --ref: a reference series (a baseline run): drawn by step
+                                    beside the metric, never counted in its trend
                                     single value/target bar under GOAL (brief view)
                                     board view: AWB_VIEW=brief (default) | full
                                     AWB_STALE=SECS: list agents silent that long (default 600)
@@ -1716,6 +1726,15 @@ selftest() {
   bd2=$t/brief2; mkdir -p "$bd2"
   for v in 1 2 3; do AWB_DIR=$bd2 "$BIN" metric he $v 30; done
   AWB_DIR=$bd2 "$BIN" snapshot | jq -e '.metric.eta == null' >/dev/null || die "selftest: an estimate from readings in one second"
+  # a reference series (metric --ref), even written after the metric, is never the metric nor
+  # in its trend; it is drawn by step beside it, one point per step (a re-sent step replaces)
+  rf=$t/ref; mkdir -p "$rf"; rb() { AWB_DIR=$rf "$BIN" metric "$@"; }
+  rb --step 2000 "he 0926" 6 30
+  i=1; while [ $i -le 3 ]; do rb --at $((bn + i)) --step $((i * 2000)) "base 0923" $((i * 3)) 30; i=$((i + 1)); done
+  rb --ref --step 4000 "base 0923" 7 30
+  AWB_DIR=$rf "$BIN" snapshot | jq -e '.metric.name == "he 0926" and .day.metric == null and .metric.since == null
+    and .refs == [{name:"base 0923", target:30, history:[{x:2000, value:3}, {x:4000, value:7}, {x:6000, value:9}]}]' >/dev/null \
+    || die "selftest: a reference series leaked into the metric: $(AWB_DIR=$rf "$BIN" snapshot | jq -c '{m:.metric.name, d:.day.metric, refs}')"
   # replay: the board as of each step, from the log alone. An agent silent for two hours is
   # one silent episode; a board AWB_NOW renders never reads the live registry or panes.
   rd=$t/replay; mkdir -p "$rd"; r0=$((bn - 20000))
@@ -2294,6 +2313,10 @@ FAKE
     lr setup oc_test >/dev/null && [ "$(cat "$t/xdg/awb/lark-chat")" = oc_test ] || die "selftest: awb-lark setup"
     AWB_DIR=$lb "$BIN" goal "L"; AWB_DIR=$lb "$BIN" start k1 kay; AWB_DIR=$lb "$BIN" now k1 "carding"
     AWB_DIR=$lb "$BIN" news "first-news"
+    # one reading plus a reference series draws a chart by step with both series
+    AWB_DIR=$rf AWB=$BIN "$lk" sync --dry-run | jq -e '[.body.elements[] | select(.tag == "chart") | .chart_spec]
+      | length == 1 and (.[0].data.values | map(.s) | unique) == ["base 0923", "he 0926"] and (.[0].axes[1].type == "linear")' >/dev/null \
+      || die "selftest: the card chart lacks the reference series"
     lr sync --dry-run | jq -e '.schema == "2.0" and .header.title.content == "L"
       and (.header.subtitle.content | startswith("lboard · 更新于"))
       and ([.body.elements[] | select(.tag == "markdown") | .content] | any(startswith("**无需你处理")))
@@ -2409,13 +2432,14 @@ case "$cmd" in
   goal)     [ $# -ge 1 ] || die "usage: $PROG goal TEXT"
             append '{t:"goal",time:$time,ep:$ep,text:$text}' --arg text "$*" ;;
   metric)   # --at EPOCH records a past reading at its own time; --step N is its x (a training step)
-            _at=; _x=; _by=
+            _at=; _x=; _by=; _ref=
             while :; do case "${1:-}" in
               --at) _at=${2:-}; shift 2 || die "--at needs an epoch" ;;
               --step) _x=${2:-}; shift 2 || die "--step needs a number" ;;
               --by) _by=${2:-}; shift 2 || die "--by needs an epoch" ;;
+              --ref) _ref=1; shift ;;
               *) break ;; esac; done
-            [ $# -ge 3 ] || die "usage: $PROG metric [--at EPOCH] [--step N] [--by EPOCH] NAME VALUE TARGET [NOTE]"
+            [ $# -ge 3 ] || die "usage: $PROG metric [--at EPOCH] [--step N] [--by EPOCH] [--ref] NAME VALUE TARGET [NOTE]"
             # jq tonumber rejects '1.2.3'/'-'/''; the finite/self-equal guard
             # additionally rejects NaN/Infinity (jq 1.8 has no finite/0).
             _numok='tonumber as $n | $n == $n and $n < 1e309 and $n > -1e309'
@@ -2432,8 +2456,9 @@ case "$cmd" in
                     + (if $at == "" then {time:$time, ep:$ep}
                        else ($at | tonumber) as $a | {time:($a | strflocaltime("%H:%M:%S")), ep:$a} end)
                     + (if $x == "" then {} else {x:($x | tonumber)} end)
-                    + (if $by == "" then {} else {by:($by | tonumber)} end)' \
-              --arg name "$1" --arg value "$2" --arg target "$3" --arg note "${4-}" --arg at "$_at" --arg x "$_x" --arg by "$_by" ;;
+                    + (if $by == "" then {} else {by:($by | tonumber)} end)
+                    + (if $ref == "" then {} else {ref:true} end)' \
+              --arg name "$1" --arg value "$2" --arg target "$3" --arg note "${4-}" --arg at "$_at" --arg x "$_x" --arg by "$_by" --arg ref "$_ref" ;;
   now)      [ $# -ge 2 ] || die "usage: $PROG now ID MILESTONE"
             append '{t:"now",time:$time,ep:$ep,id:$id,text:$text}' --arg id "$1" --arg text "${2-}" ;;
   done)     [ $# -ge 1 ] || die "usage: $PROG done ID [TEXT]"
