@@ -57,7 +57,8 @@ that need them do not fire in a replay.
 - An agent's own `done` is a claim. `awb check` runs a check the main agent chose; only a
   passing check marks the milestone verified (`⊢`), and a rejected check blocks `done`
   until a later check passes.
-- `awb metric NAME VALUE TARGET [NOTE]` is a render-only indicator: the latest event shows
+- `awb metric NAME VALUE TARGET [NOTE]` is a render-only indicator (`--ref`: a reference
+  series, drawn by step beside the metric on the card, never the metric nor in its trend): the latest event shows
   under GOAL in the brief view as `NAME VALUE / TARGET ▕bar▏pct%`, followed by the history of
   that name. Record every measurement with it and keep numbers out of `awb goal`. It has no id
   and is ignored by the proven fold/audit — the fold drops any unknown event whose id is not

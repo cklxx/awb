@@ -34,6 +34,10 @@ type commands:
    change since the first reading and an estimated time to target from these events only.
    When the work has an end (a training run, a deadline), pass it once as `--by <epoch>`: an
    estimate past it shows as "按当前趋势截止前达不到" instead.
+   `--at <epoch>` is the real time of an older reading, never an invented one: the trend is
+   computed from these times. A comparison run (an earlier baseline) is a separate name sent
+   with `--ref --step <step>`; it is drawn by step beside the metric on the card and never
+   enters its trend. One `--ref` reading marks the whole name as a reference.
 2. Workers: for each parallel task, `awb tui -g <group> <id> <name>`. It waits until the
    worker's Claude is ready and prints `<id> session: <session name>`. If it prints "answer the
    folder-trust prompt", ask the user to confirm trust in that pane; neither awb nor you makes
