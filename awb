@@ -995,13 +995,15 @@ watch() {
   # an open board also runs the nudge rounds (awb nudge), so agents are reminded wherever a
   # board is up; AWB_NUDGE=0 turns that off. The first round waits one AWB_NUDGE_POLL.
   last=; synced=0; off=0; full=; rt=0; nudged=$(date +%s)
-  # a board mirrored to Lark (awb-lark setup ran) syncs its topic once a minute, in the background
+  # a board linked to a Lark topic (awb-lark sync ran once for it: lark.json) syncs it once a
+  # minute, in the background. An unlinked board stays local: with only the group set, every
+  # sandbox and scratch board a worker opened used to post a topic of its own to the group
   lk=$(dirname "$(readlink "$BIN" 2>/dev/null || echo "$BIN")")/awb-lark
   [ -x "$lk" ] || lk=$(command -v awb-lark || true)
   # A tick starts a sync only when the last one has ended (its pid is in lock-lark); one
   # running for AWB_LARK_STALE seconds is killed with its lark-cli (model/tla/AwbLark.tla)
   while :; do
-    if [ -n "$lk" ] && [ -s "${XDG_CONFIG_HOME:-$HOME/.config}/awb/lark-chat" ] \
+    if [ -n "$lk" ] && [ -s "$AWB_DIR/lark.json" ] && [ -s "${XDG_CONFIG_HOME:-$HOME/.config}/awb/lark-chat" ] \
        && [ $(($(date +%s) - synced)) -ge "${AWB_LARK_EVERY:-60}" ]; then
       synced=$(date +%s)
       lp=$(readlink "$AWB_DIR/lock-lark" 2>/dev/null || true)
@@ -2364,6 +2366,12 @@ CHK
     psock=$pd/.awb/sock; [ -S "$psock" ] || die "selftest: awb up without a terminal made no session"
     AWB_TMUX_SOCKET=$psock AWB_TMUX_FOR=$pd/.awb TMUX=$psock,0,0 AWB_DIR=$t/child "$BIN" down
     tmux -S "$psock" has-session -t awb 2>/dev/null || die "selftest: awb down under another AWB_DIR killed the parent board"
+    # an agent pane of the board (which inherits its AWB_DIR) cannot end the board
+    ap=$(tmux -S "$psock" list-panes -t awb -F '#{pane_id}' | tail -1)
+    AWB_DIR=$pd/.awb "$BIN" start pa agent >/dev/null; printf 'pa %s\n' "$ap" >> "$pd/.awb/panes"
+    ! TMUX_PANE=$ap AWB_TMUX_SOCKET=$psock AWB_TMUX_FOR=$pd/.awb AWB_DIR=$pd/.awb "$BIN" down 2>/dev/null \
+      || die "selftest: an agent pane ended its own board with awb down"
+    tmux -S "$psock" has-session -t awb 2>/dev/null || die "selftest: awb down from an agent pane killed the board"
     AWB_TMUX_SOCKET=$psock AWB_TMUX_FOR=$pd/.awb AWB_DIR=$pd/.awb "$BIN" down
     ! tmux -S "$psock" has-session -t awb 2>/dev/null || die "selftest: awb down did not end its own board"
     # awb board twice for one .awb opens one board; the second call names the open one
@@ -2442,6 +2450,11 @@ FAKE
     grep -q 'messages patch' "$t/lark.log" || die "selftest: an old lock directory stopped the refresh"
     # the topic is created with a key derived from the board, so a repeated send is deduplicated
     grep -q 'idempotency-key awb-' "$t/lark.log.first" || die "selftest: the topic was created without an idempotency key"
+    # a board never linked (no lark.json) does not post itself, even with the group set
+    nl=$t/unlinked; mkdir -p "$nl"; AWB_DIR=$nl "$BIN" goal "scratch" >/dev/null; : > "$t/lark.log"
+    AWB_DIR=$nl XDG_CONFIG_HOME=$t/xdg PATH=$fb:$PATH AWB_LARK_EVERY=1 AWB_INTERVAL=0.2 "$BIN" watch >/dev/null 2>&1 &
+    wp=$!; sleep 2.5; kill $wp; wait $wp 2>/dev/null || true
+    [ ! -s "$t/lark.log" ] && [ ! -e "$nl/lark.json" ] || die "selftest: an unlinked board posted itself to the Lark group"
     # the refresh itself: a running board (watch) patches the card on its own, again and
     # again, and each patch carries the board's latest state
     : > "$t/lark.log"
@@ -2473,6 +2486,11 @@ case "${1:-}" in -h|--help) usage; exit 0 ;; esac
 case "$cmd" in
   up)       up "$@" ;;
   down)     init_dir   # only the session awb up made for this board, never the server it runs in
+            # an agent of this board inherits its AWB_DIR: its awb down (a worker trying awb in
+            # another directory) once ended the board and every worker on it
+            if [ -n "${TMUX_PANE:-}" ] && agent_panes | awk -v p="$TMUX_PANE" '$2 == p {f = 1} END {exit !f}'; then
+              die "this pane is an agent of the board $AWB_DIR; awb down would end it and every agent on it. The user or the main agent runs it (set AWB_DIR for another board)"
+            fi
             [ -S "$(sock_path)" ] && tmux -S "$(sock_path)" kill-session -t awb 2>/dev/null || true ;;
   run)      run "$@" ;;
   tui)      tui "$@" ;;

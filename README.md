@@ -161,8 +161,10 @@ socket is `/tmp/awb-UID-HASH.sock`, since unix socket paths are limited to about
 
 ## Lark (Feishu) topics
 
-With [lark-cli](https://github.com/larksuite/cli) logged in as a bot, every board mirrors into
-its own topic of one Lark topic group. `install.sh` asks for the group (or reads
+With [lark-cli](https://github.com/larksuite/cli) logged in as a bot, a board mirrors into
+its own topic of one Lark topic group once it is linked: run `awb-lark sync` once in the
+board's directory. Boards never linked stay local, so scratch and test boards never reach the
+group. `install.sh` asks for the group (or reads
 `AWB_LARK_CHAT=oc_xxx`); `awb-lark setup oc_xxx` sets it later. The bot must be a member of
 the group.
 
@@ -177,7 +179,7 @@ the group.
   (`model/tla/AwbLark.tla`). Lark stops
   patching a card after 14 days, so at 13 days the board opens a new topic and the old card
   is replaced by a pointer to it.
-- The board syncs by itself once a minute while `awb board` / `awb up` runs
+- A linked board syncs by itself once a minute while `awb board` / `awb up` runs
   (`AWB_LARK_EVERY`); `awb-lark sync` does it by hand, `--dry-run` prints the card JSON.
 - The mapping is `$AWB_DIR/lark.json` (chat, root message), so it follows the
   board. The card is built from `awb snapshot`, the same data as the brief view.
