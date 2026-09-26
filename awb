@@ -1098,6 +1098,21 @@ up() {
   _att
 }
 
+# the pane of a new agent (globals id name group sock work): split beside the work pane; a
+# window with no room left (tmux: "no space for new pane", about 5 agents) gets a new window
+agent_split() {
+  set -- -P -F '#{pane_id}' -e "AWB_DIR=$AWB_DIR" -e "AWB_TMUX_SOCKET=$sock" -e "AWB_TMUX_FOR=$AWB_DIR" \
+    -e "AWB_GROUP=$group" -e "AWB_AGENT_ID=$id" -e "AWB_AGENT_NAME=$name" -e "AWB_AGENT_KIND=$1" "$2"
+  tm split-window -h -t "$work" "$@" 2>/dev/null || tm new-window -a -d -t "$work" "$@"
+}
+# a second agent with a live id took over its events, and the first ran on untracked
+not_running() {
+  _p=$(agent_pane "$1"); [ -n "$_p" ] && tm list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qx "$_p" || return 0
+  _st=$({ grep -F "\"id\":\"$1\"" "$EV" 2>/dev/null || true; } | jq -R -s -r \
+    '[split("\n")[] | fromjson? | select(type == "object" and (.t == "start" or .t == "status"))] | last | .status // "running"')
+  case $_st in failed|done) ;; *) die "$1 is running in pane $_p; use another id, or end it first ($PROG fail $1 REASON)" ;; esac
+}
+
 run() {
   group=${AWB_GROUP:-default}
   case "${1:-}" in
@@ -1109,7 +1124,7 @@ run() {
   [ "${1:-}" = -- ] && shift
   [ $# -ge 1 ] || die "usage: $PROG run [-g GROUP] ID NAME -- CMD..."
   case $id in *[!A-Za-z0-9_-]* ) die "id must match [A-Za-z0-9_-] (got: $id)";; esac
-  init_dir
+  init_dir; not_running "$id"
   work=$(cat "$AWB_DIR/work-pane" 2>/dev/null) && [ -n "$work" ] || die "run '$PROG up' first"
   tm list-panes -t "$work" >/dev/null 2>&1 || die "work pane $work gone; restart with '$PROG up'"
   kind=$(basename -- "$1")
@@ -1119,10 +1134,7 @@ run() {
 AWB_AGENT_ID=$(q "$id") AWB_AGENT_NAME=$(q "$name") AWB_AGENT_KIND=$(q "$kind") \
 $(q "$BIN") _enter; rc=0; $cmdq || rc=\$?; \
 AWB_DIR=$(q "$AWB_DIR") $(q "$BIN") _leave \$rc; exec $(q "$SHELL")"
-  pane=$(tm split-window -h -t "$work" -P -F '#{pane_id}' \
-           -e "AWB_DIR=$AWB_DIR" -e "AWB_TMUX_SOCKET=$sock" -e "AWB_TMUX_FOR=$AWB_DIR" -e "AWB_GROUP=$group" \
-           -e "AWB_AGENT_ID=$id" -e "AWB_AGENT_NAME=$name" \
-           -e "AWB_AGENT_KIND=$kind" "$inner")
+  pane=$(agent_split "$kind" "$inner")
   tm select-pane -t "$pane" -T "$name"
 }
 
@@ -1135,7 +1147,7 @@ tui() {
   [ $# -ge 2 ] || die "usage: $PROG tui [-g GROUP] ID NAME [TASK...]"
   id=$1; name=$2; shift 2
   case $id in *[!A-Za-z0-9_-]* ) die "id must match [A-Za-z0-9_-] (got: $id)";; esac
-  init_dir
+  init_dir; not_running "$id"
   work=$(cat "$AWB_DIR/work-pane" 2>/dev/null) && [ -n "$work" ] || die "run '$PROG up' first"
   tm list-panes -t "$work" >/dev/null 2>&1 || die "work pane gone; restart with '$PROG up'"
   tui_cmd=${AWB_TUI_CMD:-$(command -v claude-db >/dev/null && echo claude-db || echo claude)}
@@ -1145,10 +1157,7 @@ tui() {
   inner="AWB_DIR=$(q "$AWB_DIR") AWB_TMUX_SOCKET=$(q "$sock") AWB_TMUX_FOR=$(q "$AWB_DIR") AWB_GROUP=$(q "$group") \
 AWB_AGENT_ID=$(q "$id") AWB_AGENT_NAME=$(q "$name") AWB_AGENT_KIND=claude \
 $(q "$BIN") _enter; $tui_cmd; exec $(q "$SHELL")"
-  pane=$(tm split-window -h -t "$work" -P -F '#{pane_id}' \
-           -e "AWB_DIR=$AWB_DIR" -e "AWB_TMUX_SOCKET=$sock" -e "AWB_TMUX_FOR=$AWB_DIR" -e "AWB_GROUP=$group" \
-           -e "AWB_AGENT_ID=$id" -e "AWB_AGENT_NAME=$name" -e "AWB_AGENT_KIND=claude" \
-           "$inner")
+  pane=$(agent_split claude "$inner")
   tm select-pane -t "$pane" -T "$name"
   # first message: Chinese working rules + optional task.
   # paste via buffer — a plain Enter does not submit inside the claude TUI.
@@ -2051,6 +2060,12 @@ EOF
     sleep 1; cap=$(tmux -L "$S" capture-pane -p -t "$(agent_pane z1)")
     { printf '%s\n' "$cap" | grep -qx "told-A" && printf '%s\n' "$cap" | grep -qx "told-B"; } \
       || die "selftest: concurrent tells merged or lost"
+    # a full window takes the next agent in a new window; a live id is not taken twice
+    i=1; while [ $i -le 9 ]; do "$BIN" run zw$i w -- sleep 30 || die "selftest: run $i found no room"; i=$((i + 1)); done
+    [ "$(tmux -L "$S" list-windows -t awb | wc -l | tr -d ' ')" -ge 2 ] || die "selftest: 9 agents fit one window (test too small)"
+    ! "$BIN" run zw1 again -- true 2>/dev/null || die "selftest: run took the id of a running agent"
+    "$BIN" fail zw1 "stopped"; "$BIN" run zw1 again -- true || die "selftest: run refused the id of a failed agent"
+    i=1; while [ $i -le 9 ]; do tmux -L "$S" kill-pane -t "$(agent_pane zw$i)" 2>/dev/null || true; i=$((i + 1)); done
 
     # tell must confirm a paste actually submitted. A real Claude pane does NOT
     # end on the input line: it is `❯ <text>`, then a divider, then a ⏵⏵
@@ -2580,15 +2595,15 @@ case "$cmd" in
             # jq tonumber rejects '1.2.3'/'-'/''; the finite/self-equal guard
             # additionally rejects NaN/Infinity (jq 1.8 has no finite/0).
             _numok='tonumber as $n | $n == $n and $n < 1e309 and $n > -1e309'
-            printf '%s' "$2" | jq -eR "$_numok" >/dev/null || die "metric VALUE must be numeric (got: $2)"
-            printf '%s' "$3" | jq -eR "$_numok" >/dev/null || die "metric TARGET must be numeric (got: $3)"
+            printf '%s' "$2" | jq -eR "$_numok" >/dev/null 2>&1 || die "metric VALUE must be numeric (got: $2)"
+            printf '%s' "$3" | jq -eR "$_numok" >/dev/null 2>&1 || die "metric TARGET must be numeric (got: $3)"
             # render-only: no id / agent. The fold's `($e.id|type)!="string" or
             # .agents[id]==null` arm (matching Lean parseLine's `_ => none`)
             # drops the unknown event, so it never reaches agent state; render
             # reads it from the same piped event array, not a second log read.
             [ -z "$_at" ] || printf '%s' "$_at" | grep -Eqx '[0-9]{9,11}' || die "--at wants epoch seconds (got: $_at)"
             [ -z "$_by" ] || printf '%s' "$_by" | grep -Eqx '[0-9]{9,11}' || die "--by wants epoch seconds (got: $_by)"
-            [ -z "$_x" ] || printf '%s' "$_x" | jq -eR "$_numok" >/dev/null || die "--step must be numeric (got: $_x)"
+            [ -z "$_x" ] || printf '%s' "$_x" | jq -eR "$_numok" >/dev/null 2>&1 || die "--step must be numeric (got: $_x)"
             append '{t:"metric", name:$name, value:($value|tonumber), target:($target|tonumber), note:$note}
                     + (if $at == "" then {time:$time, ep:$ep}
                        else ($at | tonumber) as $a | {time:($a | strflocaltime("%H:%M:%S")), ep:$a} end)

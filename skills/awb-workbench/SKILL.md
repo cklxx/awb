@@ -111,7 +111,7 @@ socket is `/tmp/awb-UID-HASH.sock`).
 | `awb stale` / `awb nudge` | list agents silent ≥ `AWB_STALE` seconds / remind them in a loop. An open board runs the same rounds (`AWB_NUDGE=0` turns that off), and `awb board` reuses a board already open for this `.awb` |
 | `awb audit` / `awb state` | protocol violations from the Lean monitor (exit 1 if any) / per-agent state from the jq fold |
 | `awb board` | board beside the current tmux pane, which becomes the split origin for tui/run |
-| `awb render` / `awb reset` | one-shot render (works outside tmux) / clear all events |
+| `awb render` / `awb snapshot` / `awb reset` | one-shot render (works outside tmux) / the same as JSON / clear all events (keeps a `.bak` copy) |
 | `awb skill` / `awb version` / `awb selftest` | this manual / version / end-to-end self-test |
 
 Board settings: `AWB_VIEW=brief|full` (default brief), `AWB_STALE` (seconds, default 600),
@@ -123,7 +123,8 @@ States: ◔ running · ✓ done · ▲ blocked · ✗ failed · ■ dead; group 
 1. State the goal with `awb goal`; start workers per role with `awb run -g` / `awb tui`.
 2. A worker does not know its ID: put it in the prompt and ask for `awb now` / `awb done` at
    each stage (template below).
-3. Read progress with `awb render` or `.awb/events.jsonl`.
+3. Read progress with `awb snapshot` (one JSON object: goal, metric, need, anomalies, agents,
+   tasks, checks); `awb render` draws the same for a person.
 4. An agent's own `done` is only a claim. You choose the acceptance command and `awb check`
    runs it; after a rejected check the agent cannot become done until a later check passes.
 5. Keep acceptance files (tests, ACCEPT.lean) outside the worker's directory so it cannot edit them.
