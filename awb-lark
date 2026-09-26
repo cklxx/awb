@@ -80,8 +80,8 @@ card() {
                  tile("达成"; (if $s.metric.frac then "\($s.metric.frac * 100 | floor)%" else "—" end);
                       (if $s.metric.v0 then "起 \($s.metric.v0) · \($s.metric.since | ago)前" else "" end))]
               else [tile("任务"; "\($s.progress.d) / \($s.progress.t)"; "")] end)
-             + [tile("24 小时"; "里程碑 +\($s.day.milestones)";
-                     "已核 \($s.day.verified) · 任务 +\($s.day.tasks)"
+             + [tile("24 小时"; "完成 +\($s.day.done)";
+                     "已核 \($s.day.verified)"
                      + (if $s.day.metric then " · \($s.metric.name) \(if $s.day.metric >= 0 then "+" else "" end)\($s.day.metric * 100 | round / 100)" else "" end))])}]
        # the chart: the metric, and by step each reference series (metric --ref) beside it; a
        # reference makes one reading enough. Two readings at the same t (a manual current
@@ -122,7 +122,7 @@ card() {
              + (if $s.tasks_old > 0 then [{tag:"markdown", content:("✓ 另有 \($s.tasks_old) 项已完成" | grey)}] else [] end)) as $pe
            | if ($pe | length) == 0 then []
              else [{tag:"collapsible_panel", expanded:false,
-                    header:{title:{tag:"markdown", content:("**进展与任务**　" + ("里程碑已核 \($s.verified.v)/\($s.verified.n)" | grey))}},
+                    header:{title:{tag:"markdown", content:("**进展与任务**　" + ("已核 \($s.verified.v)/\($s.verified.n)" | grey))}},
                     vertical_spacing:"8px", elements:$pe}] end))
        + [{tag:"markdown", content:("\($path)" | grey), text_size:"notation"}])}}'
 }
