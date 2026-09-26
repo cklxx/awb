@@ -9,6 +9,9 @@ theorem acc_pr (tr : List Ob) (h : (audit tr).v = []) (pre post : List Ob)
 theorem acc_brief_total (es : List Ev) : (sec (run es).st).isSome := every_agent_shown es
 theorem acc_brief_rejected (es : List Ev) (h : (run es).gate = true) :
     sec (run es).st ≠ some .idle := rejected_not_idle es h
+theorem acc_brief_drawn (es : List Ev) (h : (run es).gate = true)
+    (hs : (run es).st ≠ .running ∧ (run es).st ≠ .blocked) : drawn (run es).st = true :=
+  rejected_stopped_drawn es h hs
 theorem acc_probe_newest (es : List PEv) (a : Reading) (h : Probe.prun es = some a) :
     ∀ e ∈ es, e.st.isSome → e.t0 ≤ a.t0 := Probe.newest es none a h
 theorem acc_probe_fail (es : List PEv) (t0 ep : Int) :

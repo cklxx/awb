@@ -2,10 +2,12 @@ import AwbModel
 import Audit
 
 /-!
-The brief view and the Lark card sort every agent into one section: working (◔/▲), idle
-(○) or needs-you (✗). This models that choice on the proven fold and shows that no agent
-is dropped from the view and that a rejected check never reads as idle. `awbmodel brief`
-prints the sections; selftest compares them with `awb snapshot` on random logs.
+`awb snapshot` sorts every agent into one section: working (◔/▲), idle (○) or needs-you
+(✗). The brief view and the Lark card draw only needs-you (README: an agent shows only where
+it needs the owner or is off). This models that choice on the proven fold: no agent is
+dropped from the snapshot, a rejected check never reads as idle, and an agent that stopped
+after a rejected check is always drawn, under 需要你. `awbmodel brief` prints the sections;
+selftest compares them with `awb snapshot` on random logs.
 (Permission dialogs and session mismatches come from the Claude registry, outside the log.)
 -/
 
@@ -36,3 +38,14 @@ theorem rejected_not_idle (es : List Ev) (h : (run es).gate = true) :
   obtain ⟨_, h2, _, _⟩ := inv_run es
   have := h2 h
   cases hs : (run es).st <;> simp_all [sec]
+
+/-- What the brief view draws of an agent: the needs-you section only. -/
+def drawn (s : St) : Bool := sec s == some .needYou
+
+/-- An agent that stopped (neither working nor waiting) after its last check was rejected is
+always drawn: the view never hides a rejected result behind a finished or idle agent. -/
+theorem rejected_stopped_drawn (es : List Ev) (h : (run es).gate = true)
+    (hs : (run es).st ≠ .running ∧ (run es).st ≠ .blocked) : drawn (run es).st = true := by
+  obtain ⟨_, h2, h3, _⟩ := inv_run es
+  have := h2 h
+  cases hr : (run es).st <;> simp_all [drawn, sec]

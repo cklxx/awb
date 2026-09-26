@@ -107,7 +107,7 @@ socket is `/tmp/awb-UID-HASH.sock`).
 | `awb hold RES OWNER [NOTE]` / `awb release RES [OWNER]` / `awb holder RES` | one holder per shared resource (a GPU, a host); another owner is refused; a holder quiet for `AWB_STALE` shows under 异常 |
 | `awb tell ID MSG` | type a message into the agent's TUI pane and press Enter (claude/codex; Claude queues it when busy) |
 | `awb peers` | each agent's Claude session name and busy/idle |
-| `awb stale` / `awb nudge` | list agents silent ≥ `AWB_STALE` seconds / remind them in a loop |
+| `awb stale` / `awb nudge` | list agents silent ≥ `AWB_STALE` seconds / remind them in a loop. An open board runs the same rounds (`AWB_NUDGE=0` turns that off), and `awb board` reuses a board already open for this `.awb` |
 | `awb audit` / `awb state` | protocol violations from the Lean monitor (exit 1 if any) / per-agent state from the jq fold |
 | `awb board` | board beside the current tmux pane, which becomes the split origin for tui/run |
 | `awb render` / `awb reset` | one-shot render (works outside tmux) / clear all events |
