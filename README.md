@@ -189,6 +189,7 @@ awb tell a1 "rebase on main, then re-run the check"   # typed into the agent's T
 awb peers                                             # ID PANE CLAUDE-SESSION STATUS
 awb stale                                             # agents silent >= AWB_STALE seconds
 awb nudge                                             # loop: remind silent agents every AWB_NUDGE_EVERY
+                                                      # (an open board runs these rounds too; AWB_NUDGE=0 turns that off)
 ```
 
 `awb nudge` (loop cadence `AWB_NUDGE_POLL`, default 60 s) also fingerprints each agent's
@@ -276,7 +277,7 @@ proven model:
 |---|---|---|
 | status fold (events → agent state) | proven: duration frozen iff ended, no `done` while a check is rejected, only known states, non-negative durations | `model/AwbModel.lean` |
 | jq fold in `awb` = Lean fold | differential test on random logs (`awb selftest`, 200 logs; 1000 run clean) | `awb state` vs `awbmodel fold` |
-| brief view / Lark card (events → sections) | proven: every agent is shown in one section, and an agent with a rejected check is never shown idle; the jq snapshot is differentially tested against it (every 4th random log) | `model/Brief.lean` vs `awb snapshot` |
+| brief view / Lark card (events → sections) | proven: every agent is in one snapshot section, an agent with a rejected check is never idle, and one that stopped after a rejected check is always drawn under 需要你; the jq snapshot is differentially tested against it (every 4th random log) | `model/Brief.lean` vs `awb snapshot` |
 | protocol audit | proven: the one-pass monitor reports nothing iff every event obeys the rules given its prefix (`audit_iff_clean`); corollary: every PR in a clean log followed a passing check | `model/Audit.lean` |
 | deliverables | `awb check` (tests, or Lean with kernel-checked theorems and standard axioms only) | `awb check` |
 | merge | `awb pr` refuses without a passing check or with audit violations, and logs the PR for the audit; `awb merge` merges only on an approve of the current head (newest verdict wins, whole-line match) with the required checks green, pinned by `--match-head-commit` | `awb pr`, `awb merge` |

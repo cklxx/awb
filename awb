@@ -878,6 +878,19 @@ probe() {
 
 # nudge: paste a reminder into the pane of every agent silent >= AWB_STALE,
 # at most once per AWB_NUDGE_EVERY. Panes map: $AWB_DIR/panes, lines "ID PANE".
+# one nudge round at a time per board: the nudge loop and every open board (watch) start
+# rounds, and a round already running in a live process is not repeated
+nudge_round() {
+  _nl=$AWB_DIR/lock-nudge
+  if ! ln -s "$$" "$_nl" 2>/dev/null; then
+    _hp=$(readlink "$_nl" 2>/dev/null || true)
+    if [ -n "$_hp" ] && [ "$_hp" != "$$" ] && kill -0 "$_hp" 2>/dev/null; then return 0; fi
+    rm -f "$_nl"; ln -s "$$" "$_nl" 2>/dev/null || return 0
+  fi
+  nudge_once
+  rm -f "$_nl"
+}
+
 nudge_once() {
   freeze_once
   stuck_once
@@ -901,7 +914,8 @@ nudge_once() {
     | "\(.key) \((($now - .value.last) / 60) | floor)"' |
   while read -r id mins; do
     msg="[看板自动提醒] 你（${id}）已 ${mins} 分钟没更新看板。请现在报一句结果：AWB_DIR=$AWB_DIR awb now $id \"<结果>\"；卡住用 awb block $id \"<原因>\"；做完用 awb finish $id \"<成果>\"。"
-    tell "$id" "$msg" 2>/dev/null || continue
+    # in a subshell: tell exits for an agent it cannot reach, which must not end the round
+    ( tell "$id" "$msg" ) 2>/dev/null || continue
     append '{t:"nudge",time:$time,ep:$ep,id:$id}' --arg id "$id"
   done
 }
@@ -921,7 +935,7 @@ stuck_once() {
     [ -n "$hit" ] || continue     # the pipeline's status is tail's, so test the match itself
     last=$(grep -F "\"id\":\"$id\"" "$EV" 2>/dev/null | grep -F '"why":"stuck"' | tail -1 | jq -R -r 'fromjson? | .ep' || true)
     [ $((now - ${last:-0})) -ge "${AWB_STUCK_EVERY:-600}" ] || continue
-    tell "$id" "[看板自动提醒] 你上一条输出里的工具调用（${hit}）被打印成了文本，没有执行，会话已停。请重新发出那条调用，然后继续。" 2>/dev/null || continue
+    ( tell "$id" "[看板自动提醒] 你上一条输出里的工具调用（${hit}）被打印成了文本，没有执行，会话已停。请重新发出那条调用，然后继续。" ) 2>/dev/null || continue
     append '{t:"nudge",time:$time,ep:$ep,id:$id,why:"stuck",hit:$h}' --arg id "$id" --arg h "$hit"
   done
 }
@@ -945,7 +959,7 @@ hold_once() {
     [ "$q" -ge "${AWB_STALE:-600}" ] || continue
     last=$(grep -F "\"id\":\"$own\"" "$EV" 2>/dev/null | grep -F '"why":"hold"' | tail -1 | jq -R -r 'fromjson? | .ep' || true)
     [ $((now - ${last:-0})) -ge "${AWB_NUDGE_EVERY:-900}" ] || continue
-    tell "$own" "[看板自动提醒] 你占着 ${res} 已 $((held / 60)) 分钟，最近 $((q / 60)) 分钟没在干活，别人在排队。还在用就报一句进度（awb now $own \"...\"）；用完了就恢复现场并 awb release ${res} ${own}。" 2>/dev/null || continue
+    ( tell "$own" "[看板自动提醒] 你占着 ${res} 已 $((held / 60)) 分钟，最近 $((q / 60)) 分钟没在干活，别人在排队。还在用就报一句进度（awb now $own \"...\"）；用完了就恢复现场并 awb release ${res} ${own}。" ) 2>/dev/null || continue
     append '{t:"nudge",time:$time,ep:$ep,id:$id,why:"hold",res:$r}' --arg id "$own" --arg r "$res"
   done
 }
@@ -967,7 +981,9 @@ watch() {
     trap 'printf "\033[?1049l"' EXIT
   fi
   trap 'exit 130' INT TERM
-  last=; synced=0; off=0; full=; rt=0
+  # an open board also runs the nudge rounds (awb nudge), so agents are reminded wherever a
+  # board is up; AWB_NUDGE=0 turns that off. The first round waits one AWB_NUDGE_POLL.
+  last=; synced=0; off=0; full=; rt=0; nudged=$(date +%s)
   # a board mirrored to Lark (awb-lark setup ran) syncs its topic once a minute, in the background
   lk=$(dirname "$(readlink "$BIN" 2>/dev/null || echo "$BIN")")/awb-lark
   [ -x "$lk" ] || lk=$(command -v awb-lark || true)
@@ -986,6 +1002,9 @@ watch() {
       else
         ( AWB="$BIN" "$lk" sync >/dev/null 2>&1 & )
       fi
+    fi
+    if [ "${AWB_NUDGE:-1}" != 0 ] && [ $(($(date +%s) - nudged)) -ge "${AWB_NUDGE_POLL:-60}" ]; then
+      nudged=$(date +%s); ( "$BIN" nudge --once >/dev/null 2>&1 & )
     fi
     set -- $(dims); cols=${1:-80}; rows=${2:-24}
     # a key within the same second scrolls what is on screen instead of rendering again
@@ -1329,6 +1348,11 @@ board() {
     echo "not in tmux; watch it from another terminal: AWB_DIR=$AWB_DIR $PROG watch"; return 0
   fi
   printf '%s\n' "$TMUX_PANE" > "$AWB_DIR/work-pane"      # awb tui/run split from here
+  # one board per .awb: a board already open anywhere on this server is reused, not repeated
+  # (workers that each ran awb board once left five 7-column boards squeezed between them)
+  _b=$(tmux list-panes -a -F '#{pane_id} #{session_name}:#{window_index}.#{pane_index} #{pane_start_command}' 2>/dev/null \
+       | grep -F "AWB_DIR=$(q "$AWB_DIR") " | grep ' watch' | head -n 1 | cut -d' ' -f2)
+  if [ -n "$_b" ]; then echo "board: $AWB_DIR already open in pane $_b"; return 0; fi
   tmux split-window -h -d -l 45% -t "$TMUX_PANE" "AWB_DIR=$(q "$AWB_DIR") $(q "$BIN") watch"
   echo "board: $AWB_DIR (right of this pane)"
 }
@@ -1654,7 +1678,7 @@ selftest() {
   S=awbselftest$$
   cleanup() { tmux -L "$S" kill-server 2>/dev/null || true; rm -rf "$t"; }
   trap cleanup EXIT
-  export AWB_DIR=$t AWB_COLS=160 AWB_ROWS=200; EV=$t/events.jsonl
+  export AWB_DIR=$t AWB_COLS=160 AWB_ROWS=200 AWB_NUDGE=0; EV=$t/events.jsonl
   # never the user's Lark group: a test board's watch loop would mirror itself there. A
   # guard lark-cli first on PATH records any call that escapes the fakes below.
   XDG_CONFIG_HOME=$t/xdg-none; export XDG_CONFIG_HOME
@@ -2093,6 +2117,19 @@ FT
     [ "$(grep -F '"why":"hold"' "$EV" | grep -cF '"id":"z1"')" = 1 ] || die "selftest: the hold reminder is not throttled"
     "$BIN" release gpu9 z1; tmux -L "$S" send-keys -t "$zp" C-u; tmux -L "$S" send-keys -t "$zp" clear Enter
     reg idle "" 10
+    # an open board runs the nudge rounds itself; a round held by a live process is skipped
+    "$BIN" now z1 "quiet work"; sleep 1.1
+    # (v1 above has no pane: tell cannot reach it, and the round must go on to z1)
+    ln -s $$ "$t/lock-nudge"
+    AWB_STALE=1 AWB_NUDGE_EVERY=0 ht nudge --once >/dev/null 2>&1
+    rm -f "$t/lock-nudge"
+    [ "$(grep -F '"t":"nudge"' "$EV" | grep -F '"id":"z1"' | grep -vcF '"why"')" = 0 ] || die "selftest: a nudge round ran while another held the lock"
+    HOME=$t/home AWB_STALE=1 AWB_NUDGE_EVERY=0 AWB_NUDGE=1 AWB_NUDGE_POLL=1 AWB_INTERVAL=0.2 "$BIN" watch >/dev/null 2>&1 &
+    wp=$!; i=0
+    until grep -F '"t":"nudge"' "$EV" | grep -F '"id":"z1"' | grep -qvF '"why"'; do
+      i=$((i + 1)); [ $i -lt 40 ] || { kill $wp; die "selftest: an open board did not nudge a silent agent"; }; sleep 0.25; done
+    kill $wp; wait $wp 2>/dev/null || true
+    tmux -L "$S" send-keys -t "$zp" C-u; tmux -L "$S" send-keys -t "$zp" clear Enter
     "$BIN" finish z1
     [ "$(ht peers | grep '^z1 ')" = "z1 $zp zz-1 idle" ] || die "selftest: peers lost the session"
     # a pane given as session:window.pane in .awb/panes resolves to the same session
@@ -2290,6 +2327,14 @@ CHK
     [ "$(printf '%s\n' "$two" | sed -n 2p)" = "$(printf '%s\n' "$top" | sed -n 4p)" ] \
       || die "selftest: g j j does not scroll 2 lines from the top"
     [ -z "$alive" ] || die "selftest: q does not quit the board"
+    # awb board twice for one .awb opens one board; the second call names the open one
+    bk=$(tmux -L "${S}b" new-session -d -x 160 -y 30 -P -F '#{socket_path},0,0 #{pane_id}' "sleep 60")
+    bsock=${bk% *}; bpane=${bk#* }
+    TMUX=$bsock TMUX_PANE=$bpane AWB_DIR=$sb "$BIN" board >/dev/null
+    TMUX=$bsock TMUX_PANE=$bpane AWB_DIR=$sb "$BIN" board | grep -q "already open" || die "selftest: a second awb board did not reuse the open one"
+    nb=$(tmux -L "${S}b" list-panes -a -F '#{pane_start_command}' | grep -c ' watch' || true)
+    tmux -L "${S}b" kill-server 2>/dev/null || true
+    [ "$nb" = 1 ] || die "selftest: awb board opened $nb boards for one .awb"
   fi
   # awb-lark: one board = one topic whose root card carries every update. A fake lark-cli
   # records each call; the flow must create the topic once, then only patch that card.
@@ -2423,8 +2468,8 @@ case "$cmd" in
             # agents on a permission dialog, whatever they reported: "ID MINUTES waiting"
             sessions_json | jq -r --argjson now "$now" 'to_entries[] | select(.value.status == "waiting")
               | "\(.key) \((($now - .value.since) / 60) | floor) waiting"' ;;
-  nudge)    init_dir; if [ "${1:-}" = "--once" ]; then nudge_once
-            else while :; do nudge_once; sleep "${AWB_NUDGE_POLL:-60}"; done; fi ;;
+  nudge)    init_dir; if [ "${1:-}" = "--once" ]; then nudge_round
+            else while :; do nudge_round; sleep "${AWB_NUDGE_POLL:-60}"; done; fi ;;
   news)     _nk=; if [ "${1:-}" = --key ]; then _nk=${2:-}; shift 2 || die "--key needs a key"; fi
             [ $# -ge 1 ] || die "usage: $PROG news [--key KEY] TEXT"
             append '{t:"news",time:$time,ep:$ep,text:$text} + (if $k == "" then {} else {key:$k} end)' \
