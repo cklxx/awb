@@ -1215,11 +1215,13 @@ open_key() {
 }
 send() {
   [ $# -ge 2 ] || die "usage: $PROG send ID TASK   (prints the message to SendMessage)"
-  id=$1; shift; init_dir
+  id=$1; shift; need_agent "$id"
   k=$(open_key "$id"); [ -z "$k" ] || die "$id already has open task #$k; wait for its reply (or: $PROG idle $id)"
   k=$(date +%s | tail -c 5)$(printf %02d $(( $$ % 100 )))
   append '{t:"now",time:$time,ep:$ep,id:$id,text:$x,key:$k}' --arg id "$id" --arg x "$*" --arg k "$k"
   printf '[awb %s#%s] %s\n做完后回复一行：以 [awb %s#%s] 开头，写结果（做不了也照此格式说明原因）。\n' "$id" "$k" "$*" "$id" "$k"
+  # the task is only recorded here; the text above still has to reach the worker
+  echo "$PROG: recorded $id #$k; deliver the text above with SendMessage (or: $PROG tell $id \"\$msg\")" >&2
 }
 reply() {
   [ $# -ge 2 ] || die "usage: $PROG reply ID KEY [RESULT]"
@@ -1401,6 +1403,13 @@ agent_panes() {
   # session registry use; other target forms (window names) pass through unresolved
 }
 agent_pane() { agent_panes | awk -v i="$1" '$1 == i {print $2}'; }
+# an event for an id never started is dropped by the fold; a typo'd id must not pass silently
+need_agent() {
+  init_dir
+  { [ -s "$EV" ] && grep -F "\"id\":\"$1\"" "$EV" | grep -qF '"t":"start"'; } \
+    || { [ -s "$AWB_DIR/panes" ] && awk -v i="$1" '$1 == i {f = 1} END {exit !f}' "$AWB_DIR/panes"; } \
+    || die "unknown agent: $1 (register it first: $PROG run, $PROG tui or $PROG start)"
+}
 
 # type a message into an agent's TUI (claude, codex, any): a named buffer, then Enter.
 # Claude queues it if a turn is running. Plain send-keys Enter does not submit in claude.
@@ -1477,22 +1486,22 @@ tell() {
 
 # Claude Code sessions of awb agents, read from ~/.claude/sessions (never written):
 # {ID: {name, status, waiting, since}}, status busy|idle|waiting|shell. One pass over the
-# registry; an entry being rewritten or of a dead pid is skipped. Pane ids are unique per
-# tmux server; the registry keeps the session a pane started in (panes move), so the session
-# name is matched only on awb's own server, where ids collide. Always prints JSON.
+# registry; an entry being rewritten or of a dead pid is skipped. A session belongs to the
+# pane whose process it descends from: the registry's tmux field ("awb:@0.%2") names no
+# server, and every awb board runs its own server with a session "awb" and panes from %0,
+# so matching on it gave one board's agent another board's Claude. Always prints JSON.
 sessions_json() {
-  _panes=$(tm list-panes -a -F '#{pane_id} #{session_name}' 2>/dev/null) || { echo '{}'; return 0; }
-  _strict=0; { [ -n "${AWB_TMUX_SOCKET:-}" ] || [ -S "$(sock_path)" ]; } && _strict=1
+  _panes=$(tm list-panes -a -F '#{pane_id} #{pane_pid}' 2>/dev/null) || { echo '{}'; return 0; }
   { awk 1 "$HOME"/.claude/sessions/*.json 2>/dev/null || true; } | jq -Rnc \
-    --arg ag "$(agent_panes)" --arg panes "$_panes" --argjson strict "$_strict" \
-    --arg pids " $(ps -Ao pid= | tr -s ' \n' '  ') " '
-    [inputs | fromjson? | select(type == "object" and (.tmux | type) == "string"
-                                 and (" \(.pid) " as $k | $pids | contains($k)))] as $reg
-    | ($panes | split("\n") | map(select(. != "") | split(" ") | {key:.[0], value:.[1]}) | from_entries) as $sn
-    | [ $ag | split("\n")[] | select(. != "") | split(" ") | .[0] as $id | .[1] as $p
-        | ($sn[$p] // null) as $s | select($s != null)
-        | ([$reg[] | select((.tmux | endswith("." + $p)) and ($strict == 0 or (.tmux | startswith($s + ":"))))]
-           | max_by(.startedAt // 0)) as $r
+    --arg ag "$(agent_panes)" --arg panes "$_panes" --arg ps "$(ps -Ao pid=,ppid=)" '
+    ($ps | split("\n") | map([splits(" +")] | map(select(. != "")) | select(length == 2)
+       | {key:.[0], value:.[1]}) | from_entries) as $pp
+    | def up($p; $n): if $n == 0 or $p == null or $p == "0" or $p == "1" then empty else $p, up($pp[$p]; $n - 1) end;
+    [inputs | fromjson? | select(type == "object" and $pp["\(.pid)"] != null)] as $reg
+    | ($panes | split("\n") | map(select(. != "") | split(" ") | {key:.[0], value:.[1]}) | from_entries) as $pid
+    | [ $ag | split("\n")[] | select(. != "") | split(" ") | .[0] as $id | ($pid[.[1]] // null) as $root
+        | select($root != null)
+        | ([$reg[] | select(any(up("\(.pid)"; 32); . == $root))] | max_by(.startedAt // 0)) as $r
         | select($r != null)
         | {key:$id, value:{name:$r.name, status:$r.status, waiting:($r.waitingFor // ""),
                            since:((($r.statusUpdatedAt // 0) / 1000) | floor)}} ]
@@ -1567,7 +1576,7 @@ lean_accept() (
 # acceptance gate: the check the main agent chose decides done, not the agent's claim
 check() {
   [ $# -ge 3 ] || die "usage: $PROG check ID -- CMD... | $PROG check ID --lean DIR [ACCEPT.lean]"
-  id=$1; shift
+  id=$1; shift; need_agent "$id"
   case $1 in
     --lean) what="lean ${3:+$(basename "$3")}"; set -- lean_accept "$2" "${3:-}" ;;
     --) shift; what=$*; set -- stage cmd "$@" ;;
@@ -1593,7 +1602,7 @@ check() {
       --arg id "$id" --arg r "验收未过($what): $why"
     # tell the agent, unless the agent ran the check itself and already sees the output
     if [ "${AWB_NOTIFY:-1}" = 1 ] && [ "$(agent_pane "$id")" != "${TMUX_PANE:-}" ]; then
-      tell "${id}" "awb 验收未过（${what}）：${why}。完整日志：${CHK_LOG}。修复后重新验收：awb check ${id} ..." 2>/dev/null \
+      ( tell "${id}" "awb 验收未过（${what}）：${why}。完整日志：${CHK_LOG}。修复后重新验收：awb check ${id} ..." ) 2>/dev/null \
         && echo "notified $id" || true
     fi
     tail -40 "$CHK_LOG"; echo "rejected: $what (full log: $CHK_LOG)"; return 1
@@ -1641,7 +1650,7 @@ Chat-driven: you talk to one Claude (the main agent); it keeps the board and run
   $PROG goal TEXT                   set the overall goal
   $PROG stale                       print "ID MINUTES" for running agents silent >= AWB_STALE,
                                     and "ID MINUTES waiting" for agents on a permission dialog
-  $PROG nudge [--once]              remind silent agents in their pane ($AWB_DIR/panes: "ID PANE")
+  $PROG nudge [--once]              remind silent agents in their pane (\$AWB_DIR/panes: "ID PANE")
   $PROG news [--key KEY] TEXT       one progress line (board shows last 3); one KEY = one fact, latest shown
   $PROG metric [--at EPOCH] [--step N] [--by EPOCH] [--ref] NAME VALUE TARGET [NOTE]
                                     --by: deadline; an ETA past it is not shown
@@ -1652,7 +1661,7 @@ Chat-driven: you talk to one Claude (the main agent); it keeps the board and run
                                     AWB_STALE=SECS: list agents silent that long (default 600)
                                     AWB_SILENT=SECS: silence shown as an anomaly (default 3600)
   $PROG task ID STATE [TEXT] [PARENT] [OWNER] [--probe CMD]
-                                    task tree node; STATE todo|wip|review|blocked|done|drop;
+                                    task tree node; STATE todo|wip|review|blocked|done|drop|ask;
                                     re-issue to update (empty args keep old values);
                                     --probe: the state comes from CMD (docs/probe.md)
   $PROG probe run [--once]          run due task probes (AWB_PROBE_EVERY 120 s, timeout 30 s)
@@ -1712,6 +1721,17 @@ selftest() {
   [ ! -e "$t/help-probe" ] || die "selftest: up --help created AWB_DIR"
   ( cd "$t" && AWB_DIR=help-probe "$BIN" --help >/dev/null ) || die "selftest: --help failed"
   [ ! -e "$t/help-probe" ] || die "selftest: --help ran a command (created AWB_DIR)"
+  # a typo is an error, never an event the fold drops or a title (own log)
+  ud=$t/usage; ub() { AWB_DIR=$ud "$BIN" "$@"; }
+  [ "$(ub bogus 2>&1 | wc -l | tr -d ' ')" = 1 ] || die "selftest: an unknown command printed more than one line"
+  ! ub now ghost "x" 2>/dev/null || die "selftest: now accepted an agent never started"
+  ! ub check ghost -- true 2>/dev/null || die "selftest: check accepted an agent never started"
+  ! ub task t3 wip "x" nope 2>/dev/null || die "selftest: task accepted a parent that does not exist"
+  ! ub goal --nope x 2>/dev/null || die "selftest: goal took an unknown option as its text"
+  ub start gone gone; printf 'gone %%9999999\n' >> "$ud/panes"
+  ub check gone -- false 2>/dev/null | grep -q '^rejected: false' || die "selftest: a rejected check of a dead pane printed no verdict"
+  ub reset | grep -q 'cleared; the old log is' && [ ! -s "$ud/events.jsonl" ] && ls "$ud"/events.jsonl.*.bak >/dev/null \
+    || die "selftest: reset kept no copy of the log"
   "$BIN" goal "SHIP THE WORKBENCH"
   "$BIN" start a1 claude agent backend
   "$BIN" now a1 "wire event log"
@@ -2081,14 +2101,18 @@ FT
     tmux -L "$S" kill-window -t "$fp" 2>/dev/null || true
     tmux -L "$S" kill-window -t "$fb" 2>/dev/null || true
     tmux -L "$S" kill-window -t "$fc" 2>/dev/null || true
-    # session truth from a fake ~/.claude/sessions entry on z1's pane (pid = this shell):
+    # session truth from a fake ~/.claude/sessions entry on z1's pane (pid = the pane's shell):
     # A. a permission dialog shows on the board and in stale, and tell will not type into it;
     # B. a self-report the session contradicts is flagged. Each has its negative control.
     zp=$(agent_pane z1); zs=$(tmux -L "$S" display-message -p -t "$zp" '#{session_name}')
+    zpid=$(tmux -L "$S" display-message -p -t "$zp" '#{pane_pid}')
     mkdir -p "$t/home/.claude/sessions"
     reg() { printf '{"pid":%s,"name":"zz-1","status":"%s","waitingFor":"%s","startedAt":1,"statusUpdatedAt":%s000,"tmux":"%s:@0.%s"}\n' \
-              $$ "$1" "${2-}" "$(($(date +%s) - ${3:-0}))" "$zs" "$zp" > "$t/home/.claude/sessions/1.json"; }
+              "${RPID:-$zpid}" "$1" "${2-}" "$(($(date +%s) - ${3:-0}))" "$zs" "$zp" > "$t/home/.claude/sessions/1.json"; }
     ht() { HOME=$t/home "$BIN" "$@"; }
+    # a Claude of another board names the same "awb:@0.%N" but runs outside this pane
+    RPID=$$ reg busy
+    ht peers | grep -Eq "^z1 $zp - not-claude$" || die "selftest: another server's session with the same pane id matched"
     reg waiting "permission prompt"
     ht render | grep -Fq "待批准：permission prompt" || die "selftest: permission dialog not on the board"
     ht stale | grep -Eq '^z1 [0-9]+ waiting$' || die "selftest: permission dialog not in stale"
@@ -2483,6 +2507,8 @@ main() {
 cmd=${1:-}; shift 2>/dev/null || true
 # `awb up --help` used to start a session and create AWB_DIR in the cwd; help never has side effects
 case "${1:-}" in -h|--help) usage; exit 0 ;; esac
+case "$cmd" in ""|-h|--help|help|version|--version|-V) ;;
+  *) command -v jq >/dev/null 2>&1 || die "jq is required: brew install jq (macOS), apt install jq (Debian/Ubuntu)" ;; esac
 case "$cmd" in
   up)       up "$@" ;;
   down)     init_dir   # only the session awb up made for this board, never the server it runs in
@@ -2508,6 +2534,8 @@ case "$cmd" in
               for _x; do _i=$((_i + 1)); [ $_i -le $_k ] && _a="$_a $(q "$_x")"; done
               eval "set -- $_a"
             fi
+            [ -z "${4:-}" ] || { init_dir; [ -s "$EV" ] && grep -F "\"id\":\"$4\"" "$EV" | grep -qF '"t":"task"'; } \
+              || die "no task $4 to be the parent of $1 (create it first: $PROG task $4 STATE TEXT)"
             append '{t:"task",time:$time,ep:$ep,id:$id,state:$st,text:$text,parent:$par,owner:$own,probe:$pc,pdir:$pd}' \
               --arg id "$1" --arg st "$2" --arg text "${3:-}" --arg par "${4:-}" --arg own "${5:-}" \
               --arg pc "$pcmd" --arg pd "$pdir" ;;
@@ -2530,9 +2558,11 @@ case "$cmd" in
             else while :; do nudge_round; sleep "${AWB_NUDGE_POLL:-60}"; done; fi ;;
   news)     _nk=; if [ "${1:-}" = --key ]; then _nk=${2:-}; shift 2 || die "--key needs a key"; fi
             [ $# -ge 1 ] || die "usage: $PROG news [--key KEY] TEXT"
+            case $1 in --*) die "unknown option: $1" ;; esac
             append '{t:"news",time:$time,ep:$ep,text:$text} + (if $k == "" then {} else {key:$k} end)' \
               --arg text "$*" --arg k "$_nk" ;;
   goal)     [ $# -ge 1 ] || die "usage: $PROG goal TEXT"
+            case $1 in --*) die "unknown option: $1" ;; esac
             append '{t:"goal",time:$time,ep:$ep,text:$text}' --arg text "$*" ;;
   metric)   # --at EPOCH records a past reading at its own time; --step N is its x (a training step)
             _at=; _x=; _by=; _ref=
@@ -2541,6 +2571,7 @@ case "$cmd" in
               --step) _x=${2:-}; shift 2 || die "--step needs a number" ;;
               --by) _by=${2:-}; shift 2 || die "--by needs an epoch" ;;
               --ref) _ref=1; shift ;;
+              --*) die "unknown option: $1" ;;
               *) break ;; esac; done
             [ $# -ge 3 ] || die "usage: $PROG metric [--at EPOCH] [--step N] [--by EPOCH] [--ref] NAME VALUE TARGET [NOTE]"
             # jq tonumber rejects '1.2.3'/'-'/''; the finite/self-equal guard
@@ -2563,27 +2594,36 @@ case "$cmd" in
                     + (if $ref == "" then {} else {ref:true} end)' \
               --arg name "$1" --arg value "$2" --arg target "$3" --arg note "${4-}" --arg at "$_at" --arg x "$_x" --arg by "$_by" --arg ref "$_ref" ;;
   now)      [ $# -ge 2 ] || die "usage: $PROG now ID MILESTONE"
+            need_agent "$1"
             append '{t:"now",time:$time,ep:$ep,id:$id,text:$text}' --arg id "$1" --arg text "${2-}" ;;
   done)     [ $# -ge 1 ] || die "usage: $PROG done ID [TEXT]"
+            need_agent "$1"
             append '{t:"done",time:$time,ep:$ep,id:$id,text:(if $text == "" then null else $text end)}' \
               --arg id "$1" --arg text "${2:-}" ;;
   block)    [ $# -ge 2 ] || die "usage: $PROG block ID REASON"
+            need_agent "$1"
             append '{t:"status",time:$time,ep:$ep,id:$id,status:"blocked",reason:$r}' \
               --arg id "$1" --arg r "${2-}" ;;
   unblock)  [ $# -ge 1 ] || die "usage: $PROG unblock ID"
+            need_agent "$1"
             append '{t:"status",time:$time,ep:$ep,id:$id,status:"running",reason:""}' --arg id "$1" ;;
   fail)     [ $# -ge 2 ] || die "usage: $PROG fail ID REASON"
+            need_agent "$1"
             append '{t:"status",time:$time,ep:$ep,id:$id,status:"failed",reason:$r}' \
               --arg id "$1" --arg r "${2-}" ;;
   finish)   [ $# -ge 1 ] || die "usage: $PROG finish ID [NOTE]"
+            need_agent "$1"
             append '{t:"done",time:$time,ep:$ep,id:$id,text:(if $text == "" then null else $text end)}' \
               --arg id "$1" --arg text "${2:-}"
             append '{t:"status",time:$time,ep:$ep,id:$id,status:"done",reason:""}' --arg id "$1" ;;
   status)   [ $# -ge 2 ] || die "usage: $PROG status ID running|blocked|failed|done [REASON]"
+            need_agent "$1"
             case $2 in running|blocked|failed|done) ;; *) die "status: running|blocked|failed|done" ;; esac
             append '{t:"status",time:$time,ep:$ep,id:$id,status:$st,reason:$r}' \
               --arg id "$1" --arg st "$2" --arg r "${3:-}" ;;
-  reset)    init_dir; : > "$EV" ;;
+  reset)    init_dir   # the log is the only record: keep a copy, then clear in place (watch keeps its file)
+            _b=$EV.$(date +%s).bak; [ -s "$EV" ] && { cp "$EV" "$_b"; echo "cleared; the old log is $_b"; }
+            : > "$EV" ;;
   render)   init_dir; render ;;
   replay)   replay "$@" ;;
   view)     set -- $(dims); brief_view "${1:-80}" "${2:-24}" ;;   # a snapshot on stdin, drawn as the brief view
@@ -2610,7 +2650,7 @@ case "$cmd" in
   peers)    peers ;;
   selftest) selftest ;;
   ""|-h|--help|help) usage ;;
-  *) usage; die "unknown command: $cmd" ;;
+  *) die "unknown command: $cmd (commands: $PROG help)" ;;
 esac
 }
 
