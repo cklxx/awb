@@ -478,7 +478,7 @@ else
   # the next open steps of the main line
   | ([ $trees[] | .kids[] | select(.state | IN("done","drop") | not) ][:3]
      # a task dispatched with awb send and not yet replied to is work in flight toward the goal
-     + [ $raw | map(select(type == "object" and (.id | type) == "string" and (.t == "now" or .t == "done" or .t == "start"
+     + [ $raw | map(select(type == "object" and (.id | type) == "string" and (((.t == "now" or .t == "done") and (.key // "") != "") or .t == "start"
                  or (.t == "status" and (.status == "failed" or .status == "done")))))
          | group_by(.id)[] | last | select(.t == "now" and (.key // "") != "")
          | {text:"\(($s.agents[.id].name) // .id)：\(.text)", state:"wip", prog:null} ]) as $next
@@ -1205,12 +1205,14 @@ open_ms() {
 # dispatch/report loop with a worker over the session socket (model/tla/AwbLoop.tla):
 # one open task per worker, each with a key its reply must echo; an idle notice never closes a
 # task: the first makes the main ask once, the second marks the task blocked for the user.
-# the open task of an agent: its last keyed `now`, unless a milestone, a restart (start) or a
-# final status (failed, done) came after it. blocked keeps it open: the reply may still come.
+# the open task of an agent: its last keyed `now`, unless its reply (a keyed done), a restart
+# (start) or a final status (failed, done) came after it. The worker's own milestones (now/done
+# without a key) never close it: a worker that reported a stage had its reply refused as stale.
+# blocked keeps it open: the reply may still come.
 open_key() {
   [ -s "$EV" ] || return 0
   grep -F "\"id\":\"$1\"" "$EV" | jq -R -s -r '[split("\n")[] | fromjson? | select(type == "object")
-      | select(.t == "now" or .t == "done" or .t == "start" or (.t == "status" and (.status == "failed" or .status == "done")))]
+      | select(((.t == "now" or .t == "done") and (.key // "") != "") or .t == "start" or (.t == "status" and (.status == "failed" or .status == "done")))]
     | last // {} | select(.t == "now") | .key // empty'
 }
 send() {
@@ -1817,7 +1819,8 @@ selftest() {
     || die "selftest: AWB_NOW did not render the board as of that time"
   # a task dispatched with awb send shows under 下一步 until its reply closes it
   sd=$t/sent; mkdir -p "$sd"; sn() { AWB_DIR=$sd "$BIN" "$@"; }
-  sn start d1 reviewer >/dev/null; sm=$(sn send d1 "review the manual"); sk=$(printf '%s' "$sm" | sed -n '1s/^\[awb d1#\([0-9]*\)\].*/\1/p')
+  sn start d1 reviewer >/dev/null; sm=$(sn send d1 "review the manual" 2>/dev/null); sk=$(printf '%s' "$sm" | sed -n '1s/^\[awb d1#\([0-9]*\)\].*/\1/p')
+  sn now d1 "reading"; sn done d1 "read"    # the worker's own milestones keep the task open
   sn snapshot | jq -e '[.next[].text] == ["reviewer：review the manual"]' >/dev/null || die "selftest: a dispatched task is not under 下一步"
   sn reply d1 "$sk" "3 findings" >/dev/null
   sn snapshot | jq -e '.next == []' >/dev/null || die "selftest: a replied task is still under 下一步"
