@@ -52,7 +52,7 @@ def fold:
 reduce (. // [])[] as $e (
   {goal:"", agents:{}, gorder:{}, gseen:[], tasks:{}, torder:[], news:[], checks:{}, probes:{}};
   if   $e.t == "goal" then .goal = $e.text
-  elif $e.t == "news" then .news += [{text:$e.text, time:($e.time // "")}]
+  elif $e.t == "news" then .news += [{text:$e.text, time:($e.time // ""), key:($e.key // "")}]
   elif $e.t == "task" then
     (if .tasks[$e.id] == null then .torder += [$e.id] else . end)
     | .tasks[$e.id] = ((.tasks[$e.id] // {id:$e.id, state:"todo", text:$e.id, parent:"", owner:""})
@@ -117,7 +117,8 @@ reduce (. // [])[] as $e (
   else . end);
 '
 
-JQ_RENDER=$JQ_FOLD'
+# formatting helpers shared by the board views (JQ_RENDER) and the brief view (JQ_BRIEF)
+JQ_DEFS='
 def wide($c):
   ($c >= 4352 and $c <= 4447) or ($c >= 11904 and $c <= 42191)
   or ($c >= 44032 and $c <= 55203) or ($c >= 63744 and $c <= 64255)
@@ -177,7 +178,9 @@ def wrap($n):
             else .lines[-1] += [$c] | .w += $cw end)
         | [.lines[] | implode])
   end;
+'
 
+JQ_RENDER=$JQ_FOLD$JQ_DEFS'
 ($w   | if . < 40 then 40 elif . > 240 then 240 else . end) as $w |
 ($h   | if . < 12 then 12 elif . > 5000 then 5000 else . end) as $h |
 ($w - 1) as $inner |
@@ -459,17 +462,11 @@ else
   | ([ $trees[] | .kids[] | select(.state | IN("done","drop") | not) ][:3]) as $next
   # the tree below leaves out the steps already shown as 下一步
   | [ $trees[] | .kids |= map(select(. as $k | $next | index([$k]) | not)) ] as $trees
-  # news: two lines of the same minute about one reading (an automatic feed and a
-  # hand-written line) show once, the latest: the numbers of one line include a decimal and all
-  # of them appear in the other line. A shared step number alone ("15000") is not a reading.
-  | (def nums: [scan("[0-9]+(?:\\.[0-9]+)?")] | unique;
-     def sub($a; $b): ($a | any(contains("."))) and ($a | inside($b));
-     reduce ($s.news | reverse[]) as $n ([];
-       ($n.text | nums) as $nn
-       | if any(.[]; .time[0:5] == $n.time[0:5]
-             and ((.text | nums) as $o | sub($o; $nn) or sub($nn; $o)))
-         then . else . + [$n] end)
-     | reverse) as $news
+  # news: one line per fact. Lines written with the same key (awb news --key) are one fact,
+  # and only the latest is shown; lines without a key are all shown.
+  | ([$s.news | to_entries[] | .key as $i | .value | (.key // "") as $k
+      | select($k == "" or ([$s.news[($i + 1):][] | .key // ""] | index([$k]) | not))
+      | {text, time}]) as $news
   | ([ (if ($need | length) > 0 then "需要你 \($need | length) 件" else "无需你处理" end),
        # a judgement only: the numbers are on the metric line and the footer
        (if $M == null or $M.value == null or $M.target == null then empty
@@ -480,80 +477,103 @@ else
         elif $D.metric < 0 then "\($M.name) 24 小时在降"
         else "\($M.name) 24 小时没变" end),
        (if ($anom | length) > 0 then "异常 \($anom | length)" else empty end) ] | join(" · ")) as $headline
-  | if $view == "snapshot" then
-      [ {goal:$s.goal, title:$G.title, about:$G.about, headline:$headline, quiet:$quiet,
-         now:$nowep, clock:$now, progress:$tp, hour:{milestones:$m1, tasks:$t1}, day:$D,
-         verified:{v:$mver, n:($mdone | length)}, running:$nrun, metric:$M, need:$need,
-         anomalies:$anom, next:$next, holds:$holds,
-         agents:$act, idle:$idl, tasks:$trees, tasks_old:$nold,
-         news:$news, checks:[$s.checks[] | {id, what, ok:(all(.steps[]; .state == "ok")),
-           fail:any(.steps[]; .state == "fail"), startEp}]} | tojson ]
-    else
-  (if $m1 + $t1 > 0 then $g + "近 1 小时 里程碑 +\($m1) 任务 +\($t1)" + $rs
-   elif $nrun > 0 then $y + "近 1 小时无新里程碑" + $rs
-   else $dm + "近 1 小时无变化" + $rs end) as $move
-  | (if $M == null then []
-     else (if $M.frac != null then " ▕" + bar($M.frac; 1; 10) + "▏" + (($M.frac * 100) | floor | tostring) + "%" else "" end) as $bar
-       | ([$M.history[].value] | .[-12:]) as $vals
-       | (if ($vals | length) >= 2 then " " + ($vals | spark([$M.target // 0, max] | max)) else "" end) as $sp
-       | (if $M.stale then "  最新读数 \($M.age | ago)前" else "" end) as $old
-       | (if $M.v0 != null then "  起 \($M.v0) · \($M.since | ago)前"
-            + (if $M.eta != null then " · 按均速约 \($M.eta | ago)达标（估）"
-               elif $M.late then " · 按当前趋势截止前达不到" else "" end) else "" end) as $tr
-       | ($old + $tr) as $tr
-       | ["│ " + $cy + ($M.name | clip(14)) + $rs + " \($metric.value) / \($metric.target)" + $bar + $sp
-          + $dm + ($tr | clip([$bw - 50, 0] | max)) + $rs]
-         + (if $M.note != "" then ["│   " + $dm + ($M.note | clip($bw - 6)) + $rs] else [] end)
-     end) as $mlines
-  | ("╰─ 进度 " + bar($tp.d; $tp.t; 16) + " \($tp.d)/\($tp.t)" + "   " + $now
-     + (if $quiet >= 60 then " · 更新于 \($quiet | ago)前" else "" end)) as $bfoot
-  | (if $G.title == "" then $top
-     else ($G.title | clip($bw - 6)) as $tt | "╭─ " + $tt + " " + ("─" * ([$bw - 5 - ($tt | dwidth), 2] | max)) end) as $btop
-  | ([$G.about[] | wrap($bw - 4)[] | "│ " + $dm + . + $rs]) as $babout
-  | ("│ " + (if ($need | length) > 0 then $y elif ($anom | length) > 0 then $cy else $g end) + "▶ " + $headline + $rs) as $bhead
-  | ("   " + $move + $dm + " · 里程碑 已核 \($mver) / 自报 \(($mdone | length) - $mver)" + $rs) as $bstat
-  | ([ $holds[] | "   " + $dm + "资源 " + $rs + .res + " → " + (($s.agents[.owner].name) // .owner)
-       + $dm + " · 占 " + (($nowep - .since) | sdur) + (if .note != "" then " · " + .note else "" end) + $rs
-       | clip($bw) ]) as $holdb
-  | (if ($need | length) > 0 then ["", $y + "需要你（\($need | length)）" + $rs]
-       + [ $need[] | (if .age != null then $dm + " · 已 \(.age | ago)" + $rs else "" end) as $ag
-                     | if .kind == "wait" then $y + "  ▲ " + $rs + (.name | clip(10) | pad(10)) + " " + (.text | clip($bw - 16))
-                       elif .kind == "fail" then $r + "  ✗ " + $rs + (.name | clip(10) | pad(10)) + " " + (.text | clip($bw - 26)) + $ag
-                       else $y + "  ? " + $rs + (.text | clip($bw - 16)) + $ag end ]
-     else [] end) as $needb
-  | (if ($trees | length) + $nold == 0 then [] else [""]
-     + [ $trees[] | . as $tr
-         | $cy + "■ " + ($tr.text | clip($bw - 25) | pad($bw - 25)) + $rs + " " + bar($tr.d; $tr.t; 12) + $dm + " \($tr.d)/\($tr.t)"
-           + (if $tr.quiet then " · \($tr.quiet | ago)没更新" else "" end) + $rs,
-           (if $tr.folded > 0 then $dm + "  ├─ ✓ 另 \($tr.folded) 项已完成" + $rs else empty end),
-           (range(0; $tr.kids | length) as $i | $tr.kids[$i] as $t | ($TI[$t.state] // ["•",$dm]) as $ic
-            | (if $i == ($tr.kids | length) - 1 then "  └─ " else "  ├─ " end) as $pre
-            | $ic[1] + $pre + $ic[0] + " " + ($t.text | clip($bw - 26) | pad($bw - 26)) + $rs
-              + (if $t.prog then bar($t.prog.d; $t.prog.t; 6) + $dm + " \($t.prog.d)/\($t.prog.t)" + $rs else "" end)) ]
-     + (if $nold > 0 then [$dm + "✓ 另有 \($nold) 项已完成（1 小时前）" + $rs] else [] end) end) as $tasksb
-  | (if ($next | length) > 0 then ["", $cy + "下一步" + $rs]
-       + [ $next[] | ($TI[.state] // ["•",$dm]) as $ic | "  " + $ic[1] + $ic[0] + $rs + " " + (.text | clip($bw - 6)) ]
-     else [] end) as $nextb
-  | (if ($anom | length) > 0 then ["", $y + "异常（\($anom | length)）" + $rs]
-       + [ $anom[] | "  " + $y + "! " + $rs + (.text | clip($bw - 6)) ] else [] end) as $anomb
-  | ("   " + $dm + "24 小时：里程碑 +\($D.milestones)（已核 \($D.verified)） · 任务 +\($D.tasks)"
-     + (if $D.metric != null then " · \($M.name) " + (if $D.metric >= 0 then "+" else "" end) + ($D.metric * 100 | round / 100 | tostring) else "" end)
-     + $rs) as $bday
-  | ([$btop] + $babout + [$bhead] + $mlines + [($bfoot | clip($bw)), $bstat] + $holdb
-     + $needb + $nextb + $anomb + ["", $bday]
-     + (if ($news | length) > 0 then ["", $g + "进展" + $rs]
-          + [ $news[-3:] | reverse[] | "  ✓ " + $dm + .time[0:5] + $rs + " " + (.text | clip($bw - 12)) ] else [] end)
-     + $tasksb + $chk)
-    end
+  | [ {goal:$s.goal, title:$G.title, about:$G.about, headline:$headline, quiet:$quiet,
+       now:$nowep, clock:$now, progress:$tp, hour:{milestones:$m1, tasks:$t1}, day:$D,
+       verified:{v:$mver, n:($mdone | length)}, running:$nrun, metric:$M, need:$need,
+       anomalies:$anom, next:$next, holds:$holds,
+       agents:$act, idle:$idl, tasks:$trees, tasks_old:$nold,
+       news:$news,
+       checks:[$s.checks[] | {id, name:(($s.agents[.id].name) // .id), what, startEp,
+         ok:(all(.steps[]; .state == "ok")), fail:any(.steps[]; .state == "fail"),
+         steps:[.steps[] | {s, state, el:((.ep1 // $nowep) - .ep0), note}]}],
+       violations:[$vs[] | {id:.[0], name:(($s.agents[.[0]].name) // .[0]), kind:.[1]}]} | tojson ]
 end
+| .[:$h] | .[]
+'
+
+# the brief view, drawn from the snapshot alone (awb snapshot); the Lark card is the other view
+# of it. README "What the brief view shows" is the rule each line is held to.
+JQ_BRIEF=$JQ_DEFS'
+({"todo":["○",$dm],"wip":["◔",$cy],"review":["◑",$cy],"blocked":["▲",$y],
+  "done":["✓",$g],"drop":["–",$dm],"ask":["?",$y],"unknown":["?",$r]}) as $TI
+| ([$w - 1, 100] | min) as $bw
+| . as $S | .metric as $M | .day as $D
+| (if $S.title == "" then "╭─ GOAL " + ("─" * ($bw - 8))
+   else ($S.title | clip($bw - 6)) as $tt | "╭─ " + $tt + " " + ("─" * ([$bw - 5 - ($tt | dwidth), 2] | max)) end) as $btop
+| ([$S.about[] | wrap($bw - 4)[] | "│ " + $dm + . + $rs]) as $babout
+| ("│ " + (if ($S.need | length) > 0 then $y elif ($S.anomalies | length) > 0 then $cy else $g end)
+   + "▶ " + $S.headline + $rs) as $bhead
+| (if $M == null then []
+   else (if $M.frac != null then " ▕" + bar($M.frac; 1; 10) + "▏" + (($M.frac * 100) | floor | tostring) + "%" else "" end) as $bar
+     | ([$M.history[].value] | .[-12:]) as $vals
+     | (if ($vals | length) >= 2 then " " + ($vals | spark([$M.target // 0, max] | max)) else "" end) as $sp
+     | (if $M.stale then "  最新读数 \($M.age | ago)前" else "" end) as $old
+     | (if $M.v0 != null then "  起 \($M.v0) · \($M.since | ago)前"
+          + (if $M.eta != null then " · 按均速约 \($M.eta | ago)达标（估）"
+             elif $M.late then " · 按当前趋势截止前达不到" else "" end) else "" end) as $tr
+     | ["│ " + $cy + ($M.name | clip(14)) + $rs + " \($M.value) / \($M.target)" + $bar + $sp
+        + $dm + (($old + $tr) | clip([$bw - 50, 0] | max)) + $rs]
+       + (if $M.note != "" then ["│   " + $dm + ($M.note | clip($bw - 6)) + $rs] else [] end)
+   end) as $mlines
+| ("╰─ 进度 " + bar($S.progress.d; $S.progress.t; 16) + " \($S.progress.d)/\($S.progress.t)" + "   " + $S.clock
+   + (if $S.quiet >= 60 then " · 更新于 \($S.quiet | ago)前" else "" end)) as $bfoot
+# movement, one line: the last hour, the last 24 hours, and how much of it is verified
+| ((if $S.hour.milestones + $S.hour.tasks > 0 then $g + "近 1 小时 里程碑 +\($S.hour.milestones) 任务 +\($S.hour.tasks)" + $rs
+    elif $S.running > 0 then $y + "近 1 小时无新里程碑" + $rs
+    else $dm + "近 1 小时无变化" + $rs end)
+   + $dm + " · 24 小时 里程碑 +\($D.milestones) 任务 +\($D.tasks)"
+   + (if $D.metric != null then " \($M.name) " + (if $D.metric >= 0 then "+" else "" end) + ($D.metric * 100 | round / 100 | tostring) else "" end)
+   + " · 里程碑已核 \($S.verified.v)/\($S.verified.n)" + $rs) as $move
+| (if ($S.need | length) > 0 then ["", $y + "需要你（\($S.need | length)）" + $rs]
+     + [ $S.need[] | (if .age != null then $dm + " · 已 \(.age | ago)" + $rs else "" end) as $ag
+         | if .kind == "wait" then $y + "  ▲ " + $rs + (.name | clip(10) | pad(10)) + " " + (.text | clip($bw - 16))
+           elif .kind == "fail" then $r + "  ✗ " + $rs + (.name | clip(10) | pad(10)) + " " + (.text | clip($bw - 26)) + $ag
+           else $y + "  ? " + $rs + (.text | clip($bw - 16)) + $ag end ]
+   else [] end) as $needb
+| (if ($S.next | length) > 0 then ["", $cy + "下一步" + $rs]
+     + [ $S.next[] | ($TI[.state] // ["•",$dm]) as $ic | "  " + $ic[1] + $ic[0] + $rs + " " + (.text | clip($bw - 6)) ]
+   else [] end) as $nextb
+| (if ($S.anomalies | length) > 0 then ["", $y + "异常（\($S.anomalies | length)）" + $rs]
+     + [ $S.anomalies[] | "  " + $y + "! " + $rs + (.text | clip($bw - 6)) ] else [] end) as $anomb
+| (if ($S.news | length) > 0 then ["", $g + "进展" + $rs]
+     + [ $S.news[-3:] | reverse[] | "  ✓ " + $dm + .time[0:5] + $rs + " " + (.text | clip($bw - 12)) ] else [] end) as $newsb
+| (if ($S.tasks | length) + $S.tasks_old == 0 then [] else [""]
+   + [ $S.tasks[] | . as $tr
+       | $cy + "■ " + ($tr.text | clip($bw - 25) | pad($bw - 25)) + $rs + " " + bar($tr.d; $tr.t; 12) + $dm + " \($tr.d)/\($tr.t)"
+         + (if $tr.quiet then " · \($tr.quiet | ago)没更新" else "" end) + $rs,
+         (if $tr.folded > 0 then $dm + "  ├─ ✓ 另 \($tr.folded) 项已完成" + $rs else empty end),
+         (range(0; $tr.kids | length) as $i | $tr.kids[$i] as $t | ($TI[$t.state] // ["•",$dm]) as $ic
+          | (if $i == ($tr.kids | length) - 1 then "  └─ " else "  ├─ " end) as $pre
+          | $ic[1] + $pre + $ic[0] + " " + ($t.text | clip($bw - 26) | pad($bw - 26)) + $rs
+            + (if $t.prog then bar($t.prog.d; $t.prog.t; 6) + $dm + " \($t.prog.d)/\($t.prog.t)" + $rs else "" end)) ]
+   + (if $S.tasks_old > 0 then [$dm + "✓ 另有 \($S.tasks_old) 项已完成（1 小时前）" + $rs] else [] end) end) as $tasksb
+| (($S.checks | sort_by(-.startEp) | .[:3]) as $cks
+   | (if ($cks | length) == 0 then [] else ["", $g + "验收" + $rs]
+      + [ $cks[] | .steps as $ss
+          | (if .fail then ["✗",$r] elif any($ss[]; .state == "run") then ["◔",$cy] else ["⊢",$g] end) as $ov
+          | ([ $ss[] | ({"ok":["✓",$g],"fail":["✗",$r],"run":["◔",$cy]}[.state] // ["·",$dm]) as $i
+               | $i[1] + .s + " " + $i[0] + $rs + (if .state == "run" then $dm + " " + (.el | sdur) + $rs else "" end) ]
+             | join($dm + " → " + $rs)) as $chain
+          | ([$ss[] | select(.state == "fail") | .note] | first // "") as $why
+          | "  " + $ov[1] + $ov[0] + $rs + " " + (.name | clip(10) | pad(10)) + " "
+            + $dm + (.what | clip(18) | pad(18)) + $rs + " " + $chain + $dm + "  " + ([$ss[].el] | add // 0 | sdur) + $rs,
+            (if $why != "" then "    " + $r + "└ " + ($why | clip($bw - 8)) + $rs else empty end) ] end)
+   + (if ($S.violations | length) == 0 then [] else ["", $r + "审计违规（Lean 监控）" + $rs]
+      + [ $S.violations[] | "  " + $r + "✗ " + $rs + (.name | clip(10) | pad(10)) + " "
+          + ({"verified-without-passing-check":"验收标记前没有通过的验收（疑似伪造）",
+              "pr-without-passing-check":"没有通过的验收就开了 PR",
+              "done-while-check-rejected":"验收被拒后仍报完成"}[.kind] // .kind) ] end)) as $chk
+| [$btop] + $babout + [$bhead] + $mlines + [($bfoot | clip($bw)), "   " + $move]
+  + $needb + $nextb + $anomb + $newsb + $tasksb + $chk
 | .[:$h] | .[]
 '
 
 dims() {
   if [ -n "${AWB_ROWS:-}" ] && [ -n "${AWB_COLS:-}" ]; then
     echo "$AWB_COLS $AWB_ROWS"
-  elif [ -n "${TMUX_PANE:-}" ]; then
-    # $TMUX_PANE names a pane of the server this process runs in ($TMUX); tm would prefer AWB_DIR's socket
+  elif [ -n "${TMUX:-}" ] && [ -n "${TMUX_PANE:-}" ]; then
+    # $TMUX_PANE names a pane of the server this process runs in ($TMUX); tm would prefer AWB_DIR's socket.
+    # Without $TMUX the default server answers, with the size of some other pane of the same id
     tmux display-message -p -t "$TMUX_PANE" '#{pane_width} #{pane_height}' 2>/dev/null
   else
     stty size 2>/dev/null | awk '{print $2, $1}'
@@ -610,15 +630,26 @@ render() {
     diffs=$(jq -Rn '[inputs | select(length > 0) | split(" ")
              | {id:.[0], hash:.[1], ep:(.[2] | tonumber)}]' < "$AWB_DIR/diffs")
   else diffs='[]'; fi
+  # the brief view is drawn from the snapshot only; the full view renders the fold itself
+  _v=${AWB_VIEW:-brief}; [ "$_v" = full ] || _v=snapshot
   events_json | jq -r --arg viol "$viol" \
     --argjson w "$cols" --argjson h "$rows" \
     --arg now "$(date +$TS_FMT)" --argjson nowep "$(date +%s)" \
-    --arg prog "$PROG" --argjson live "$live" --arg view "${AWB_VIEW:-brief}" --arg stale "${AWB_STALE:-600}" \
+    --arg prog "$PROG" --argjson live "$live" --arg view "$_v" --arg stale "${AWB_STALE:-600}" \
     --argjson diffs "$diffs" --argjson frz "${AWB_FROZEN:-900}" --argjson fresh "${AWB_PROBE_FRESH:-600}" \
     --argjson mstale "${AWB_METRIC_STALE:-21600}" --argjson tstale "${AWB_TASK_STALE:-21600}" --argjson sess "$(sessions_json)" \
     --arg g  "${ESC}[32m"  --arg cy "${ESC}[36m" --arg y "${ESC}[33m" \
     --arg r  "${ESC}[31m"  --arg dm "${ESC}[2m"  --arg rs "${ESC}[0m" \
-    "$JQ_RENDER"
+    "$JQ_RENDER" |
+  if [ "${AWB_VIEW:-brief}" = brief ]; then brief_view "$cols" "$rows"; else cat; fi
+}
+
+# the brief view of a snapshot on stdin (awb snapshot | awb brief-view renders the same board)
+brief_view() {
+  jq -r --argjson w "$1" --argjson h "$(( $2 < 12 ? 12 : $2 ))" \
+    --arg g  "${ESC}[32m"  --arg cy "${ESC}[36m" --arg y "${ESC}[33m" \
+    --arg r  "${ESC}[31m"  --arg dm "${ESC}[2m"  --arg rs "${ESC}[0m" \
+    "$JQ_BRIEF"
 }
 
 # no-code-change detection: runs on the nudge loop's cadence AWB_NUDGE_POLL
@@ -1191,7 +1222,7 @@ merge() {
     [ "$1" != MERGED ] || return 0
     if [ "$3" = approve ] && [ "$4" = green ]; then
       gh pr merge "$n" "--${AWB_MERGE_METHOD:-merge}" --match-head-commit "$2" || die "merge of #$n refused"
-      append '{t:"news",time:$time,ep:$ep,text:$x}' --arg x "PR #$n merged (head ${2%"${2#????????}"})"
+      append '{t:"news",time:$time,ep:$ep,text:$x,key:$k}' --arg k "pr#$n" --arg x "PR #$n merged (head ${2%"${2#????????}"})"
       echo "#$n merged"; return 0
     fi
     [ "$4" != red ] || [ "$3" != approve ] || die "#$n: approved but checks are red"
@@ -1476,7 +1507,7 @@ Chat-driven: you talk to one Claude (the main agent); it keeps the board and run
   $PROG stale                       print "ID MINUTES" for running agents silent >= AWB_STALE,
                                     and "ID MINUTES waiting" for agents on a permission dialog
   $PROG nudge [--once]              remind silent agents in their pane ($AWB_DIR/panes: "ID PANE")
-  $PROG news TEXT                   one progress line (board shows last 5)
+  $PROG news [--key KEY] TEXT       one progress line (board shows last 3); one KEY = one fact, latest shown
   $PROG metric [--at EPOCH] [--step N] [--by EPOCH] NAME VALUE TARGET [NOTE]
                                     --by: deadline; an ETA past it is not shown
                                     single value/target bar under GOAL (brief view)
@@ -1517,6 +1548,7 @@ Chat-driven: you talk to one Claude (the main agent); it keeps the board and run
                                     typecheck with standard axioms only
   $PROG render | watch              one-shot render | render loop (board pane)
   $PROG snapshot                    the brief view as JSON (awb-lark builds its card from it)
+  $PROG view                        draw a snapshot from stdin as the brief view
   $PROG reset                       clear all events (fresh board)
   $PROG selftest
 EOF
@@ -1553,7 +1585,7 @@ selftest() {
   "$BIN" task l1 done "" r
   out=$(AWB_VIEW=full "$BIN" render)
   brief=$("$BIN" render)
-  for s in "■ root" "进度" ; do printf "%s" "$brief" | grep -Fq -- "$s" || die "selftest: brief missing $s"; done
+  printf '%s' "$brief" | grep -Fq "■ root" || die "selftest: brief missing the task root"
   for s in "SHIP THE WORKBENCH" "✓ wire event log" "▸ render board" \
            "▲ waiting on review" "2 agents" "✓0" "◔1" "▲1" "◆ backend" "◆ frontend" "■ root" "├─ ✓ leaf" "└─ ◔ open" "1/2 任务"; do
     printf '%s' "$out" | grep -Fq -- "$s" || die "selftest: missing '$s'"
@@ -1577,39 +1609,40 @@ selftest() {
   # a backfilled older reading (--at) joins the history without replacing the newest
   bb metric --at $((bn - 500000)) --step 100 tps 5 40
   ! bb metric --at yesterday tps 1 40 2>/dev/null || die "selftest: metric --at accepted a non-epoch"
+  # what the brief view shows is asserted on the snapshot it is drawn from; the drawing
+  # itself is pinned once, by the fixture test after this block
+  bs=$(bb snapshot)
+  bj() { printf '%s' "$bs" | jq -e "$1" >/dev/null || die "selftest: snapshot: $2"; }
+  bj '.title == "GOAL-TITLE" and .about == ["what-it-is line"]' "title is the goal line, about is the rest"
+  bj '.headline == "需要你 1 件 · tps 24 小时在涨 · 异常 1"' "headline is a judgement: $(printf '%s' "$bs" | jq -c .headline)"
+  bj '[.need[] | [.kind, .text]] == [["ask", "pick a config"]]' "an ask task needs you"
+  bj '[.anomalies[].text] == ["#9 卡住 waiter、waiter2"]' "two agents blocked on #9 are one bottleneck"
+  bj '[.next[].text] == ["open one"]' "the next open step"
+  bj '[.tasks[] | select(.text == "main line") | .folded, (.kids | map(.text))] == [2, ["done-3", "done-4"]]' "done steps fold, the next step leaves the tree"
+  bj '.tasks_old == 1 and ([.tasks[].text] | index("ancient root") | not)' "an old finished root folds away"
+  bj '.metric.v0 == 5 and .metric.eta != null and .hour.milestones + .hour.tasks > 0 and .day.tasks > 0' "metric trend and movement"
+  # agents appear only where they need you or are off: no per-agent rows in the drawn view
   b=$(bb render | sed 's/\x1b\[[0-9;]*m//g')
-  for s in "另 2 项已完成" "另有 1 项已完成" \
-           "近 1 小时 里程碑 +" "达标（估）" "? pick a config" "✓ done-4" \
-           "╭─ GOAL-TITLE" "│ what-it-is line" "▶ 需要你 1 件 · tps 24 小时在涨 · 异常" "异常 1" "#9 卡住 waiter、waiter2" \
-           "下一步" "◔ open one" "24 小时：里程碑 +" "起 5"; do
-    printf '%s' "$b" | grep -Fq -- "$s" || die "selftest: brief missing '$s'"; done
-  # agents appear only where they need you or are off: no per-agent rows, no agent count
-  for s in "等：" "等 等" "ancient root" "done-1" "tuning kernel" "○ 空闲" "agent  ◔"; do
+  for s in "tuning kernel" "○ 空闲" "agent  ◔"; do
     ! printf '%s' "$b" | grep -Fq -- "$s" || die "selftest: brief shows '$s'"; done
-  printf '%s' "$b" | grep -Eq '[▁▂▃▄▅▆▇█]{3}' || die "selftest: metric sparkline missing"
   bb snapshot | jq -e '.metric.value == 25 and ([.metric.history[].value] == [5, 10, 20, 25])
     and ([.metric.history[].x] == [100, null, null, null])' >/dev/null || die "selftest: metric --at/--step history"
   # readings all in one second give no time-to-target estimate
   bd2=$t/brief2; mkdir -p "$bd2"
   for v in 1 2 3; do AWB_DIR=$bd2 "$BIN" metric he $v 30; done
   AWB_DIR=$bd2 "$BIN" snapshot | jq -e '.metric.eta == null' >/dev/null || die "selftest: an estimate from readings in one second"
-  # a step shown as 下一步 is not repeated in the tree below it
-  [ "$(printf '%s\n' "$b" | grep -c 'open one')" = 1 ] || die "selftest: a 下一步 step repeated in the task tree"
-  # news about one reading in the same minute shows once; another reading or a bare step does not merge
-  bd4=$t/brief4; mkdir -p "$bd4"
-  for n in "step 15000 checkpoint saved" "step 15000 val loss 1.888" "val 1.888 at 15000, grad 0.55 ok" "val loss 1.901 at 15500"; do
-    AWB_DIR=$bd4 "$BIN" news "$n"; done
-  [ "$(AWB_DIR=$bd4 "$BIN" snapshot | jq -c '[.news[].text]')" = '["step 15000 checkpoint saved","val 1.888 at 15000, grad 0.55 ok","val loss 1.901 at 15500"]' ] \
-    || die "selftest: news about one reading not shown once"
-  # the headline is a judgement; the numbers stay on the metric line
-  ! printf '%s\n' "$b" | grep '▶' | grep -Fq '25/40' || die "selftest: headline repeats the metric numbers"
+  # news: lines with one key are one fact, the latest shows; lines without a key all show
+  bd4=$t/brief4; mkdir -p "$bd4"; nb() { AWB_DIR=$bd4 "$BIN" news "$@"; }
+  nb "no key"; nb --key val@15000 "feed: val 1.888"; nb "other"; nb --key val@15000 "val 1.888, grad ok"; nb --key ck "saved"
+  [ "$(AWB_DIR=$bd4 "$BIN" snapshot | jq -c '[.news[].text]')" = '["no key","other","val 1.888, grad ok","saved"]' ] \
+    || die "selftest: news with one key not shown once: $(AWB_DIR=$bd4 "$BIN" snapshot | jq -c '[.news[].text]')"
   # an estimate past the deadline (--by, given once) is replaced by "misses it"; a far deadline keeps it
   bd3=$t/brief3; mkdir -p "$bd3"
   AWB_DIR=$bd3 "$BIN" metric --at $((bn - 86400)) --by $((bn + 3600)) he 1 30
   AWB_DIR=$bd3 "$BIN" metric he 2 30
   AWB_DIR=$bd3 "$BIN" snapshot | jq -e '.metric.eta == null and .metric.late' >/dev/null \
     || die "selftest: an estimate past the deadline shown"
-  AWB_DIR=$bd3 "$BIN" render | grep -Fq '截止前达不到' || die "selftest: a missed deadline not on the board"
+  AWB_DIR=$bd3 "$BIN" snapshot | jq -e '.headline | contains("截止前达不到")' >/dev/null || die "selftest: a missed deadline not in the headline"
   AWB_DIR=$bd3 "$BIN" metric --by $((bn + 86400 * 400)) he 2 30
   AWB_DIR=$bd3 "$BIN" snapshot | jq -e '.metric.eta != null and (.metric.late | not)' >/dev/null \
     || die "selftest: an estimate inside the deadline hidden"
@@ -1623,7 +1656,6 @@ selftest() {
   bd6=$t/brief6; mkdir -p "$bd6"
   AWB_DIR=$bd6 "$BIN" metric --at $((n5 - 108000)) m 10 40; AWB_DIR=$bd6 "$BIN" metric --at $((n5 - 25200)) m 20 40
   AWB_DIR=$bd6 "$BIN" snapshot | jq -e '.metric.eta == null and .metric.stale' >/dev/null || die "selftest: an estimate from a day-old reading"
-  AWB_DIR=$bd6 "$BIN" render | grep -Fq "最新读数" || die "selftest: a stale reading does not say its age"
   # an open task root nobody touched for AWB_TASK_STALE says so; a fresh one does not
   printf '{"t":"task","time":"00:00:00","ep":%s,"id":"old","state":"wip","text":"old root","parent":"","owner":""}\n' $((n5 - 30000)) >> "$bd6/events.jsonl"
   AWB_DIR=$bd6 "$BIN" task new wip "new root"
@@ -1640,7 +1672,7 @@ selftest() {
   [ "$(hb state)" = "h1 running false - 0 0" ] || die "selftest: hold events reached the fold: $(hb state)"
   AWB_STALE=0 hb snapshot | jq -e '.holds[0].owner == "h1" and any(.anomalies[]; .kind == "hold")' >/dev/null \
     || die "selftest: a quiet holder is not an anomaly"
-  hb render | grep -Fq "gpu → perf1" || die "selftest: the held resource is not on the board"
+  ! hb render | grep -Fq "gpu" || die "selftest: a resource held by a working agent is on the brief view"
   hb release gpu; ! hb holder gpu >/dev/null || die "selftest: release did not free the resource"
   AWB_STALE=0 hb snapshot | jq -e '(.holds | length) == 0 and (any(.anomalies[]; .kind == "hold") | not)' >/dev/null \
     || die "selftest: a released resource still shown"
@@ -1668,8 +1700,55 @@ selftest() {
   mpr "$(mc 1 'REQUEST CHANGES (rev, head 891472af)'),$(mc 2 "$ok")" "$(mg SUCCESS SUCCESS)"
   mm || die "selftest: merge refused an exact approve with green checks"
   grep -qx "pr merge 7 --merge --match-head-commit $mh" "$t/fgh/log" || die "selftest: merge not pinned to the head: $(cat "$t/fgh/log")"
-  [ "$(printf '%s\n' "$b" | grep -n '^需要你' | cut -d: -f1)" -lt "$(printf '%s\n' "$b" | grep -n '^异常' | cut -d: -f1)" ] \
-    || die "selftest: 需要你 not above 异常"
+  # the drawing, pinned: a fixed snapshot gives exactly this brief view. A change of wording
+  # or layout is made here once; everything else is asserted on the snapshot above.
+  fx='{"goal":"G","title":"G","about":["what it is"],"headline":"需要你 1 件 · m 按当前趋势截止前达不到 · 异常 1",
+    "quiet":120,"now":0,"clock":"12:00:00","progress":{"d":1,"t":2},"hour":{"milestones":1,"tasks":0},
+    "day":{"milestones":3,"verified":1,"tasks":2,"metric":1.5},"verified":{"v":1,"n":3},"running":1,
+    "metric":{"name":"m","value":3,"target":10,"note":"n1","frac":0.3,"history":[{"value":1},{"value":3}],
+      "v0":1,"since":90000,"eta":null,"late":true,"stale":true,"age":30000},
+    "need":[{"kind":"ask","id":"q","name":"","text":"pick one","age":600}],
+    "anomalies":[{"kind":"bottleneck","text":"#9 卡住 a、b"}],"next":[{"text":"step two","state":"wip","prog":null}],
+    "holds":[],"agents":[],"idle":[],"tasks":[{"text":"root","d":1,"t":2,"folded":0,"quiet":null,
+      "kids":[{"text":"step one","state":"done","prog":null}]}],"tasks_old":0,
+    "news":[{"text":"n-old","time":"10:00:00"},{"text":"n-new","time":"11:00:00"}],
+    "checks":[{"id":"a","name":"alpha","what":"selftest","startEp":1,"ok":false,"fail":true,
+      "steps":[{"s":"cmd","state":"fail","el":5,"note":"exit 1"}]}],"violations":[]}'
+  got=$(printf '%s' "$fx" | brief_view 80 60 | sed 's/\x1b\[[0-9;]*m//g')
+  want=$(cat <<'GOLD'
+╭─ G ─────────────────────────────────────────────────────────────────────────
+│ what it is
+│ ▶ 需要你 1 件 · m 按当前趋势截止前达不到 · 异常 1
+│ m 3 / 10 ▕███░░░░░░░▏30% ▁▃  最新读数 8小时前  起 1 · 1…
+│   n1
+╰─ 进度 ████████░░░░░░░░ 1/2   12:00:00 · 更新于 2分钟前
+   近 1 小时 里程碑 +1 任务 +0 · 24 小时 里程碑 +3 任务 +2 m +1.5 · 里程碑已核 1/3
+
+需要你（1）
+  ? pick one · 已 10分钟
+
+下一步
+  ◔ step two
+
+异常（1）
+  ! #9 卡住 a、b
+
+进展
+  ✓ 11:00 n-new
+  ✓ 10:00 n-old
+
+■ root                                                   ██████░░░░░░ 1/2
+  └─ ✓ step one                                             
+
+验收
+  ✗ alpha      selftest           cmd ✗  5s
+    └ exit 1
+GOLD
+)
+  [ "$got" = "$want" ] || { printf '%s\n' "$got" > "$t/brief.got"; diff "$t/brief.got" - <<EOF >&2
+$want
+EOF
+    die "selftest: the brief view of the fixture snapshot changed (got: $t/brief.got)"; }
 
   # single metric indicator under GOAL, render-only (the "#" id keeps it out
   # of the proven fold; `awb state` below proves no agent is created).
@@ -1703,7 +1782,7 @@ selftest() {
   "$BIN" now a1 "post-unknown-still-works"
   AWB_VIEW=full "$BIN" render | grep -Fq "post-unknown-still-works" || die "selftest: events after an unknown no-id event dropped"
   # verified vs self-reported milestones: a1 has one done, none verified yet
-  printf '%s' "$brief" | grep -Fq "里程碑 已核 0 / 自报 1" || die "selftest: brief milestone verify/self count wrong"
+  "$BIN" snapshot | jq -e '.verified == {v:0, n:1}' >/dev/null || die "selftest: milestone verified/self-reported count wrong"
   printf '%s' "$out" | grep -F "✓ wire event log" | grep -Fq "自报" || die "selftest: unverified done not marked 自报"
 
   "$BIN" now a1 "gated"
@@ -2079,7 +2158,7 @@ CHK
     tmux -L "${S}s" kill-server 2>/dev/null || true
     printf '%s\n' "$top" | grep -q '还有 .* 行' || die "selftest: a board taller than the pane shows no scroll hint"
     printf '%s\n' "$end" | grep -q 'scroll row 30' || die "selftest: G does not scroll to the last line"
-    [ "$(printf '%s\n' "$two" | sed -n 1p)" = "$(printf '%s\n' "$top" | sed -n 3p)" ] \
+    [ "$(printf '%s\n' "$two" | sed -n 2p)" = "$(printf '%s\n' "$top" | sed -n 4p)" ] \
       || die "selftest: g j j does not scroll 2 lines from the top"
     [ -z "$alive" ] || die "selftest: q does not quit the board"
   fi
@@ -2213,8 +2292,10 @@ case "$cmd" in
               | "\(.key) \((($now - .value.since) / 60) | floor) waiting"' ;;
   nudge)    init_dir; if [ "${1:-}" = "--once" ]; then nudge_once
             else while :; do nudge_once; sleep "${AWB_NUDGE_POLL:-60}"; done; fi ;;
-  news)     [ $# -ge 1 ] || die "usage: $PROG news TEXT"
-            append '{t:"news",time:$time,ep:$ep,text:$text}' --arg text "$*" ;;
+  news)     _nk=; if [ "${1:-}" = --key ]; then _nk=${2:-}; shift 2 || die "--key needs a key"; fi
+            [ $# -ge 1 ] || die "usage: $PROG news [--key KEY] TEXT"
+            append '{t:"news",time:$time,ep:$ep,text:$text} + (if $k == "" then {} else {key:$k} end)' \
+              --arg text "$*" --arg k "$_nk" ;;
   goal)     [ $# -ge 1 ] || die "usage: $PROG goal TEXT"
             append '{t:"goal",time:$time,ep:$ep,text:$text}' --arg text "$*" ;;
   metric)   # --at EPOCH records a past reading at its own time; --step N is its x (a training step)
@@ -2266,6 +2347,7 @@ case "$cmd" in
               --arg id "$1" --arg st "$2" --arg r "${3:-}" ;;
   reset)    init_dir; : > "$EV" ;;
   render)   init_dir; render ;;
+  view)     set -- $(dims); brief_view "${1:-80}" "${2:-24}" ;;   # a snapshot on stdin, drawn as the brief view
   snapshot) init_dir; ( AWB_VIEW=snapshot AWB_COLS=100 AWB_ROWS=200; export AWB_VIEW AWB_COLS AWB_ROWS; render ) ;;
   watch)    init_dir; watch ;;
   _enter)   _enter ;;

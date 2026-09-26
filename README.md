@@ -14,21 +14,28 @@ The board above (`AWB_VIEW=full`, demo data) shows the task tree, the acceptance
 each step, and per-group agents with their milestones; `⊢` marks a milestone that passed
 `awb check`; the full view tags an unverified finished milestone with a dim `自报`.
 
-The brief view (default) and the Lark card share one layout, most important first, since
-the view is cut at the pane height:
+The brief view (default) is for the person who owns the goal. A line belongs on it only if
+it is a decision that person has to make, or a change in how far the goal is; each fact
+appears once. Coordination between agents (who holds a resource, who waits for whom) shows
+only when it breaks, as a 需要你 or 异常 line. Every addition to the view is held to this.
+
+Both the brief view and the Lark card are drawn from `awb snapshot` and nothing else
+(`awb snapshot | awb view` draws the same board), in one layout, most important first,
+since the view is cut at the pane height:
 
 1. Title: the goal's first line. Its other lines say what the goal is (definition, scope).
 2. One-sentence verdict without numbers: needs you or not · whether the metric rose in 24
    hours, reached its target or misses its deadline · how many anomalies.
 3. The metric with its history and a linear time-to-target marked `（估）` (hidden past the
-   `--by` deadline), task progress, the last hour, `已核 M / 自报 K`, and how long ago the
-   board last changed.
+   `--by` deadline), task progress, how long ago the board last changed, and one movement
+   line: the last hour, the last 24 hours, and how many milestones were verified.
 4. 需要你: permission dialogs, failed or dead agents, `ask` tasks, each with how long it waited.
 5. 下一步: the main line's next open steps.
 6. 异常, one line per agent: a bottleneck (an issue or PR, `#N`, two or more blocked agents
    wait for), no code change, a session that contradicts the report, a silent agent that has
    no Claude session to report for it, a board nobody writes to.
-7. The last 24 hours in numbers, news and the task tree (folded on the card). Agents show
+7. News (the last 3; lines with one `--key` are one fact, the latest shows), the task tree
+   without the steps already under 下一步 (folded on the card), acceptance runs. Agents show
    only in 需要你 and 异常; `AWB_VIEW=full` lists every agent.
 
 ## Model
@@ -108,7 +115,8 @@ awb fail  a2 "tests red"
 # task tree and progress feed (brief view shows them)
 awb task t1 wip "build API"                  # STATE todo|wip|review|blocked|done|drop|ask
 awb task t2 todo "auth" t1 a1                # [TEXT] [PARENT] [OWNER]; re-issue to update
-awb news "API merged"                        # board shows the last 5
+awb news "API merged"                        # board shows the last 3
+awb news --key val@15000 "val loss 1.888"    # one key = one fact: a later line replaces it
 awb metric tps 32 40 "V100 target"      # brief: one value/target bar under GOAL
 
 # acceptance

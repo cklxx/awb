@@ -87,7 +87,7 @@ socket is `/tmp/awb-UID-HASH.sock`).
 |---|---|
 | `awb goal TEXT` | set the overall goal |
 | `awb task ID STATE [TEXT] [PARENT] [OWNER]` | task-tree node; STATE: todo/wip/review/blocked/done/drop/ask; re-issue the ID to update; ask = needs a human decision |
-| `awb news TEXT` | one progress line; the board shows the last 5 |
+| `awb news [--key KEY] TEXT` | one progress line; the board shows the last 3. A fact that a feed or probe may also report takes a key (`val@15000`, `ckpt@15000`): lines with one key show once, the latest |
 | `awb run [-g G] ID NAME -- CMD...` | run a command in a pane; pane closed unexpectedly → ■ dead |
 | `awb tui [-g G] ID NAME [TASK]` | resident Claude worker (command from `AWB_TUI_CMD`, default claude-db if on PATH, else claude); prints the session name when ready |
 | `awb start ID NAME [KIND] [G]` | register a non-pane / remote agent |
