@@ -20,7 +20,7 @@ appears once. Coordination between agents (who holds a resource, who waits for w
 only when it breaks, as a 需要你 or 异常 line. Every addition to the view is held to this.
 
 Both the brief view and the Lark card are drawn from `awb snapshot` and nothing else
-(`awb snapshot | awb view` draws the same board), in one layout, most important first,
+(`awb snapshot | awb _view` draws the same board), in one layout, most important first,
 since the view is cut at the pane height:
 
 1. Title: the goal's first line. Its other lines say what the goal is (definition, scope).
@@ -85,8 +85,10 @@ with `awb skill`; `awb` itself points agents there.
 
 ## Chat-driven: main agent + awb + session socket
 
-You talk to one Claude, the main agent; the board is for watching. Nothing in Claude's
-configuration changes and workers need not know awb.
+You talk to one Claude, the main agent; the board is for watching. The unit of work is the
+task, a node of the task tree under the goal: the main plans with `awb task`, hands a task to
+a worker with `awb send`, and the worker's reply closes it with its result. The main writes
+the board; workers need not know awb. Nothing in Claude's configuration changes.
 
 A board taller than its pane scrolls: `j`/`k`, arrow keys or the mouse wheel move by lines,
 space/`b` by pages, `g`/`G` jump to the top/end, `q` quits.
@@ -96,15 +98,18 @@ awb up                    # board beside the main agent's tmux pane (own session
 awb tui -g g w1 worker    # a Claude worker; prints "w1 session: <name>" once it is ready
 ```
 
-The main agent dispatches with `msg=$(awb send w1 "<task>")` and its SendMessage tool
+The main agent dispatches with `msg=$(awb send [--under <task>] w1 "<task>")`, which puts the
+task on the tree owned by w1, and its SendMessage tool
 (`to: <name>`, `notify_when_idle: true`), which travels over Claude's own per-session socket
 and reaches the worker even mid-turn. The message carries a key; the worker's reply echoes it
-and the main records `awb reply w1 <key> "<result>"`. On an idle notice without a reply,
+and the main records `awb reply w1 <key> "<result>"`: the task is done, with its result. A
+worker that exits (`awb fail`) loses its open task; restarted, it is sent the task again. On
+an idle notice without a reply,
 `awb idle w1` asks once and then marks the task blocked for the user. One open task per
 worker; `awb peers` recovers open tasks after a restart. `model/tla/AwbLoop.tla` shows why:
 with the earlier protocol TLC finds a reply closing the wrong task, a held message counted as
 done, and a task lost; the keyed protocol passes both "done only for done work" and "every
-task ends done or blocked". The skill (`awb skill`) spells out this protocol.
+task ends done or blocked", with a worker that crashes and is restarted. The skill (`awb skill`) spells out this protocol.
 `tui` waits for the worker to register with Claude before typing anything; it never answers
 the folder-trust prompt, it asks you to. Several boards: one `.awb` per project, or `AWB_DIR`.
 
@@ -115,19 +120,21 @@ awb up                                   # tmux session: board on top, work area
 awb goal "ship v1"
 awb run -g build a1 builder -- claude    # pane per agent; exit 0 -> done, else failed
 awb run -g docs  a2 writer  -- codex
-awb tui -g main assistant helper "task"  # resident interactive claude TUI; command from
+awb tui -g main w1 helper                # resident interactive claude TUI; command from
                                          # AWB_TUI_CMD (default: claude-db if on PATH, else claude)
 
-# reported by the agent (or the main agent on its behalf)
-awb now   a1 "event log"
-awb done  a1
-awb block a3 "waiting for review"     # the next awb now clears it
-awb finish a1
-awb fail  a2 "tests red"
+# the task tree: the plan, and every task handed to a worker
+awb task api todo "build API"                # STATE todo|wip|review|blocked|done|drop|ask
+awb task auth todo "auth" api                # [TEXT] [PARENT] [OWNER]; re-issue to update
+awb send --under api w1 "write the handlers" # a task for w1 under api; prints the message
+awb reply w1 <key> "handlers merged"         # its reply closes it with the result
+awb block w1 "等 #42"; awb unblock w1        # waiting on a PR or issue / not any more
+awb fail  w1 "exited"                        # its open task is lost; restart and send again
 
-# task tree and progress feed (brief view shows them)
-awb task t1 wip "build API"                  # STATE todo|wip|review|blocked|done|drop|ask
-awb task t2 todo "auth" t1 a1                # [TEXT] [PARENT] [OWNER]; re-issue to update
+# agents in a pane report themselves (never while a sent task is open)
+awb now a1 "event log"; awb done a1; awb finish a1 "shipped"
+
+# progress feed
 awb news "API merged"                        # board shows the last 3
 awb news --key val@15000 "val loss 1.888"    # one key = one fact: a later line replaces it
 awb metric tps 32 40 "V100 target"      # brief: one value/target bar under GOAL
@@ -146,7 +153,7 @@ awb down                                            # kill the session
 ```
 
 Board knobs: `AWB_VIEW=brief|full` (default brief), `AWB_STALE=SECS` lists agents silent
-that long (default 600), `AWB_INTERVAL` refresh seconds (default 1), `AWB_METRIC_STALE=SECS` shows the latest reading's
+that long are nudged (default 600), `AWB_INTERVAL` refresh seconds (default 1), `AWB_METRIC_STALE=SECS` shows the latest reading's
 age and drops the time-to-target estimate once that reading is older (default 21600; the
 estimate itself counts from the latest reading), `AWB_TASK_STALE=SECS` tags an open task root
 nobody updated that long (default 21600), `AWB_FROZEN=SECS`
@@ -282,7 +289,7 @@ proven model:
 | link | how | where |
 |---|---|---|
 | status fold (events → agent state) | proven: duration frozen iff ended, no `done` while a check is rejected, only known states, non-negative durations | `model/AwbModel.lean` |
-| jq fold in `awb` = Lean fold | differential test on random logs (`awb selftest`, 200 logs; 1000 run clean) | `awb state` vs `awbmodel fold` |
+| jq fold in `awb` = Lean fold | differential test on random logs (`awb selftest`, 200 logs; 1000 run clean) | `awb _state` vs `awbmodel fold` |
 | brief view / Lark card (events → sections) | proven: every agent is in one snapshot section, an agent with a rejected check is never idle, and one that stopped after a rejected check is always drawn under 需要你; the jq snapshot is differentially tested against it (every 4th random log) | `model/Brief.lean` vs `awb snapshot` |
 | protocol audit | proven: the one-pass monitor reports nothing iff every event obeys the rules given its prefix (`audit_iff_clean`); corollary: every PR in a clean log followed a passing check | `model/Audit.lean` |
 | deliverables | `awb check` (tests, or Lean with kernel-checked theorems and standard axioms only) | `awb check` |

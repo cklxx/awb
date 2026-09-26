@@ -16,9 +16,11 @@ curl -fsSL https://raw.githubusercontent.com/cklxx/awb/main/install.sh | sh
 
 ## Main agent protocol
 
-The user talks to one Claude, the main agent; the board is for watching. Nothing in Claude's
-configuration changes (no hooks), and workers need not know awb. When you are that Claude,
-follow this and do not ask the user to type commands:
+The user talks to one Claude, the main agent; the board is for watching. The unit of work is
+the task, a node of the task tree under the goal: you plan with `awb task`, hand a task to a
+worker with `awb send`, and its reply closes it with the result. You write the board; workers
+need not know awb. Nothing in Claude's configuration changes (no hooks). When you are that
+Claude, follow this and do not ask the user to type commands:
 
 1. Board: `awb up`. Inside tmux it opens right of your pane (reused if already open); outside
    tmux it makes a tmux session with the board and a work pane and prints the one command the
@@ -27,21 +29,25 @@ follow this and do not ask the user to type commands:
    worker's Claude is ready and prints `<id> session: <session name>`. If it prints "answer the
    folder-trust prompt", ask the user to confirm trust in that pane; neither awb nor you makes
    that decision for them.
-3. Dispatch: `msg=$(awb send <id> "<task in one line>")`, then SendMessage(to: <session name>,
-   message: <msg>, notify_when_idle: true). `awb send` only records the task and prints the
-   message; nothing reaches the worker until you send it. The message carries a key
-   `[awb <id>#<key>]` the reply must echo. One open task per worker; send the next after the
-   reply. The worker's own `awb now` / `awb done` do not close it.
+3. Plan and dispatch: `awb task <id> todo "<step>" [<parent>]` lays out the line of work; a
+   decision for the owner is a task at `ask`. `msg=$(awb send [--under <parent>] <id> "<task
+   in one line>")` puts the task on the tree, owned by the worker, and prints the message; then
+   SendMessage(to: <session name>, message: <msg>, notify_when_idle: true). Nothing reaches the
+   worker until you send it. The message carries a key `[awb <id>#<key>]` (the task's id) the
+   reply must echo. One open task per worker; send the next after the reply.
 4. Results:
-   - A reply starting with `[awb <id>#<key>]` → `awb reply <id> <key> "<result in one line>"`.
-     Close tasks this way, not with `awb finish`: a task closed without a reply keeps no result,
-     and `awb replay` counts it apart. A reply with another key is stale or duplicate.
+   - A reply starting with `[awb <id>#<key>]` → `awb reply <id> <key> "<result in one line>"`:
+     the task is done, with its result. A reply with another key is stale or duplicate.
    - An idle notice → `awb idle <id>`. The first time it prints an ask; SendMessage it (again
      with notify_when_idle). The second time it marks the task blocked: tell the user, since the
      worker's session is probably holding your message for its user's approval. Never mark a
      task done from an idle notice alone (`model/tla/AwbLoop.tla`: that marks undone work done).
-   - The worker exited → `awb fail <id> "exited"`; `awb tui` with the same id restarts it; then
-     send its lost task again with `awb send` (a new key: a late reply to the old one is stale).
+   - The worker exited → `awb fail <id> "exited"`: its open task is lost (it leaves the tree).
+     `awb tui` with the same id restarts it; then send the task again with `awb send` (a new
+     key: a late reply to the old one is stale).
+   - The worker waits on something (a PR, an issue: write it as `#N`) → `awb block <id>
+     "等 #N"`, and `awb unblock <id>` when it can go on. Two workers waiting on one `#N` show as
+     a bottleneck.
    - After a restart or compaction, `awb peers` lists every agent with its session, status,
      open task key and silence; continue with `awb idle` for each open task.
 5. Acceptance: a worker's claim is not a result. You choose the command and
@@ -51,8 +57,9 @@ follow this and do not ask the user to type commands:
    approve, an approve of an older head, or a check that never started is not a green light).
 6. Read the board with `awb snapshot` (one JSON object: goal, metric, need, anomalies, agents,
    tasks, checks); `awb render` draws the same for a person.
-7. Subagents you start with your Agent tool can be on the board too: `awb start <id> <name>`
-   and `awb now` before starting, `awb done` when the result comes back.
+7. Subagents you start with your Agent tool take tasks the same way: `awb start <id> <name>`
+   once, `awb send <id> "<task>"`, give the printed message to the Agent tool as its prompt,
+   and `awb reply` with the key when its result comes back.
 
 The board reads each worker's session from Claude's registry: `▲ 待批准` means a permission
 dialog (tell the user; awb never types into it), and 会话实况 lists self-reports the session
@@ -84,7 +91,7 @@ since the first reading and an estimated time to target from these events only.
 sent and how each ended (reply, `finish` without a reply, lost, open), how long each 需要你
 item stayed on the board, and worker restarts.
 
-## Workers that are not Claude sessions
+## Workers that report themselves (`awb run`)
 
 ```sh
 awb run -g build  a1 builder -- ./train.sh  # a command in a pane; exit 0 -> done, else failed
@@ -93,47 +100,39 @@ awb down                                    # end this board's session (refused 
 ```
 
 Attach from another terminal: `tmux -S .awb/sock attach -t awb` (for a deep project path the
-socket is `/tmp/awb-UID-HASH.sock`). A window with no room left gets a new window. Put the ID
-in such a worker's prompt:
+socket is `/tmp/awb-UID-HASH.sock`). A window with no room left gets a new window. A command
+in a pane is its own record: exit 0 is done, else failed. An agent CLI there (codex, ...)
+can report milestones itself, which only it does, and never while a sent task is open; put
+the ID in its prompt:
 
 ```
 You are on the awb board as agent <ID>. Before each stage run `awb now <ID> "<stage>"`,
-after it `awb done <ID>`; if stuck `awb block <ID> "<reason>"`, then `awb now` again when unstuck;
+after it `awb done <ID>`; if stuck `awb block <ID> "<reason>"`, then `awb unblock <ID>`;
 when everything is done `awb finish <ID> "<result in one line>"`. Milestones state results,
 not process, one per stage. Full rules: `awb skill`.
 ```
 
 ## Commands
 
-| command | does |
-|---|---|
-| `awb up` / `awb down` | the board (see protocol step 1) / end this board's session |
-| `awb goal TEXT` | set the overall goal |
-| `awb metric [--at E] [--step N] [--by E] [--ref] NAME VALUE TARGET [NOTE]` | one reading of a goal number |
-| `awb task ID STATE [TEXT] [PARENT] [OWNER] [--probe CMD]` | task-tree node; STATE todo/wip/review/blocked/done/drop/ask; re-issue the ID to update; ask = needs a human decision; `--probe`: the state comes from CMD (`docs/probe.md`) |
-| `awb news [--key KEY] TEXT` | one progress line; the board shows the last 3. Lines with one key are one fact, the latest shows (`val@15000`) |
-| `awb tui [-g G] ID NAME [TASK]` | resident Claude worker (`AWB_TUI_CMD`, default claude-db if on PATH, else claude) |
-| `awb run [-g G] ID NAME -- CMD...` | a command in a pane; a pane closed unexpectedly → ■ dead |
-| `awb start ID NAME [KIND] [G]` | register a non-pane / remote agent |
-| `awb now ID MILESTONE` / `awb done ID [TEXT]` | start / finish a milestone (timed) |
-| `awb block ID REASON` | blocked; the next `awb now` clears it |
-| `awb fail ID REASON` / `awb finish ID [NOTE]` | failed / close the last milestone and mark done |
-| `awb send ID TASK` / `awb reply ID KEY [RESULT]` / `awb idle ID` | protocol steps 3 and 4 |
-| `awb peers` | every agent: `ID PANE SESSION STATUS [#KEY] [silent MINm]` — the Claude session to SendMessage, busy/idle/waiting, its open task, silent ≥ `AWB_STALE` seconds. Sessions not started by awb: add `ID PANE` lines to `.awb/panes` |
-| `awb tell ID MSG` | type a message into the agent's pane and press Enter (claude/codex; Claude queues it when busy). For Claude workers prefer SendMessage |
-| `awb check ID -- CMD...` | acceptance gate: CMD exits 0 → milestone verified (`⊢`); else ✗ with the reason, log in `.awb/check-ID.log`, and the agent is told (`AWB_NOTIFY=0` turns that off) |
-| `awb check ID --lean DIR [ACCEPT.lean]` | Lean 4 gate (see below) |
-| `awb pr ID [gh args]` | push the current branch and open a PR; refused unless the agent's latest check passed |
-| `awb merge PR [--watch]` | merge only when the newest verdict on the current head approves (a review, or a comment whose first line names the head sha and matches `AWB_APPROVE_RE`) and `AWB_MIN_CHECKS` checks named by `AWB_REQUIRE_CHECKS` ran green |
-| `awb hold RES OWNER [NOTE]` / `awb release RES [OWNER]` / `awb holder RES` | one holder per shared resource (a GPU, a host); scripts that must not disturb it check `awb holder` first |
-| `awb snapshot` / `awb render` / `awb replay [STEP]` | the board as JSON / drawn / over the log's history |
-| `awb audit` | protocol violations from the Lean monitor (exit 1 if any) |
-| `awb reset` | clear all events (keeps a `.bak` copy) |
-| `awb skill` / `awb version` / `awb selftest` | this manual / version / end-to-end self-test |
+`awb help` lists them in three groups: the task loop (up, goal, tui, send, reply, idle, fail,
+task, block/unblock, check, pr, merge, metric, news), self-reporting workers (run, start,
+now/done/finish), and coordination and reading (peers, tell, nudge, hold/release/holder,
+snapshot/render/watch, replay, audit, probe, down/reset). Details worth knowing:
+
+- `awb check ID -- CMD`: exit 0 verifies the worker's latest work (`⊢`); else ✗ with the reason,
+  the log in `.awb/check-ID.log`, and the worker is told (`AWB_NOTIFY=0` turns that off).
+- `awb merge PR`: only on an approve of the current head (a review, or a comment whose first
+  line names the head sha and matches `AWB_APPROVE_RE`) with `AWB_MIN_CHECKS` checks named by
+  `AWB_REQUIRE_CHECKS` green.
+- `awb peers`: `ID PANE SESSION STATUS [#KEY] [silent MINm]`. Sessions not started by awb:
+  add `ID PANE` lines to `.awb/panes`.
+- `awb hold RES OWNER`: one holder per shared resource; scripts that must not disturb it check
+  `awb holder RES` first.
+- `awb tell`: types into a pane; for Claude workers prefer SendMessage.
 
 Settings: `AWB_VIEW=brief|full` (default brief), `AWB_STALE` (seconds, default 600),
-`AWB_INTERVAL` (refresh seconds, default 1). IDs match `[A-Za-z0-9_-]`; an id must be started
-before other commands use it. States: ◔ running · ✓ done · ▲ blocked · ✗ failed · ■ dead.
+`AWB_INTERVAL` (refresh seconds, default 1). IDs match `[A-Za-z0-9_-]`; an agent id must be
+started before other commands use it. States: ◔ running · ✓ done · ▲ blocked · ✗ failed · ■ dead.
 
 ## Lean 4 acceptance
 

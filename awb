@@ -52,8 +52,14 @@ tm() {
 BIN=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
 
 # event fold: the state machine modelled and proven in model/AwbModel.lean;
-# `awb state` prints it for the differential test against the compiled model
+# `awb _state` prints it for the differential test against the compiled model
 JQ_FOLD='
+# an open sent task ends without a reply: lost (a restart, a failure, a newer task), or
+# finished (awb finish, the run exited 0) with no result
+def lose($id): (.agents[$id].key // null) as $k
+  | if $k == null then . else .tasks[$k].state = "drop" | .tasks[$k].lost = true | .agents[$id].key = null end;
+def finish($id): (.agents[$id].key // null) as $k
+  | if $k == null then . else .tasks[$k].state = "done" | .agents[$id].key = null end;
 def fold:
 reduce (. // [])[] as $e (
   {goal:"", agents:{}, gorder:{}, gseen:[], tasks:{}, torder:[], news:[], checks:{}, probes:{}};
@@ -66,12 +72,13 @@ reduce (. // [])[] as $e (
            | with_entries(select(.value != null and .value != ""))))
   elif $e.t == "start" then
     if .agents[$e.id] != null then
-      .agents[$e.id] += {status:"running", reason:"", endEp:null,
+      lose($e.id)
+      | .agents[$e.id] += {status:"running", reason:"", endEp:null,
                          pane:($e.pane // .agents[$e.id].pane), lastEp:($e.ep // .agents[$e.id].lastEp)}
     else ($e.group // "default") as $g
       | .agents[$e.id] = {id:$e.id, name:($e.name // $e.id), kind:($e.kind // "agent"),
                           pane:($e.pane // ""), group:$g, status:"running",
-                          current:null, done:[], reason:"", gate:false,
+                          current:null, done:[], reason:"", gate:false, key:null,
                           startEp:($e.ep // 0), lastEp:($e.ep // 0), endEp:null}
       | .gorder[$g] = ((.gorder[$g] // []) + [$e.id])
       | (if (.gseen | index($g)) then . else .gseen += [$g] end)
@@ -96,6 +103,12 @@ reduce (. // [])[] as $e (
     | .agents[$e.id].current = {text:($e.text // ""), time:($e.time // ""), ep:($e.ep // 0)}
     | .agents[$e.id] += {status:"running", reason:"", endEp:null}
     | .agents[$e.id].lastEp = ($e.ep // .agents[$e.id].lastEp)
+    # awb send: the task is a node of the task tree, owned by the worker; its key is its id
+    | if ($e.key // "") == "" then .
+      else lose($e.id) | .agents[$e.id].key = $e.key
+        | (if .tasks[$e.key] == null then .torder += [$e.key] else . end)
+        | .tasks[$e.key] = {id:$e.key, state:"wip", text:($e.text // ""), parent:($e.parent // ""), owner:$e.id}
+      end
   elif $e.t == "done" then
     (.agents[$e.id]) as $a | ($e.ep // $a.lastEp) as $ep
     # a passing check with no open milestone verifies the last finished one
@@ -105,6 +118,9 @@ reduce (. // [])[] as $e (
                                      time:($e.time // ""), dur:([0, $ep - ($a.current.ep // $ep)] | max)}] end)
     | .agents[$e.id].current = null
     | .agents[$e.id].lastEp = $ep
+    # awb reply: the reply closes the task with its key and keeps the result
+    | (if ($e.key // "") != "" and .agents[$e.id].key == $e.key
+       then .tasks[$e.key] += {state:"done", result:($e.text // "")} | .agents[$e.id].key = null else . end)
     | (if $e.verified then .agents[$e.id].gate = false
          | (if .agents[$e.id].status == "failed"
             then .agents[$e.id] += {status:"running", reason:"", endEp:null} else . end)
@@ -113,7 +129,8 @@ reduce (. // [])[] as $e (
   elif $e.t == "status" and $e.status == "done" and .agents[$e.id].gate then
     .agents[$e.id] += {status:"failed", endEp:($e.ep // 0)}
   elif $e.t == "status" then
-    .agents[$e.id].gate = (.agents[$e.id].gate or ($e.gate == true))
+    (if $e.status == "done" then finish($e.id) elif $e.status == "failed" then lose($e.id) else . end)
+    | .agents[$e.id].gate = (.agents[$e.id].gate or ($e.gate == true))
     | .agents[$e.id].status = ($e.status // "running")
     | .agents[$e.id].reason = ($e.reason // "")
     | .agents[$e.id].lastEp = ($e.ep // .agents[$e.id].lastEp)
@@ -173,6 +190,12 @@ def tree($T; $O; $id; $pre): kids($T; $O; $id) as $k | ($k | length) as $n
        + tree($T; $O; $k[$i]; $pre + (if $l then "   " else "│  " end))] | add // [];
 def prog($T; $ids): [$ids[] | $T[.] | select(.state != "drop")] as $x
   | {d:([$x[] | select(.state == "done")] | length), t:($x | length)};
+# one count of finished work since an epoch: a sent task replied, a milestone of a
+# self-reporting agent, a tree task set done (a passing check that only verifies earlier work
+# is not new work)
+def finished($raw; $since): [$raw[] | select(type == "object" and (.ep // 0) >= $since)]
+  | ([.[] | select(.t == "done" and ((.verified == true and .text == null and (.key // "") == "") | not))] | length)
+    + ([.[] | select(.t == "task" and .state == "done") | .id] | unique | length);
 def live: .current != null and (.status == "running" or .status == "blocked");
 def lpad($n):
   . as $s | (" " * ($n - (($s|length) | if . < 0 then 0 elif . > $n then $n else . end))) + $s;
@@ -250,8 +273,11 @@ JQ_RENDER=$JQ_FOLD$JQ_DEFS'
 | ([$s.agents[] | .status] | group_by(.) | map({key:.[0], value:length}) | from_entries) as $c
 # what needs you and what is off, computed once for both views (the full view used to show
 # neither, so a short full-view pane could hide every failure)
-| ([$raw[] | select(type == "object" and .t == "task" and .id != null)]
-   | group_by(.id) | map({key:.[0].id, value:(map(.ep // 0) | max)}) | from_entries) as $tep
+# the last change of each task: its task events, and the send and reply of a sent task
+| ([$raw[] | select(type == "object")
+    | if .t == "task" and .id != null then {k:.id, ep:(.ep // 0)}
+      elif (.t == "now" or .t == "done") and (.key // "") != "" then {k:.key, ep:(.ep // 0)} else empty end]
+   | group_by(.k) | map({key:.[0].k, value:(map(.ep) | max)}) | from_entries) as $tep
 | ([$s.agents[] | select(.status == "running")] | length) as $nrun
 | (if ([$raw[] | select(type == "object")] | length) == 0 then 0
    else $nowep - ([$raw[] | select(type == "object") | .ep // 0] | max // 0) end) as $quiet
@@ -438,9 +464,6 @@ else
   | ([$roots[] | select(.old)] | length) as $nold
   | prog($s.tasks; [$lroots[] | leaves($s.tasks; $s.torder; .)[]]) as $tp
   | ($nowep - 3600) as $h1
-  | ([$raw[] | select(type == "object" and .t == "done" and (.ep // 0) >= $h1)] | length) as $m1
-  | ([$raw[] | select(type == "object" and .t == "task" and .state == "done" and (.ep // 0) >= $h1) | .id]
-     | unique | length) as $t1
   | ([$s.agents[].done[]? | .text // ""]) as $mdone
   | ([$mdone[] | select(startswith("⊢ "))] | length) as $mver
   # the metric and its history (same name); a linear ETA from the first reading, an estimate
@@ -475,11 +498,11 @@ else
        | ($dk[:-2]) as $fold
        | (if $rp.d < $rp.t then $nowep - ([$root, leaves($s.tasks; $s.torder; $root)[]] | map($tep[.] // 0) | max)
           else 0 end) as $tage
-       | {text:$rt.text, d:$rp.d, t:$rp.t, folded:($fold | length),
+       | {id:$root, text:$rt.text, state:$rt.state, owner:($rt.owner // ""), d:$rp.d, t:$rp.t, folded:($fold | length),
           quiet:(if $tage >= $tstale then $tage else null end),
           kids:[ $k0[] | select(. as $x | $fold | index($x) | not) | $s.tasks[.] as $t
                  | leaves($s.tasks; $s.torder; .) as $lv
-                 | {text:$t.text, state:$t.state,
+                 | {id:$t.id, text:$t.text, state:$t.state, owner:($t.owner // ""),
                     prog:(if ($lv | length) > 1 then prog($s.tasks; $lv) else null end)} ]} ]) as $trees
   # the goal: its first line is the title, the rest says what it is
   | (($s.goal | gsub("\r"; "") | split("\n")) as $gl
@@ -487,21 +510,21 @@ else
   # the last 24 hours in numbers
   | ($nowep - 86400) as $d1
   | ([$raw[] | select(type == "object" and (.ep // 0) >= $d1)]) as $day
-  | {milestones:([$day[] | select(.t == "done")] | length),
+  | {done:finished($raw; $d1),
      verified:([$day[] | select(.t == "done" and .verified == true)] | length),
-     tasks:([$day[] | select(.t == "task" and .state == "done") | .id] | unique | length),
      metric:(if $M == null or ($M.history | length) < 2 or $M.value == null then null
              else (([$M.history[] | select(.ep < $d1)] | last | .value) // $M.history[0].value) as $vd
                | ($M.value - $vd) end)} as $D
-  # the next open steps of the main line
-  | ([ $trees[] | .kids[] | select(.state | IN("done","drop") | not) ][:3]
-     # a task dispatched with awb send and not yet replied to is work in flight toward the goal
-     + [ $raw | map(select(type == "object" and (.id | type) == "string" and (((.t == "now" or .t == "done") and (.key // "") != "") or .t == "start"
-                 or (.t == "status" and (.status == "failed" or .status == "done")))))
-         | group_by(.id)[] | last | select(.t == "now" and (.key // "") != "")
-         | {text:"\(($s.agents[.id].name) // .id)：\(.text)", state:"wip", prog:null} ]) as $next
+  # the next open steps of the main line: open children of the live roots, and a root handed to
+  # a worker (awb send without --under); work in flight (wip) first, with its owner
+  | ([ $trees[] | if (.kids | length) == 0 then (select(.owner != "") | {id, text, state, owner, prog:null}) else .kids[] end
+       | select(.state | IN("done","drop") | not) ]
+     | sort_by(if .state == "wip" then 0 else 1 end)[:3]
+     | map(.text = ((if .owner != "" then "\(($s.agents[.owner].name) // .owner)：" else "" end) + .text))) as $next
   # the tree below leaves out the steps already shown as 下一步
-  | [ $trees[] | .kids |= map(select(. as $k | $next | index([$k]) | not)) ] as $trees
+  | ([$next[].id]) as $nid
+  | [ $trees[] | select((.kids | length) > 0 or ((.id as $i | $nid | index([$i])) | not))
+      | .kids |= map(select(.id as $i | $nid | index([$i]) | not)) ] as $trees
   # news: one line per fact. Lines written with the same key (awb news --key) are one fact,
   # and only the latest is shown; lines without a key are all shown.
   | ([$s.news | to_entries[] | .key as $i | .value | (.key // "") as $k
@@ -518,7 +541,7 @@ else
         else "\($M.name) 24 小时没变" end),
        (if ($anom | length) > 0 then "异常 \($anom | length)" else empty end) ] | join(" · ")) as $headline
   | [ {goal:$s.goal, title:$G.title, about:$G.about, headline:$headline, quiet:$quiet,
-       now:$nowep, clock:$now, progress:$tp, hour:{milestones:$m1, tasks:$t1}, day:$D,
+       now:$nowep, clock:$now, progress:$tp, hour:{done:finished($raw; $h1)}, day:$D,
        verified:{v:$mver, n:($mdone | length)}, running:$nrun, metric:$M, need:$need,
        anomalies:$anom, next:$next, holds:$holds,
        agents:$act, idle:$idl, tasks:$trees, tasks_old:$nold,
@@ -572,12 +595,12 @@ JQ_BRIEF=$JQ_DEFS'
 | ("╰─ " + (if $S.progress.t > 0 then "进度 " + bar($S.progress.d; $S.progress.t; 16) + " \($S.progress.d)/\($S.progress.t)   " else "" end) + $S.clock
    + (if ($S.quiet // 0) >= 60 then " · 更新于 \($S.quiet | ago)前" else "" end)) as $bfoot
 # movement, one line: the last hour, the last 24 hours, and how much of it is verified
-| ((if $S.hour.milestones + $S.hour.tasks > 0 then $g + "近 1 小时 里程碑 +\($S.hour.milestones) 任务 +\($S.hour.tasks)" + $rs
-    elif $S.running > 0 then $y + "近 1 小时无新里程碑" + $rs
+| ((if $S.hour.done > 0 then $g + "近 1 小时 完成 +\($S.hour.done)" + $rs
+    elif $S.running > 0 then $y + "近 1 小时无新完成" + $rs
     else $dm + "近 1 小时无变化" + $rs end)
-   + $dm + " · 24 小时 里程碑 +\($D.milestones) 任务 +\($D.tasks)"
+   + $dm + " · 24 小时 完成 +\($D.done)"
    + (if $D.metric != null then " \($M.name) " + (if $D.metric >= 0 then "+" else "" end) + ($D.metric * 100 | round / 100 | tostring) else "" end)
-   + " · 里程碑已核 \($S.verified.v)/\($S.verified.n)" + $rs) as $move0
+   + " · 已核 \($S.verified.v)/\($S.verified.n)" + $rs) as $move0
 | (($move0 | gsub("\u001b\\[[0-9;]*m"; "") | dwidth) as $mw
    | if $mw <= ($bw - 3) then $move0 else ($move0 | gsub("\u001b\\[[0-9;]*m"; "") | clip($bw - 3)) end) as $move
 | (if ($S.need | length) > 0 then ["", $y + "需要你（\($S.need | length)）" + $rs]
@@ -1305,22 +1328,28 @@ open_ms() {
 # dispatch/report loop with a worker over the session socket (model/tla/AwbLoop.tla):
 # one open task per worker, each with a key its reply must echo; an idle notice never closes a
 # task: the first makes the main ask once, the second marks the task blocked for the user.
-# the open task of an agent: its last keyed `now`, unless its reply (a keyed done), a restart
-# (start) or a final status (failed, done) came after it. The worker's own milestones (now/done
-# without a key) never close it: a worker that reported a stage had its reply refused as stale.
-# blocked keeps it open: the reply may still come.
-open_key() {
+# a sent task is a node of the task tree; the fold (the board's own rule) says which is open:
+# "ID KEY" per agent. A reply closes it; a restart, a failure or a newer task loses it; a
+# finish closes it with no result. blocked keeps it open: the reply may still come.
+open_keys() {
   [ -s "$EV" ] || return 0
-  grep -F "\"id\":\"$1\"" "$EV" | jq -R -s -r '[split("\n")[] | fromjson? | select(type == "object")
-      | select(((.t == "now" or .t == "done") and (.key // "") != "") or .t == "start" or (.t == "status" and (.status == "failed" or .status == "done")))]
-    | last // {} | select(.t == "now") | .key // empty'
+  events_json | jq -r "$JQ_FOLD"' fold | .agents[] | select(.key != null) | "\(.id) \(.key)"'
+}
+open_key() { open_keys | awk -v i="$1" '$1 == i {print $2}'; }
+# now/done/finish are for agents that report themselves (awb run); a sent task is closed by
+# its reply, which the main agent records: a worker's own stage report once closed it
+self_report() {
+  need_agent "$1"; _k=$(open_key "$1")
+  [ -z "$_k" ] || die "$1 has task #$_k from awb send; its reply closes it ($PROG reply $1 $_k RESULT)"
 }
 send() {
-  [ $# -ge 2 ] || die "usage: $PROG send ID TASK   (prints the message to SendMessage)"
+  _par=; if [ "${1:-}" = --under ]; then _par=${2:-}; shift 2 || die "--under needs a task id"; fi
+  [ $# -ge 2 ] || die "usage: $PROG send [--under PARENT] ID TASK   (prints the message to SendMessage)"
   id=$1; shift; need_agent "$id"
   k=$(open_key "$id"); [ -z "$k" ] || die "$id already has open task #$k; wait for its reply (or: $PROG idle $id)"
   k=$(date +%s | tail -c 5)$(printf %02d $(( $$ % 100 )))
-  append '{t:"now",time:$time,ep:$ep,id:$id,text:$x,key:$k}' --arg id "$id" --arg x "$*" --arg k "$k"
+  append '{t:"now",time:$time,ep:$ep,id:$id,text:$x,key:$k} + (if $p == "" then {} else {parent:$p} end)' \
+    --arg id "$id" --arg x "$*" --arg k "$k" --arg p "$_par"
   printf '[awb %s#%s] %s\n做完后回复一行：以 [awb %s#%s] 开头，写结果（做不了也照此格式说明原因）。\n' "$id" "$k" "$*" "$id" "$k"
   # the task is only recorded here; the text above still has to reach the worker
   echo "$PROG: recorded $id #$k; deliver the text above with SendMessage (or: $PROG tell $id \"\$msg\")" >&2
@@ -1623,6 +1652,7 @@ silent_min() {
 peers() {
   init_dir
   _s=$(sessions_json); _l=$(tm list-panes -a -F '#{pane_id}' 2>/dev/null || true); _ap=$(agent_panes); _q=$(silent_min)
+  _k=$(open_keys)
   { printf '%s\n' "$_ap" | cut -d' ' -f1; [ -s "$EV" ] && jq -R -r 'fromjson? | select(.t == "start") | .id' "$EV"; } \
   | awk 'NF && !s[$0]++' | while read -r id; do
       pane=$(printf '%s\n' "$_ap" | awk -v i="$id" '$1 == i {print $2}')
@@ -1630,7 +1660,7 @@ peers() {
       elif ! printf '%s\n' "$_l" | grep -Fxq "$pane"; then l="$id $pane - gone"
       else l=$(printf '%s' "$_s" | jq -r --arg i "$id" --arg p "$pane" \
                '.[$i] | if . then "\($i) \($p) \(.name) \(.status)" else "\($i) \($p) - not-claude" end'); fi
-      k=$(open_key "$id"); [ -z "$k" ] || l="$l #$k"
+      k=$(printf '%s\n' "$_k" | awk -v i="$id" '$1 == i {print $2}'); [ -z "$k" ] || l="$l #$k"
       m=$(printf '%s\n' "$_q" | awk -v i="$id" '$1 == i {print $2}'); [ -z "$m" ] || l="$l silent ${m}m"
       echo "$l"
     done
@@ -1748,67 +1778,55 @@ usage() {
 $PROG $VERSION — tmux agent workbench (events in .awb/events.jsonl)
 Agents: read the operating manual with '$PROG skill' before driving the board.
 
-Chat-driven: you talk to one Claude (the main agent); it keeps the board and runs workers:
+One unit of work, the task. You talk to one Claude (the main agent); it keeps the board:
   $PROG up                          the board: beside this pane inside tmux, else its own session
-  $PROG tui ID NAME                 start a Claude worker; prints its session name
-  msg=\$($PROG send ID "task"); SendMessage(to: <session>, message: \$msg, notify_when_idle: true);
-  on a reply "[awb ID#KEY] ...": $PROG reply ID KEY "result"; on an idle notice: $PROG idle ID.
-  Several boards: one .awb per project dir, or \$AWB_DIR.
-
-  $PROG down                        kill the session
-  $PROG run [-g GROUP] ID NAME -- CMD...
-                                    split a pane for any agent (claude, codex, ...)
-  $PROG tui [-g GROUP] ID NAME [TASK...]
-                                    resident interactive claude TUI, Chinese, tracked
+  $PROG goal TEXT                   the goal; its first line is the title
+  $PROG tui [-g GROUP] ID NAME      a Claude worker; prints its session name when ready
                                     (AWB_TUI_CMD, default claude-db if on PATH else claude)
-  $PROG start ID NAME [KIND] [GROUP]  register a non-pane / remote agent
-  $PROG goal TEXT                   set the overall goal
-  $PROG nudge [--once]              remind silent agents in their pane (\$AWB_DIR/panes: "ID PANE")
-  $PROG news [--key KEY] TEXT       one progress line (board shows last 3); one KEY = one fact, latest shown
-  $PROG metric [--at EPOCH] [--step N] [--by EPOCH] [--ref] NAME VALUE TARGET [NOTE]
-                                    --by: deadline; an ETA past it is not shown
-                                    --ref: a reference series (a baseline run): drawn by step
-                                    beside the metric, never counted in its trend
-                                    single value/target bar under GOAL (brief view)
-                                    board view: AWB_VIEW=brief (default) | full
-                                    AWB_STALE=SECS: an agent silent that long is nudged (default 600)
-                                    AWB_SILENT=SECS: silence shown as an anomaly (default 3600)
+  $PROG send [--under PARENT] ID TASK
+                                    a task for worker ID, a node of the task tree; prints the
+                                    message: SendMessage(to: <session>, message: it, notify_when_idle: true)
+  $PROG reply ID KEY [RESULT]       the reply "[awb ID#KEY] ..." closes the task, with its result
+  $PROG idle ID                     on an idle notice: prints an ask once, then marks the task blocked
+  $PROG fail ID REASON              the worker exited: its open task is lost; tui restarts it, send again
   $PROG task ID STATE [TEXT] [PARENT] [OWNER] [--probe CMD]
-                                    task tree node; STATE todo|wip|review|blocked|done|drop|ask;
-                                    re-issue to update (empty args keep old values);
+                                    plan the tree: STATE todo|wip|review|blocked|done|drop|ask
+                                    (ask = a decision for the owner); re-issue to update;
                                     --probe: the state comes from CMD (docs/probe.md)
-  $PROG probe run [--once]          run due task probes (AWB_PROBE_EVERY 120 s, timeout 30 s)
-  $PROG probe pr N                  built-in probe: PR state and CI, anchored to the remote ref
-  $PROG probe log PATH REGEX        built-in probe: last matching line, n/total from two groups
-  $PROG now ID MILESTONE            set agent's current objective
-  $PROG done ID [TEXT]              milestone achieved
-  $PROG block ID REASON             mark blocked; the next now clears it
-  $PROG fail ID REASON
-  $PROG finish ID [NOTE]            close milestone + mark done
-  $PROG tell ID MESSAGE             type a message into the agent's TUI pane (claude, codex, ...)
-  $PROG peers                       every agent: ID PANE SESSION STATUS [#KEY] [silent MINm]
-                                    SESSION: SendMessage to it; #KEY: open task; silent >= AWB_STALE
-  $PROG send ID TASK                open a keyed task; prints the message for SendMessage
-  $PROG reply ID KEY [RESULT]       close the task whose key the worker's reply echoes
-  $PROG idle ID                     on an idle notice: prints an ask once, then marks blocked
+  $PROG block ID REASON / unblock ID  the worker waits on something (#N: a PR or an issue) / not any more
+  $PROG check ID -- CMD...          acceptance: CMD exit 0 verifies the worker's work (⊢), else ✗
+  $PROG check ID --lean DIR [ACCEPT.lean]
+                                    Lean 4: lake build, no sorry, ACCEPT.lean theorems typecheck
+                                    with standard axioms only
   $PROG pr ID [gh args...]          push this branch and open a PR, only after a passing check
   $PROG merge PR [--watch]          merge only when the newest verdict on the current head approves
                                     and required checks ran green (AWB_APPROVE_RE, AWB_REQUIRE_CHECKS,
                                     AWB_MIN_CHECKS); --watch polls until then (AWB_MERGE_POLL/POLLS)
-  $PROG hold RES OWNER [NOTE]       take a shared resource (refused while another owner holds it)
-  $PROG release RES [OWNER]         give it back;  $PROG holder RES: "OWNER EP NOTE", exit 1 if free
+  $PROG metric [--at EPOCH] [--step N] [--by EPOCH] [--ref] NAME VALUE TARGET [NOTE]
+                                    a reading of the goal's number; --by: deadline; --ref: a
+                                    baseline series drawn by step beside it
+  $PROG news [--key KEY] TEXT       one progress line; one KEY = one fact, the latest shows
+
+Workers that are not Claude sessions report themselves (not while a sent task is open):
+  $PROG run [-g GROUP] ID NAME -- CMD...  a command in a pane; exit 0 -> done, else failed
+  $PROG start ID NAME [KIND] [GROUP]  register an agent without a pane (a subagent, a remote)
+  $PROG now ID MILESTONE / done ID [TEXT] / finish ID [NOTE]
+                                    start / end a milestone / end it and the agent
+
+Coordination and reading:
+  $PROG peers                       every agent: ID PANE SESSION STATUS [#KEY] [silent MINm]
+  $PROG tell ID MESSAGE             type into the agent's pane (claude, codex, ...) and press Enter
+  $PROG nudge [--once]              remind silent agents (an open board does it; AWB_NUDGE=0 off)
+  $PROG hold RES OWNER [NOTE] / release RES [OWNER] / holder RES
+                                    one holder per shared resource (a GPU, a host)
+  $PROG snapshot | render | watch   the board as JSON / drawn once / live (AWB_VIEW=brief|full)
+  $PROG replay [STEP]               anomalies over the log's history, then the core metrics
   $PROG audit                       protocol violations (Lean monitor)
-  $PROG version | skill             version | the agent operating manual (SKILL.md)
-  $PROG check ID -- CMD...          acceptance gate: CMD exit 0 -> milestone done (⊢), else failed
-  $PROG check ID --lean DIR [ACCEPT.lean]
-                                    Lean 4 gate: lake build, no sorry, ACCEPT.lean theorems
-                                    typecheck with standard axioms only
-  $PROG render | watch              one-shot render | render loop (board pane)
-  $PROG snapshot                    the brief view as JSON (awb-lark builds its card from it)
-  $PROG replay [STEP]               anomalies over the log history, one snapshot every STEP s
-                                    (default 1800), as episodes: judge rule thresholds on real logs
-  $PROG reset                       clear all events (fresh board)
-  $PROG selftest
+  $PROG probe run [--once] | pr N | log PATH REGEX   task probes (docs/probe.md)
+  $PROG down | reset                end this board's session | clear the log (keeps a .bak)
+  $PROG skill | version | selftest
+  AWB_STALE=SECS nudge after (600); AWB_SILENT=SECS silence is an anomaly after (3600).
+  Several boards: one .awb per project directory, or \$AWB_DIR.
 EOF
 }
 
@@ -1891,7 +1909,7 @@ selftest() {
   bj '[.next[].text] == ["open one"]' "the next open step"
   bj '[.tasks[] | select(.text == "main line") | .folded, (.kids | map(.text))] == [2, ["done-3", "done-4"]]' "done steps fold, the next step leaves the tree"
   bj '.tasks_old == 1 and ([.tasks[].text] | index("ancient root") | not)' "an old finished root folds away"
-  bj '.metric.v0 == 5 and .metric.eta != null and .hour.milestones + .hour.tasks > 0 and .day.tasks > 0' "metric trend and movement"
+  bj '.metric.v0 == 5 and .metric.eta != null and .hour.done > 0 and .day.done > 0' "metric trend and movement"
   # agents appear only where they need you or are off: no per-agent rows in the drawn view
   b=$(bb render | sed 's/\x1b\[[0-9;]*m//g')
   for s in "tuning kernel" "○ 空闲" "agent  ◔"; do
@@ -1942,17 +1960,25 @@ selftest() {
   # a task dispatched with awb send shows under 下一步 until its reply closes it
   sd=$t/sent; mkdir -p "$sd"; sn() { AWB_DIR=$sd "$BIN" "$@"; }
   sn start d1 reviewer >/dev/null; sm=$(sn send d1 "review the manual" 2>/dev/null); sk=$(printf '%s' "$sm" | sed -n '1s/^\[awb d1#\([0-9]*\)\].*/\1/p')
-  sn now d1 "reading"; sn done d1 "read"    # the worker's own milestones keep the task open
+  # the worker's own stage report does not touch its sent task: it is refused
+  ! sn now d1 "reading" 2>/dev/null || die "selftest: a worker's own now was taken while its sent task is open"
   sn peers | grep -Eq "^d1 - - - #$sk\$" || die "selftest: peers does not show the open task: $(sn peers)"
   [ "$(AWB_DIR=$sd AWB_STALE=0 "$BIN" peers)" = "d1 - - - #$sk silent 0m" ] \
     || die "selftest: peers does not show a silent agent: $(AWB_DIR=$sd AWB_STALE=0 "$BIN" peers)"
   sn snapshot | jq -e '[.next[].text] == ["reviewer：review the manual"]' >/dev/null || die "selftest: a dispatched task is not under 下一步"
   sn reply d1 "$sk" "3 findings" >/dev/null
-  sn snapshot | jq -e '.next == []' >/dev/null || die "selftest: a replied task is still under 下一步"
+  sn snapshot | jq -e '.next == [] and ([.tasks[] | select(.text == "review the manual" and .d == 1)] | length == 1)' >/dev/null \
+    || die "selftest: a replied task is not a done node of the task tree: $(sn snapshot | jq -c '.tasks')"
   # a worker that exited (fail) and was started again takes a new task: the old one is closed
   sn send d1 "second" >/dev/null; sn fail d1 "exited"; sn start d1 reviewer >/dev/null
   sn send d1 "third" >/dev/null || die "selftest: a restarted worker kept its lost task open"
-  sn snapshot | jq -e '[.next[].text] == ["reviewer：third"]' >/dev/null || die "selftest: a lost task still under 下一步"
+  sn snapshot | jq -e '[.next[].text] == ["reviewer：third"] and ([.tasks[].text] | index("second") | not)' >/dev/null \
+    || die "selftest: a lost task still on the board"
+  # a task sent under a parent is a step of that line
+  sn reply d1 "$(sn peers | sed -n 's/.*#\([0-9]*\).*/\1/p')" "ok" >/dev/null
+  sn task line todo "main line" >/dev/null; sn send --under line d1 "step A" >/dev/null
+  sn snapshot | jq -e '[.tasks[] | select(.text == "main line") | .d, .t] == [0, 1] and [.next[].text] == ["reviewer：step A"]' >/dev/null \
+    || die "selftest: a task sent under a parent is not a step of its line: $(sn snapshot | jq -c '{tasks, next}')"
   # news: lines with one key are one fact, the latest shows; lines without a key all show
   bd4=$t/brief4; mkdir -p "$bd4"; nb() { AWB_DIR=$bd4 "$BIN" news "$@"; }
   nb "no key"; nb --key val@15000 "feed: val 1.888"; nb "other"; nb --key val@15000 "val 1.888, grad ok"; nb --key ck "saved"
@@ -1991,7 +2017,7 @@ selftest() {
   hb hold gpu h1 "renew" || die "selftest: the holder could not renew"
   [ "$(hb holder gpu | cut -d' ' -f1)" = h1 ] || die "selftest: holder lost"
   ! hb release gpu h2 2>/dev/null || die "selftest: a non-holder released the resource"
-  [ "$(hb state)" = "h1 running false - 0 0" ] || die "selftest: hold events reached the fold: $(hb state)"
+  [ "$(hb _state)" = "h1 running false - 0 0" ] || die "selftest: hold events reached the fold: $(hb _state)"
   AWB_STALE=0 hb snapshot | jq -e '.holds[0].owner == "h1" and any(.anomalies[]; .kind == "hold")' >/dev/null \
     || die "selftest: a quiet holder is not an anomaly"
   ! hb render | grep -Fq "gpu" || die "selftest: a resource held by a working agent is on the brief view"
@@ -2025,8 +2051,8 @@ selftest() {
   # the drawing, pinned: a fixed snapshot gives exactly this brief view. A change of wording
   # or layout is made here once; everything else is asserted on the snapshot above.
   fx='{"goal":"G","title":"G","about":["what it is"],"headline":"需要你 1 件 · m 按当前趋势截止前达不到 · 异常 1",
-    "quiet":120,"now":0,"clock":"12:00:00","progress":{"d":1,"t":2},"hour":{"milestones":1,"tasks":0},
-    "day":{"milestones":3,"verified":1,"tasks":2,"metric":1.5},"verified":{"v":1,"n":3},"running":1,
+    "quiet":120,"now":0,"clock":"12:00:00","progress":{"d":1,"t":2},"hour":{"done":1},
+    "day":{"done":5,"verified":1,"metric":1.5},"verified":{"v":1,"n":3},"running":1,
     "metric":{"name":"m","value":3,"target":10,"note":"n1","frac":0.3,"history":[{"value":1},{"value":3}],
       "v0":1,"since":90000,"eta":null,"late":true,"stale":true,"age":30000},
     "need":[{"kind":"ask","id":"q","name":"","text":"pick one","age":600}],
@@ -2044,7 +2070,7 @@ selftest() {
 │ m 3 / 10 ▕███░░░░░░░▏30%  最新读数 8小时前 · 按当前趋势截止前达不到 ▁▃
 │   n1
 ╰─ 进度 ████████░░░░░░░░ 1/2   12:00:00 · 更新于 2分钟前
-   近 1 小时 里程碑 +1 任务 +0 · 24 小时 里程碑 +3 任务 +2 m +1.5 · 里程碑已核…
+   近 1 小时 完成 +1 · 24 小时 完成 +5 m +1.5 · 已核 1/3
 
 需要你（1）
   ? pick one · 已 10分钟
@@ -2114,15 +2140,15 @@ EOF
   AWB_DIR=$we "$BIN" snapshot | jq -e '.quiet == 0 and .title == ""' >/dev/null || die "selftest: empty snapshot quiet/title"
   # awb view takes COLS ROWS positionally (the brief view never goes below 12 rows); an
   # empty non-tty stdin with an unreachable pane falls back to 80 columns instead of that width
-  AWB_DIR=$wh "$BIN" snapshot 2>/dev/null | env -u TMUX -u TMUX_PANE "$BIN" view 50 13 | stripansi > "$t/v50"
+  AWB_DIR=$wh "$BIN" snapshot 2>/dev/null | env -u TMUX -u TMUX_PANE "$BIN" _view 50 13 | stripansi > "$t/v50"
   [ "$(wc -l < "$t/v50" | tr -d ' ')" -eq 13 ] || die "selftest: awb view ignored ROWS"
   mx=$(wmax < "$t/v50"); [ "$mx" -le 50 ] || die "selftest: awb view ignored COLS ($mx > 50)"
-  AWB_DIR=$wh "$BIN" snapshot 2>/dev/null | env -u AWB_COLS -u AWB_ROWS TMUX=/nonexistent,0,0 TMUX_PANE=%1 "$BIN" view 2>/dev/null | stripansi > "$t/vfb"
+  AWB_DIR=$wh "$BIN" snapshot 2>/dev/null | env -u AWB_COLS -u AWB_ROWS TMUX=/nonexistent,0,0 TMUX_PANE=%1 "$BIN" _view 2>/dev/null | stripansi > "$t/vfb"
   [ "$(wmax < "$t/vfb")" -gt 10 ] && [ "$(wmax < "$t/vfb")" -le 80 ] \
     || die "selftest: awb view with an unreachable pane did not fall back to 80 columns"
 
   # single metric indicator under GOAL, render-only (the "#" id keeps it out
-  # of the proven fold; `awb state` below proves no agent is created).
+  # of the proven fold; `awb _state` below proves no agent is created).
   ! "$BIN" render | grep -Fq '▕' || die "selftest: metric bar shown with no metric event"
   "$BIN" metric "tps" 32 40 "V100 target"
   m=$("$BIN" render)
@@ -2148,7 +2174,7 @@ EOF
   # no id and must neither create an agent nor stop a later event applying.
   printf '%s\n' '{"t":"zzz","ep":900000}' >> "$EV"
   "$BIN" render | grep -Fq "SHIP THE WORKBENCH" || die "selftest: unknown no-id event blanked the board"
-  _ids=$("$BIN" state | awk '{print $1}' | sort -u | tr '\n' ' ')
+  _ids=$("$BIN" _state | awk '{print $1}' | sort -u | tr '\n' ' ')
   [ "$_ids" = "a1 a2 " ] || die "selftest: unknown event leaked an agent into the fold (got: $_ids)"
   "$BIN" now a1 "post-unknown-still-works"
   AWB_VIEW=full "$BIN" render | grep -Fq "post-unknown-still-works" || die "selftest: events after an unknown no-id event dropped"
@@ -2189,11 +2215,11 @@ EOF
   runs=$(jq -r 'select(.t == "chk" and .id == "p1") | .run' "$EV" | uniq | wc -l | tr -d ' ')
   [ "$runs" = 2 ] || die "selftest: concurrent checks interleaved ($runs run segments)"
   # regressions found by model/AwbModel.lean
-  "$BIN" start g1 gatecase; "$BIN" check g1 -- false >/dev/null || true; "$BIN" status g1 done
+  "$BIN" start g1 gatecase; "$BIN" check g1 -- false >/dev/null || true; "$BIN" finish g1
   AWB_VIEW=full "$BIN" render | grep -q "✗ gatecase" || die "selftest: done overrode a rejected check"
   "$BIN" start r1 rerun; "$BIN" finish r1; "$BIN" start r1 rerun
   AWB_VIEW=full "$BIN" render | grep -q "◔ rerun" || die "selftest: re-start kept done"
-  ! "$BIN" status r1 bogus 2>/dev/null || die "selftest: bogus status accepted"
+  ! "$BIN" status r1 done 2>/dev/null || die "selftest: the removed status command still runs"
 
   if command -v tmux >/dev/null; then
     boardpane=$(tmux -L "$S" new-session -d -s awb -n board -x 200 -y 120 -P -F '#{pane_id}' \
@@ -2484,14 +2510,14 @@ FT
       '{"t":"zzz","ep":4}' \
       '{"t":"status","id":"ghost","status":"running","ep":5}' \
       '{"t":"done","id":"u","ep":6}' > "$t/diff0/events.jsonl"
-    a0=$(AWB_DIR=$t/diff0 "$BIN" state); b0=$("$m" fold < "$t/diff0/events.jsonl")
+    a0=$(AWB_DIR=$t/diff0 "$BIN" _state); b0=$("$m" fold < "$t/diff0/events.jsonl")
     [ "$a0" = "$b0" ] || { printf 'jq:\n%s\nlean:\n%s\n' "$a0" "$b0" >&2; die "selftest: jq/Lean differ on unknown events"; }
-    # differential test: jq fold (awb state) vs the proven Lean fold on random logs
+    # differential test: jq fold (awb _state) vs the proven Lean fold on random logs
     mkdir -p "$t/diff"; n=0
     while [ $n -lt "${AWB_DIFF_N:-200}" ]; do
       n=$((n + 1))
       "$m" gen $n 80 > "$t/diff/events.jsonl"
-      a=$(AWB_DIR=$t/diff "$BIN" state); b=$("$m" fold < "$t/diff/events.jsonl")
+      a=$(AWB_DIR=$t/diff "$BIN" _state); b=$("$m" fold < "$t/diff/events.jsonl")
       [ "$a" = "$b" ] || { printf 'jq:\n%s\nlean:\n%s\n' "$a" "$b" >&2; die "selftest: jq fold != Lean model (awbmodel gen $n 80)"; }
       # every 4th log: the brief view's sections (awb snapshot) match Brief.sec, which is
       # proven to show every agent; each agent must appear in exactly one section
@@ -2585,15 +2611,14 @@ CHK
     tmux -S "$psock" has-session -t awb 2>/dev/null || die "selftest: awb down from an agent pane killed the board"
     AWB_TMUX_SOCKET=$psock AWB_TMUX_FOR=$pd/.awb AWB_DIR=$pd/.awb "$BIN" down
     ! tmux -S "$psock" has-session -t awb 2>/dev/null || die "selftest: awb down did not end its own board"
-    # awb board twice for one .awb opens one board; the second call names the open one
+    # awb up inside tmux, twice for one .awb, opens one board beside the pane; the second names it
     bk=$(tmux -L "${S}b" new-session -d -x 160 -y 30 -P -F '#{socket_path},0,0 #{pane_id}' "sleep 60")
     bsock=${bk% *}; bpane=${bk#* }
-    TMUX=$bsock TMUX_PANE=$bpane AWB_DIR=$sb "$BIN" board >/dev/null
-    TMUX=$bsock TMUX_PANE=$bpane AWB_DIR=$sb "$BIN" board | grep -q "already open" || die "selftest: a second awb board did not reuse the open one"
-    TMUX=$bsock TMUX_PANE=$bpane AWB_DIR=$sb "$BIN" up | grep -q "already open" || die "selftest: awb up inside tmux did not act as awb board"
+    TMUX=$bsock TMUX_PANE=$bpane AWB_DIR=$sb "$BIN" up >/dev/null
+    TMUX=$bsock TMUX_PANE=$bpane AWB_DIR=$sb "$BIN" up | grep -q "already open" || die "selftest: a second awb up did not reuse the open board"
     nb=$(tmux -L "${S}b" list-panes -a -F '#{pane_start_command}' | grep -c ' watch' || true)
     tmux -L "${S}b" kill-server 2>/dev/null || true
-    [ "$nb" = 1 ] || die "selftest: awb board opened $nb boards for one .awb"
+    [ "$nb" = 1 ] || die "selftest: awb up opened $nb boards for one .awb"
   fi
   # awb-lark: one board = one topic whose root card carries every update. A fake lark-cli
   # records each call; the flow must create the topic once, then only patch that card.
@@ -2786,10 +2811,10 @@ case "$cmd" in
                     + (if $ref == "" then {} else {ref:true} end)' \
               --arg name "$1" --arg value "$2" --arg target "$3" --arg note "${4-}" --arg at "$_at" --arg x "$_x" --arg by "$_by" --arg ref "$_ref" ;;
   now)      [ $# -ge 2 ] || die "usage: $PROG now ID MILESTONE"
-            need_agent "$1"
+            self_report "$1"
             append '{t:"now",time:$time,ep:$ep,id:$id,text:$text}' --arg id "$1" --arg text "${2-}" ;;
   done)     [ $# -ge 1 ] || die "usage: $PROG done ID [TEXT]"
-            need_agent "$1"
+            self_report "$1"
             append '{t:"done",time:$time,ep:$ep,id:$id,text:(if $text == "" then null else $text end)}' \
               --arg id "$1" --arg text "${2:-}" ;;
   block)    [ $# -ge 2 ] || die "usage: $PROG block ID REASON"
@@ -2804,21 +2829,16 @@ case "$cmd" in
             append '{t:"status",time:$time,ep:$ep,id:$id,status:"failed",reason:$r}' \
               --arg id "$1" --arg r "${2-}" ;;
   finish)   [ $# -ge 1 ] || die "usage: $PROG finish ID [NOTE]"
-            need_agent "$1"
+            self_report "$1"
             append '{t:"done",time:$time,ep:$ep,id:$id,text:(if $text == "" then null else $text end)}' \
               --arg id "$1" --arg text "${2:-}"
             append '{t:"status",time:$time,ep:$ep,id:$id,status:"done",reason:""}' --arg id "$1" ;;
-  status)   [ $# -ge 2 ] || die "usage: $PROG status ID running|blocked|failed|done [REASON]"
-            need_agent "$1"
-            case $2 in running|blocked|failed|done) ;; *) die "status: running|blocked|failed|done" ;; esac
-            append '{t:"status",time:$time,ep:$ep,id:$id,status:$st,reason:$r}' \
-              --arg id "$1" --arg st "$2" --arg r "${3:-}" ;;
   reset)    init_dir   # the log is the only record: keep a copy, then clear in place (watch keeps its file)
             _b=$EV.$(date +%s).bak; [ -s "$EV" ] && { cp "$EV" "$_b"; echo "cleared; the old log is $_b"; }
             : > "$EV" ;;
   render)   init_dir; render ;;
   replay)   replay "$@" ;;
-  view)     # a snapshot on stdin, drawn as the brief view: awb view [COLS ROWS]. Probed, a width
+  _view)    # a snapshot on stdin, drawn as the brief view: awb view [COLS ROWS]. Probed, a width
             # under 40 is a pane of another server or a worker's sliver, not where this output goes
             printf '%s %s' "${1:-}" "${2:-}" | grep -Eq '^[0-9]+ [0-9]+$' || { set -- $(dims); [ "${1:-0}" -ge 40 ] || set -- 80 "${2:-24}"; }
             brief_view "$1" "$2" ;;
@@ -2835,9 +2855,7 @@ case "$cmd" in
   send)     send "$@" ;;
   reply)    reply "$@" ;;
   idle)     idle "$@" ;;
-  stale|pending) peers ;;   # merged into peers
-  state)    state ;;
-  board)    up ;;   # merged into up
+  _state)   state ;;   # the jq fold per agent, for the differential test against the Lean model
   audit)    audit ;;
   version|--version|-V) echo "$PROG $VERSION" ;;
   skill)    skill ;;
