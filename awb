@@ -478,7 +478,8 @@ else
   # the next open steps of the main line
   | ([ $trees[] | .kids[] | select(.state | IN("done","drop") | not) ][:3]
      # a task dispatched with awb send and not yet replied to is work in flight toward the goal
-     + [ $raw | map(select(type == "object" and (.t == "now" or .t == "done") and (.id | type) == "string"))
+     + [ $raw | map(select(type == "object" and (.id | type) == "string" and (.t == "now" or .t == "done" or .t == "start"
+                 or (.t == "status" and (.status == "failed" or .status == "done")))))
          | group_by(.id)[] | last | select(.t == "now" and (.key // "") != "")
          | {text:"\(($s.agents[.id].name) // .id)：\(.text)", state:"wip", prog:null} ]) as $next
   # the tree below leaves out the steps already shown as 下一步
@@ -1202,9 +1203,13 @@ open_ms() {
 # dispatch/report loop with a worker over the session socket (model/tla/AwbLoop.tla):
 # one open task per worker, each with a key its reply must echo; an idle notice never closes a
 # task: the first makes the main ask once, the second marks the task blocked for the user.
+# the open task of an agent: its last keyed `now`, unless a milestone, a restart (start) or a
+# final status (failed, done) came after it. blocked keeps it open: the reply may still come.
 open_key() {
   [ -s "$EV" ] || return 0
-  grep -F "\"id\":\"$1\"" "$EV" | grep -E '"t":"(now|done)"' | tail -1 | jq -R -r 'fromjson? | select(.t == "now") | .key // empty'
+  grep -F "\"id\":\"$1\"" "$EV" | jq -R -s -r '[split("\n")[] | fromjson? | select(type == "object")
+      | select(.t == "now" or .t == "done" or .t == "start" or (.t == "status" and (.status == "failed" or .status == "done")))]
+    | last // {} | select(.t == "now") | .key // empty'
 }
 send() {
   [ $# -ge 2 ] || die "usage: $PROG send ID TASK   (prints the message to SendMessage)"
@@ -1794,6 +1799,10 @@ selftest() {
   sn snapshot | jq -e '[.next[].text] == ["reviewer：review the manual"]' >/dev/null || die "selftest: a dispatched task is not under 下一步"
   sn reply d1 "$sk" "3 findings" >/dev/null
   sn snapshot | jq -e '.next == []' >/dev/null || die "selftest: a replied task is still under 下一步"
+  # a worker that exited (fail) and was started again takes a new task: the old one is closed
+  sn send d1 "second" >/dev/null; sn fail d1 "exited"; sn start d1 reviewer >/dev/null
+  sn send d1 "third" >/dev/null || die "selftest: a restarted worker kept its lost task open"
+  sn snapshot | jq -e '[.next[].text] == ["reviewer：third"]' >/dev/null || die "selftest: a lost task still under 下一步"
   # news: lines with one key are one fact, the latest shows; lines without a key all show
   bd4=$t/brief4; mkdir -p "$bd4"; nb() { AWB_DIR=$bd4 "$BIN" news "$@"; }
   nb "no key"; nb --key val@15000 "feed: val 1.888"; nb "other"; nb --key val@15000 "val 1.888, grad ok"; nb --key ck "saved"
@@ -2105,7 +2114,7 @@ FT
     reg busy
     ! AWB_SILENT=1 ht snapshot | jq -e '.anomalies[] | select(.text | startswith("demo "))' >/dev/null \
       || die "selftest: a silent agent with a busy session listed as an anomaly"
-    AWB_SILENT=1 "$BIN" snapshot | jq -e '.anomalies[] | select(.kind == "silent" and (.text | startswith("demo ")))' >/dev/null \
+    HOME=$t/nohome AWB_SILENT=1 "$BIN" snapshot | jq -e '.anomalies[] | select(.kind == "silent" and (.text | startswith("demo ")))' >/dev/null \
       || die "selftest: a silent agent with no session not listed"
     reg idle "" 10
     ! ht render | grep -Fq "会话空闲" || die "selftest: running agent idle 10s flagged"
