@@ -201,6 +201,9 @@ non-git directories are skipped.
   `DSML|<invoke name=|</?function_calls>`): some models emit the call syntax instead of calling,
   and the session then looks idle while the board says running. It is told to re-issue at most
   once per `AWB_STUCK_EVERY` (600 s), and flagged under 异常 until the session works again.
+- `nudge` also tells the holder of a resource (`awb hold`) whose session has been idle — or,
+  without a session, silent on the board — for `AWB_STALE` to report or release it, at most once
+  per `AWB_NUDGE_EVERY`: a held resource with an absent holder stalls everyone queued behind it.
 - `tell` works for any TUI agent (claude, codex, ...) and uses a named tmux buffer, so your
   own paste buffer is untouched. Claude queues it if a turn is running. After Enter it
   captures the pane (joined lines) and reads the last line starting with a prompt (`❯`

@@ -873,6 +873,7 @@ probe() {
 nudge_once() {
   freeze_once
   stuck_once
+  hold_once
   [ -s "$AWB_DIR/panes" ] || return 0
   now=$(date +%s)
   { [ -s "$EV" ] && cat "$EV" || true; } | jq -R -s -r \
@@ -914,6 +915,30 @@ stuck_once() {
     [ $((now - ${last:-0})) -ge "${AWB_STUCK_EVERY:-600}" ] || continue
     tell "$id" "[看板自动提醒] 你上一条输出里的工具调用（${hit}）被打印成了文本，没有执行，会话已停。请重新发出那条调用，然后继续。" 2>/dev/null || continue
     append '{t:"nudge",time:$time,ep:$ep,id:$id,why:"stuck",hit:$h}' --arg id "$id" --arg h "$hit"
+  done
+}
+
+# a holder that has not worked for AWB_STALE keeps everyone queued behind the resource (a
+# session that died mid-turn held a GPU for hours while the board showed it): it is told to
+# report or release, at most once per AWB_NUDGE_EVERY. Quiet is the render's: a busy session
+# is working; otherwise the session's idle time, or the board silence of an agent without one.
+hold_once() {
+  now=$(date +%s); sj=$(sessions_json)
+  { [ -s "$EV" ] && cat "$EV" || true; } | jq -R -s -r --argjson now "$now" --argjson sess "$sj" '
+    rtrimstr("\n") | if . == "" then [] else split("\n") | map(fromjson? | select(type == "object")) end
+    | (reduce .[] as $e ({}; if ($e.id | type) == "string" and $e.t != "nudge" then .[$e.id] = ($e.ep // 0) else . end)) as $last
+    | [.[] | select((.t == "hold" or .t == "release") and (.res | type) == "string")]
+    | group_by(.res)[] | sort_by(.ep // 0) | last | select(.t == "hold")
+    | ($sess[.owner] // null) as $x
+    | (if $x != null then (if $x.status == "busy" then 0 else $now - $x.since end)
+       else $now - ($last[.owner] // $now) end) as $q
+    | "\(.res) \(.owner) \($q) \($now - (.ep // $now))"' |
+  while read -r res own q held; do
+    [ "$q" -ge "${AWB_STALE:-600}" ] || continue
+    last=$(grep -F "\"id\":\"$own\"" "$EV" 2>/dev/null | grep -F '"why":"hold"' | tail -1 | jq -R -r 'fromjson? | .ep' || true)
+    [ $((now - ${last:-0})) -ge "${AWB_NUDGE_EVERY:-900}" ] || continue
+    tell "$own" "[看板自动提醒] 你占着 ${res} 已 $((held / 60)) 分钟，最近 $((q / 60)) 分钟没在干活，别人在排队。还在用就报一句进度（awb now $own \"...\"）；用完了就恢复现场并 awb release ${res} ${own}。" 2>/dev/null || continue
+    append '{t:"nudge",time:$time,ep:$ep,id:$id,why:"hold",res:$r}' --arg id "$own" --arg r "$res"
   done
 }
 
@@ -2036,6 +2061,18 @@ FT
     ! ht snapshot | jq -e '.agents[] | select(.id == "z1") | .flag | contains("工具调用没执行")' >/dev/null \
       || die "selftest: a working session still flagged stuck"
     tmux -L "$S" send-keys -t "$zp" C-u; tmux -L "$S" send-keys -t "$zp" clear Enter
+    reg idle "" 10
+    # a holder whose session is idle past AWB_STALE is told to report or release, once per
+    # AWB_NUDGE_EVERY; a busy holder is left alone
+    "$BIN" hold gpu9 z1 "bench"
+    reg busy; ht nudge --once >/dev/null 2>&1
+    ! grep -F '"why":"hold"' "$EV" | grep -qF '"id":"z1"' || die "selftest: a working holder was told to release"
+    reg idle "" 900; ht nudge --once >/dev/null 2>&1
+    [ "$(grep -F '"why":"hold"' "$EV" | grep -cF '"id":"z1"')" = 1 ] || die "selftest: an idle holder was not told"
+    sleep 0.6; tmux -L "$S" capture-pane -p -t "$zp" | grep -Fq "别人在排队" || die "selftest: the hold reminder was not typed"
+    ht nudge --once >/dev/null 2>&1
+    [ "$(grep -F '"why":"hold"' "$EV" | grep -cF '"id":"z1"')" = 1 ] || die "selftest: the hold reminder is not throttled"
+    "$BIN" release gpu9 z1; tmux -L "$S" send-keys -t "$zp" C-u; tmux -L "$S" send-keys -t "$zp" clear Enter
     reg idle "" 10
     "$BIN" finish z1
     [ "$(ht peers | grep '^z1 ')" = "z1 $zp zz-1 idle" ] || die "selftest: peers lost the session"
