@@ -192,7 +192,7 @@ $PROG sync [--dry-run]   create or update this board's topic (AWB_DIR, default .
                          --dry-run prints the card JSON and sends nothing
 $PROG watch              sync every AWB_LARK_EVERY seconds (default 60)
 $PROG where              the group, and this board's topic mapping
-A board started with 'awb board' / 'awb up' syncs by itself once setup has run.
+A board started with 'awb up' syncs by itself once setup has run.
 EOF
      [ -z "${1:-}" ] || [ "$1" = -h ] || [ "$1" = --help ] || exit 1 ;;
 esac

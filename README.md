@@ -92,7 +92,7 @@ A board taller than its pane scrolls: `j`/`k`, arrow keys or the mouse wheel mov
 space/`b` by pages, `g`/`G` jump to the top/end, `q` quits.
 
 ```sh
-awb board                 # board beside the main agent's tmux pane
+awb up                    # board beside the main agent's tmux pane (own session outside tmux)
 awb tui -g g w1 worker    # a Claude worker; prints "w1 session: <name>" once it is ready
 ```
 
@@ -101,7 +101,7 @@ The main agent dispatches with `msg=$(awb send w1 "<task>")` and its SendMessage
 and reaches the worker even mid-turn. The message carries a key; the worker's reply echoes it
 and the main records `awb reply w1 <key> "<result>"`. On an idle notice without a reply,
 `awb idle w1` asks once and then marks the task blocked for the user. One open task per
-worker; `awb pending` recovers open tasks after a restart. `model/tla/AwbLoop.tla` shows why:
+worker; `awb peers` recovers open tasks after a restart. `model/tla/AwbLoop.tla` shows why:
 with the earlier protocol TLC finds a reply closing the wrong task, a held message counted as
 done, and a task lost; the keyed protocol passes both "done only for done work" and "every
 task ends done or blocked". The skill (`awb skill`) spells out this protocol.
@@ -121,7 +121,7 @@ awb tui -g main assistant helper "task"  # resident interactive claude TUI; comm
 # reported by the agent (or the main agent on its behalf)
 awb now   a1 "event log"
 awb done  a1
-awb block a3 "waiting for review"; awb unblock a3
+awb block a3 "waiting for review"     # the next awb now clears it
 awb finish a1
 awb fail  a2 "tests red"
 
@@ -184,7 +184,7 @@ the group.
   (`model/tla/AwbLark.tla`). Lark stops
   patching a card after 14 days, so at 13 days the board opens a new topic and the old card
   is replaced by a pointer to it.
-- A linked board syncs by itself once a minute while `awb board` / `awb up` runs
+- A linked board syncs by itself once a minute while `awb up` runs
   (`AWB_LARK_EVERY`); `awb-lark sync` does it by hand, `--dry-run` prints the card JSON.
 - The mapping is `$AWB_DIR/lark.json` (chat, root message), so it follows the
   board. The card is built from `awb snapshot`, the same data as the brief view.
@@ -193,8 +193,7 @@ the group.
 
 ```sh
 awb tell a1 "rebase on main, then re-run the check"   # typed into the agent's TUI pane + Enter
-awb peers                                             # ID PANE CLAUDE-SESSION STATUS
-awb stale                                             # agents silent >= AWB_STALE seconds
+awb peers                                             # ID PANE CLAUDE-SESSION STATUS [#KEY] [silent MINm]
 awb nudge                                             # loop: remind silent agents every AWB_NUDGE_EVERY
                                                       # (an open board runs these rounds too; AWB_NUDGE=0 turns that off)
 ```
@@ -227,7 +226,7 @@ non-git directories are skipped.
   check from its own pane (`AWB_NOTIFY=0` turns this off).
 - The board reads each Claude agent's live session state from `~/.claude/sessions` (read
   only) and does not trust the self-report over it. A session on a permission dialog shows as
-  `▲ 待批准` with the dialog kind and its age, and `awb stale` prints it as `ID MINUTES waiting`,
+  `▲ 待批准` with the dialog kind and its age, and `awb peers` prints its status as `waiting`,
   whatever the agent last reported; `tell` and `nudge` refuse to type into it, since typed
   text plus Enter would answer the dialog. tell reads the registry again before the paste and
   before Enter; a dialog that opens in the gap between a read and a keystroke still takes

@@ -24,9 +24,9 @@ Claude's configuration changes (no hooks), and workers need not know awb.
 When you are the Claude the user talks to, follow this protocol and do not ask the user to
 type commands:
 
-1. Board: `awb board` (opens right of your tmux pane). Outside tmux, run `awb up` yourself:
-   it makes a tmux session with the board and a work pane, where `awb tui` opens workers, and
-   prints the one command the user runs to watch it. Then `awb goal "<goal>"`. The goal holds only the goal:
+1. Board: `awb up`. Inside tmux it opens right of your pane (reused if already open); outside
+   tmux it makes a tmux session with the board and a work pane, where `awb tui` opens workers,
+   and prints the one command the user runs to watch it. Then `awb goal "<goal>"`. The goal holds only the goal:
    its first line is the title of the board and of the Lark card, short; further lines say
    what it is (definition, how it is measured, scope). Status never goes into the goal; it
    goes into `awb news` or tasks.
@@ -55,8 +55,8 @@ type commands:
      worker's session is probably holding your message for its user's approval.
    - The worker exited → `awb fail <id> "exited"`.
    - Gate deliverables with `awb check <id> -- <command>`, then `awb pr <id>`.
-   - After a restart or compaction, `awb pending` lists open tasks with their keys and the
-     workers' session status; continue with `awb idle` for each.
+   - After a restart or compaction, `awb peers` lists every worker with its session, status,
+     open task key and silence; continue with `awb idle` for each open task.
    Never mark a task done from an idle notice alone: TLC found that this marks undone work done
    (`model/tla/AwbLoop.tla`).
 5. Subagents you start with your Agent tool can be on the board too: `awb start <id> <name>`
@@ -68,8 +68,7 @@ synced every minute while the board runs. Never link a scratch or test board.
 
 `awb peers` shows each agent's Claude session name and busy/idle/waiting. The board reads the
 same registry: `▲ 待批准` means the worker is on a permission dialog (tell the user; awb never
-types into it), and 会话实况 lists self-reports the session contradicts. `awb stale` prints
-`ID MINUTES waiting` for dialog-blocked workers. Several boards: one `.awb` per
+types into it), and 会话实况 lists self-reports the session contradicts. Several boards: one `.awb` per
 project directory, or set `AWB_DIR`.
 
 ## Manual layout
@@ -97,20 +96,20 @@ socket is `/tmp/awb-UID-HASH.sock`).
 | `awb tui [-g G] ID NAME [TASK]` | resident Claude worker (command from `AWB_TUI_CMD`, default claude-db if on PATH, else claude); prints the session name when ready |
 | `awb start ID NAME [KIND] [G]` | register a non-pane / remote agent |
 | `awb now ID MILESTONE` / `awb done ID [TEXT]` | start / finish a milestone (timed) |
-| `awb block ID REASON` / `awb unblock ID` | blocked / back to running |
+| `awb block ID REASON` | blocked; the next `awb now` clears it |
 | `awb fail ID REASON` / `awb finish ID [NOTE]` | failed / close the last milestone and mark done |
 | `awb check ID -- CMD...` | acceptance gate: CMD exits 0 → milestone verified (`⊢`); else the agent turns ✗ with the reason on the board, log in `.awb/check-ID.log` |
 | `awb check ID --lean DIR [ACCEPT.lean]` | Lean 4 gate: `lake build`, no sorry/admit in sources, ACCEPT.lean theorems typecheck against the build with standard axioms only |
 | `awb send ID TASK` / `awb reply ID KEY [RESULT]` | open a keyed task and print the message to send / close it when the reply echoes the key |
-| `awb idle ID` / `awb pending` | on an idle notice: print an ask once, then mark blocked / open tasks with keys and worker status |
+| `awb idle ID` | on an idle notice: print an ask once, then mark blocked |
 | `awb pr ID [gh args]` | push the current branch and open a PR; refused unless the agent's latest check passed; the body lists milestones and check steps |
 | `awb merge PR [--watch]` | merge only when the newest verdict on the current head approves (a PR review, or a comment whose first line names the head sha and matches `AWB_APPROVE_RE` in full) and at least `AWB_MIN_CHECKS` checks named by `AWB_REQUIRE_CHECKS` ran green; pinned with `--match-head-commit` |
 | `awb hold RES OWNER [NOTE]` / `awb release RES [OWNER]` / `awb holder RES` | one holder per shared resource (a GPU, a host); another owner is refused; a holder quiet for `AWB_STALE` shows under 异常 |
 | `awb tell ID MSG` | type a message into the agent's TUI pane and press Enter (claude/codex; Claude queues it when busy) |
-| `awb peers` | each agent's Claude session name and busy/idle |
-| `awb stale` / `awb nudge` | list agents silent ≥ `AWB_STALE` seconds / remind them in a loop. An open board runs the same rounds (`AWB_NUDGE=0` turns that off), and `awb board` reuses a board already open for this `.awb` |
-| `awb audit` / `awb state` | protocol violations from the Lean monitor (exit 1 if any) / per-agent state from the jq fold |
-| `awb board` | board beside the current tmux pane, which becomes the split origin for tui/run |
+| `awb peers` | every agent: `ID PANE SESSION STATUS [#KEY] [silent MINm]`: the Claude session to SendMessage, busy/idle/waiting, its open task, silent ≥ `AWB_STALE` seconds |
+| `awb nudge` | remind silent agents in a loop. An open board runs the same rounds (`AWB_NUDGE=0` turns that off) |
+| `awb audit` | protocol violations from the Lean monitor (exit 1 if any) |
+| `awb up` | inside tmux: the board beside the current pane, which becomes the split origin for tui/run (reused if open); outside: its own tmux session |
 | `awb render` / `awb snapshot` / `awb reset` | one-shot render (works outside tmux) / the same as JSON / clear all events (keeps a `.bak` copy) |
 | `awb skill` / `awb version` / `awb selftest` | this manual / version / end-to-end self-test |
 
@@ -139,7 +138,7 @@ Worker prompt template:
 
 ```
 You are on the awb board as agent <ID>. Before each stage run `awb now <ID> "<stage>"`,
-after it `awb done <ID>`; if stuck `awb block <ID> "<reason>"`, then `awb unblock <ID>`;
+after it `awb done <ID>`; if stuck `awb block <ID> "<reason>"`, then `awb now` again when unstuck;
 when everything is done `awb finish <ID> "<result in one line>"`. Milestones state results,
 not process, one per stage. Full rules: `awb skill`.
 ```
