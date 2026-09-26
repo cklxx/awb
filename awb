@@ -8,6 +8,12 @@ set -eu
 VERSION=0.0.8
 PROG=$(basename "$0")
 AWB_DIR=${AWB_DIR:-$PWD/.awb}
+# awb exports its tmux socket into the panes it opens, with the board it belongs to
+# (AWB_TMUX_FOR). Under another AWB_DIR the socket is not used: a worker that experiments with
+# its own board, or runs the selftest, once killed its parent board and every worker on it.
+if [ -n "${AWB_TMUX_FOR:-}" ] && [ "$(cd "$AWB_DIR" 2>/dev/null && pwd)" != "$AWB_TMUX_FOR" ]; then
+  unset AWB_TMUX_SOCKET AWB_TMUX_FOR
+fi
 EV=$AWB_DIR/events.jsonl
 TS_FMT=%H:%M:%S
 ESC=$(printf '\033')
@@ -470,7 +476,11 @@ else
        (if $quiet >= $silent and $nrun > 0
         then {kind:"board", text:"看板 \($quiet | ago)没有新事件，主控可能停了"} else empty end) ]) as $anom
   # the next open steps of the main line
-  | ([ $trees[] | .kids[] | select(.state | IN("done","drop") | not) ][:3]) as $next
+  | ([ $trees[] | .kids[] | select(.state | IN("done","drop") | not) ][:3]
+     # a task dispatched with awb send and not yet replied to is work in flight toward the goal
+     + [ $raw | map(select(type == "object" and (.t == "now" or .t == "done") and (.id | type) == "string"))
+         | group_by(.id)[] | last | select(.t == "now" and (.key // "") != "")
+         | {text:"\(($s.agents[.id].name) // .id)：\(.text)", state:"wip", prog:null} ]) as $next
   # the tree below leaves out the steps already shown as 下一步
   | [ $trees[] | .kids |= map(select(. as $k | $next | index([$k]) | not)) ] as $trees
   # news: one line per fact. Lines written with the same key (awb news --key) are one fact,
@@ -1063,22 +1073,26 @@ up() {
   command -v tmux >/dev/null || die "tmux not installed"
   init_dir
   SOCK=$(sock_path)
-  if [ -S "$SOCK" ] && tmux -S "$SOCK" has-session -t awb 2>/dev/null; then
-    exec tmux -S "$SOCK" attach-session -t awb
-  fi
+  # without a terminal (an agent runs awb up) the session is made and the user attaches later
+  _att() {
+    if [ -t 0 ] && [ -t 1 ]; then exec tmux -S "$SOCK" attach-session -t awb; fi
+    echo "awb session ready (board + work pane); to watch it, run in a terminal: cd $(q "$(dirname "$AWB_DIR")") && awb up"
+    [ "$(basename "$AWB_DIR")" = .awb ] || echo "  (with AWB_DIR=$(q "$AWB_DIR"))"
+  }
+  if [ -S "$SOCK" ] && tmux -S "$SOCK" has-session -t awb 2>/dev/null; then _att; return 0; fi
   rm -f "$SOCK"
   tmux -S "$SOCK" new-session -d -s awb -n board -P -F '#{pane_id}' \
-    -e "AWB_DIR=$AWB_DIR" -e "AWB_TMUX_SOCKET=$SOCK" \
-    "AWB_DIR=$(q "$AWB_DIR") AWB_TMUX_SOCKET=$(q "$SOCK") $(q "$BIN") watch" >/dev/null
+    -e "AWB_DIR=$AWB_DIR" -e "AWB_TMUX_SOCKET=$SOCK" -e "AWB_TMUX_FOR=$AWB_DIR" \
+    "AWB_DIR=$(q "$AWB_DIR") AWB_TMUX_SOCKET=$(q "$SOCK") AWB_TMUX_FOR=$(q "$AWB_DIR") $(q "$BIN") watch" >/dev/null
   board=$(tmux -S "$SOCK" list-panes -t awb:board -F '#{pane_id}' | head -1)
   work=$(tmux -S "$SOCK" split-window -v -t "$board" -d -p 45 -P -F '#{pane_id}' \
-           -e "AWB_DIR=$AWB_DIR" -e "AWB_TMUX_SOCKET=$SOCK" "$SHELL")
+           -e "AWB_DIR=$AWB_DIR" -e "AWB_TMUX_SOCKET=$SOCK" -e "AWB_TMUX_FOR=$AWB_DIR" "$SHELL")
   printf '%s\n' "$work" > "$AWB_DIR/work-pane"
   tmux -S "$SOCK" select-pane -t "$board" -T board
   tmux -S "$SOCK" select-pane -t "$work"  -T work
   tmux -S "$SOCK" setw -t awb:board pane-border-status top
   tmux -S "$SOCK" setw -t awb:board pane-border-format ' #{?pane_title,#{pane_title},pane} '
-  exec tmux -S "$SOCK" attach-session -t awb
+  _att
 }
 
 run() {
@@ -1098,12 +1112,12 @@ run() {
   kind=$(basename -- "$1")
   cmdq=$(for a in "$@"; do printf '%s ' "$(q "$a")"; done)
   sock=${AWB_TMUX_SOCKET:-$(sock_path)}
-  inner="AWB_DIR=$(q "$AWB_DIR") AWB_TMUX_SOCKET=$(q "$sock") AWB_GROUP=$(q "$group") \
+  inner="AWB_DIR=$(q "$AWB_DIR") AWB_TMUX_SOCKET=$(q "$sock") AWB_TMUX_FOR=$(q "$AWB_DIR") AWB_GROUP=$(q "$group") \
 AWB_AGENT_ID=$(q "$id") AWB_AGENT_NAME=$(q "$name") AWB_AGENT_KIND=$(q "$kind") \
 $(q "$BIN") _enter; rc=0; $cmdq || rc=\$?; \
 AWB_DIR=$(q "$AWB_DIR") $(q "$BIN") _leave \$rc; exec $(q "$SHELL")"
   pane=$(tm split-window -h -t "$work" -P -F '#{pane_id}' \
-           -e "AWB_DIR=$AWB_DIR" -e "AWB_TMUX_SOCKET=$sock" -e "AWB_GROUP=$group" \
+           -e "AWB_DIR=$AWB_DIR" -e "AWB_TMUX_SOCKET=$sock" -e "AWB_TMUX_FOR=$AWB_DIR" -e "AWB_GROUP=$group" \
            -e "AWB_AGENT_ID=$id" -e "AWB_AGENT_NAME=$name" \
            -e "AWB_AGENT_KIND=$kind" "$inner")
   tm select-pane -t "$pane" -T "$name"
@@ -1125,11 +1139,11 @@ tui() {
   command -v "${tui_cmd%% *}" >/dev/null || die "$tui_cmd not on PATH (set AWB_TUI_CMD)"
   sock=${AWB_TMUX_SOCKET:-$(sock_path)}
   # resident TUI: register, run interactive claude, drop to shell on exit (pane stays)
-  inner="AWB_DIR=$(q "$AWB_DIR") AWB_TMUX_SOCKET=$(q "$sock") AWB_GROUP=$(q "$group") \
+  inner="AWB_DIR=$(q "$AWB_DIR") AWB_TMUX_SOCKET=$(q "$sock") AWB_TMUX_FOR=$(q "$AWB_DIR") AWB_GROUP=$(q "$group") \
 AWB_AGENT_ID=$(q "$id") AWB_AGENT_NAME=$(q "$name") AWB_AGENT_KIND=claude \
 $(q "$BIN") _enter; $tui_cmd; exec $(q "$SHELL")"
   pane=$(tm split-window -h -t "$work" -P -F '#{pane_id}' \
-           -e "AWB_DIR=$AWB_DIR" -e "AWB_TMUX_SOCKET=$sock" -e "AWB_GROUP=$group" \
+           -e "AWB_DIR=$AWB_DIR" -e "AWB_TMUX_SOCKET=$sock" -e "AWB_TMUX_FOR=$AWB_DIR" -e "AWB_GROUP=$group" \
            -e "AWB_AGENT_ID=$id" -e "AWB_AGENT_NAME=$name" -e "AWB_AGENT_KIND=claude" \
            "$inner")
   tm select-pane -t "$pane" -T "$name"
@@ -1682,6 +1696,8 @@ selftest() {
   # never the user's Lark group: a test board's watch loop would mirror itself there. A
   # guard lark-cli first on PATH records any call that escapes the fakes below.
   XDG_CONFIG_HOME=$t/xdg-none; export XDG_CONFIG_HOME
+  # run from a worker pane, the selftest inherits its board's tmux; it must reach none of it
+  unset AWB_TMUX_SOCKET AWB_TMUX_FOR TMUX TMUX_PANE
   mkdir -p "$t/guard"; printf '#!/bin/sh\necho "$*" >> %s/guard/calls\nexit 1\n' "$t" > "$t/guard/lark-cli"
   chmod +x "$t/guard/lark-cli"; PATH=$t/guard:$PATH; export PATH
 
@@ -1772,6 +1788,12 @@ selftest() {
   ! printf '%s\n' "$rp" | grep -q "	silent	busy " || die "selftest: replay flagged an agent that kept reporting"
   AWB_DIR=$rd AWB_NOW=$((r0 + 600)) "$BIN" snapshot | jq -e '.clock != "" and (.agents | length) == 2' >/dev/null \
     || die "selftest: AWB_NOW did not render the board as of that time"
+  # a task dispatched with awb send shows under 下一步 until its reply closes it
+  sd=$t/sent; mkdir -p "$sd"; sn() { AWB_DIR=$sd "$BIN" "$@"; }
+  sn start d1 reviewer >/dev/null; sm=$(sn send d1 "review the manual"); sk=$(printf '%s' "$sm" | sed -n '1s/^\[awb d1#\([0-9]*\)\].*/\1/p')
+  sn snapshot | jq -e '[.next[].text] == ["reviewer：review the manual"]' >/dev/null || die "selftest: a dispatched task is not under 下一步"
+  sn reply d1 "$sk" "3 findings" >/dev/null
+  sn snapshot | jq -e '.next == []' >/dev/null || die "selftest: a replied task is still under 下一步"
   # news: lines with one key are one fact, the latest shows; lines without a key all show
   bd4=$t/brief4; mkdir -p "$bd4"; nb() { AWB_DIR=$bd4 "$BIN" news "$@"; }
   nb "no key"; nb --key val@15000 "feed: val 1.888"; nb "other"; nb --key val@15000 "val 1.888, grad ok"; nb --key ck "saved"
@@ -2327,6 +2349,14 @@ CHK
     [ "$(printf '%s\n' "$two" | sed -n 2p)" = "$(printf '%s\n' "$top" | sed -n 4p)" ] \
       || die "selftest: g j j does not scroll 2 lines from the top"
     [ -z "$alive" ] || die "selftest: q does not quit the board"
+    # a worker of a board (its socket exported with AWB_TMUX_FOR) that works on another AWB_DIR
+    # cannot touch that board: awb down there leaves the parent session and its panes alive
+    pd=$t/parent; mkdir -p "$pd"; AWB_DIR=$pd/.awb "$BIN" up </dev/null >/dev/null
+    psock=$pd/.awb/sock; [ -S "$psock" ] || die "selftest: awb up without a terminal made no session"
+    AWB_TMUX_SOCKET=$psock AWB_TMUX_FOR=$pd/.awb TMUX=$psock,0,0 AWB_DIR=$t/child "$BIN" down
+    tmux -S "$psock" has-session -t awb 2>/dev/null || die "selftest: awb down under another AWB_DIR killed the parent board"
+    AWB_TMUX_SOCKET=$psock AWB_TMUX_FOR=$pd/.awb AWB_DIR=$pd/.awb "$BIN" down
+    ! tmux -S "$psock" has-session -t awb 2>/dev/null || die "selftest: awb down did not end its own board"
     # awb board twice for one .awb opens one board; the second call names the open one
     bk=$(tmux -L "${S}b" new-session -d -x 160 -y 30 -P -F '#{socket_path},0,0 #{pane_id}' "sleep 60")
     bsock=${bk% *}; bpane=${bk#* }
@@ -2433,7 +2463,8 @@ cmd=${1:-}; shift 2>/dev/null || true
 case "${1:-}" in -h|--help) usage; exit 0 ;; esac
 case "$cmd" in
   up)       up "$@" ;;
-  down)     init_dir; tm kill-session -t awb 2>/dev/null || true ;;
+  down)     init_dir   # only the session awb up made for this board, never the server it runs in
+            [ -S "$(sock_path)" ] && tmux -S "$(sock_path)" kill-session -t awb 2>/dev/null || true ;;
   run)      run "$@" ;;
   tui)      tui "$@" ;;
   start)
