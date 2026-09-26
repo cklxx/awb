@@ -253,16 +253,22 @@ JQ_RENDER=$JQ_FOLD$JQ_DEFS'
 | ([$s.agents[] | select(.status == "running")] | length) as $nrun
 | (if ([$raw[] | select(type == "object")] | length) == 0 then 0
    else $nowep - ([$raw[] | select(type == "object") | .ep // 0] | max // 0) end) as $quiet
+# needs you: a permission dialog, a failed or dead agent, a decision
 | ([ $s.agents[] | select(.wait) | {kind:"wait", id, name, text:.sess, age:null} ]
    + [ $s.agents[] | select((.wait | not) and (.status | IN("failed","dead")))
        | {kind:"fail", id, name, text:(.reason // ""), age:($nowep - (.endEp // .lastEp))} ]
    + [ $s.torder[] | $s.tasks[.] | select(.state == "ask")
        | {kind:"ask", id, name:"", text, age:($nowep - ($tep[.id] // $nowep))} ]) as $need
+# one record per working agent: what it does now, for how long, verified/claimed
+# milestones, flags (no code change, session disagrees); idle agents by name
 | (([ $diffs[] | {key:.id, value:.} ] | from_entries) as $df
    | [ $s.agents[] | select((.wait | not)
           and ((.status | IN("running","blocked")) or ((.sess // "") != "")))
        | . as $a | ($nowep - $a.lastEp) as $idle
        | ($df[$a.id] // null) as $d
+       # silence is an anomaly after AWB_SILENT (3600 s), not AWB_STALE (600 s, the nudge):
+       # on a real three-day log (awb replay) the median gap between two updates of one agent
+       # was 772 s, so half of all normal gaps crossed 600 s
        | ($idle >= $silent and ($a.status | IN("running","blocked"))) as $sil
        | {id:$a.id, name:$a.name, status:$a.status, idle:$idle, silent:$sil, live:($a.live // null),
           dn:($a.done | length), dv:([$a.done[] | select(.text | startswith("⊢ "))] | length),
@@ -278,14 +284,21 @@ JQ_RENDER=$JQ_FOLD$JQ_DEFS'
                     then "无改动 " + (($nowep - $d.ep) | sdur) else empty end),
                   (if ($a.sess // "") != "" then "≠ " + $a.sess else empty end) ] | join(" · "))} ]
    | sort_by([(if .status == "blocked" then 0 elif .status == "running" then 1 else 2 end), -.idle])) as $act
+# what is off: a bottleneck (an issue or PR, #N, that two or more blocked agents wait
+# for), a silent running agent, no code change or a contradicting session, a board
+# nobody has written to while agents run
 | ([ $act[] | select(.status == "blocked")
      | .name as $n | [(.text | match("#[0-9]+"; "g") | .string)] | unique[] | {ref:., name:$n} ]
    | group_by(.ref) | map(select(length >= 2) | {ref:.[0].ref, names:map(.name)})) as $bott
 | ([ ($bott[] | {kind:"bottleneck", text:"\(.ref) 卡住 \(.names | join("、"))"}),
+     # one line per agent: a flag (no code change, session disagrees) over silence; silence
+     # counts only for an agent with no Claude session, since a live session reports itself,
+     # and not for one that owns a probed task whose fresh reading says it waits (docs/probe.md)
      ([ $s.tasks[] | select(.probe != null and (.state | IN("wip","review"))) | .owner ] as $pw
       | $act[] | if .flag != "" then {kind:"flag", text:"\(.name) \(.flag)"}
                elif .status == "running" and .silent and .live == null and ((.id | IN($pw[])) | not)
                then {kind:"silent", text:"\(.name) \(.idle | sdur) 没有更新"} else empty end),
+     # a held resource whose holder has not worked for AWB_STALE: the rest queue behind it
      ($holds[] | . as $hd | ($s.agents[$hd.owner] // null) as $a | ($sess[$hd.owner] // null) as $x
       | (if $x != null then (if $x.status == "busy" then 0 else $nowep - $x.since end)
          elif $a != null then $nowep - $a.lastEp else 0 end) as $q
@@ -452,37 +465,6 @@ else
      | if .by != null and .value != null and .target != null and .value < .target
           and (.eta == null or $nowep + .eta > .by) then .eta = null | .late = true else .late = false end
      end) as $M
-  # needs you: a permission dialog, a failed or dead agent, a decision
-  | ([ $s.agents[] | select(.wait) | {kind:"wait", id, name, text:.sess, age:null} ]
-     + [ $s.agents[] | select((.wait | not) and (.status | IN("failed","dead")))
-         | {kind:"fail", id, name, text:(.reason // ""), age:($nowep - (.endEp // .lastEp))} ]
-     + [ $s.torder[] | $s.tasks[.] | select(.state == "ask")
-         | {kind:"ask", id, name:"", text, age:($nowep - ($tep[.id] // $nowep))} ]) as $need
-  # one record per working agent: what it does now, for how long, verified/claimed
-  # milestones, flags (no code change, session disagrees); idle agents by name
-  | (([ $diffs[] | {key:.id, value:.} ] | from_entries) as $df
-     | [ $s.agents[] | select((.wait | not)
-            and ((.status | IN("running","blocked")) or ((.sess // "") != "")))
-         | . as $a | ($nowep - $a.lastEp) as $idle
-         | ($df[$a.id] // null) as $d
-         # silence is an anomaly after AWB_SILENT (3600 s), not AWB_STALE (600 s, the nudge):
-         # on a real three-day log (awb replay) the median gap between two updates of one agent
-         # was 772 s, so half of all normal gaps crossed 600 s
-         | ($idle >= $silent and ($a.status | IN("running","blocked"))) as $sil
-         | {id:$a.id, name:$a.name, status:$a.status, idle:$idle, silent:$sil, live:($a.live // null),
-            dn:($a.done | length), dv:([$a.done[] | select(.text | startswith("⊢ "))] | length),
-            age:(if $a.status == "running" and $a.current then $nowep - $a.current.ep else $idle end),
-            text:(if $a.status == "blocked" then (($a.reason // "") | ltrimstr("等：") | ltrimstr("等:")
-                                                 | if startswith("等") then . else "等 " + . end)
-                  elif $a.status == "running" and $a.current then ($a.current.text // "")
-                  elif ($a.done | length) > 0 then "✓ " + ($a.done[-1].text // "") else ($a.reason // "") end),
-            flag:([ (($stk[$a.id] // null) as $n | ($sess[$a.id] // null) as $x
-                     | if $n != null and $x != null and $x.status != "busy" and $x.since <= $n.ep
-                       then "工具调用没执行，提醒后仍停着 " + (($nowep - $n.ep) | sdur) else empty end),
-                    (if $a.status == "running" and $d != null and ($nowep - $d.ep) >= $frz
-                      then "无改动 " + (($nowep - $d.ep) | sdur) else empty end),
-                    (if ($a.sess // "") != "" then "≠ " + $a.sess else empty end) ] | join(" · "))} ]
-     | sort_by([(if .status == "blocked" then 0 elif .status == "running" then 1 else 2 end), -.idle])) as $act
   | ([ $s.agents[] | select((.wait | not) and .status == "done" and ((.sess // "") == "")) | {id, name} ]) as $idl
   | ([ $lroots[] as $root | $s.tasks[$root] as $rt
        | prog($s.tasks; leaves($s.tasks; $s.torder; $root)) as $rp
@@ -500,9 +482,6 @@ else
   # the goal: its first line is the title, the rest says what it is
   | (($s.goal | gsub("\r"; "") | split("\n")) as $gl
      | {title:($gl[0] // ""), about:($gl[1:] | map(select(. != "")))}) as $G
-  | (if ([$raw[] | select(type == "object")] | length) == 0 then null
-     else [$raw[] | select(type == "object") | .ep // 0] | max // 0 end) as $lastEp
-  | (if $lastEp == null then 0 else $nowep - $lastEp end) as $quiet
   # the last 24 hours in numbers
   | ($nowep - 86400) as $d1
   | ([$raw[] | select(type == "object" and (.ep // 0) >= $d1)]) as $day
@@ -512,28 +491,6 @@ else
      metric:(if $M == null or ($M.history | length) < 2 or $M.value == null then null
              else (([$M.history[] | select(.ep < $d1)] | last | .value) // $M.history[0].value) as $vd
                | ($M.value - $vd) end)} as $D
-  # what is off: a bottleneck (an issue or PR, #N, that two or more blocked agents wait
-  # for), a silent running agent, no code change or a contradicting session, a board
-  # nobody has written to while agents run
-  | ([ $act[] | select(.status == "blocked")
-       | .name as $n | [(.text | match("#[0-9]+"; "g") | .string)] | unique[] | {ref:., name:$n} ]
-     | group_by(.ref) | map(select(length >= 2) | {ref:.[0].ref, names:map(.name)})) as $bott
-  | ([ ($bott[] | {kind:"bottleneck", text:"\(.ref) 卡住 \(.names | join("、"))"}),
-       # one line per agent: a flag (no code change, session disagrees) over silence; silence
-       # counts only for an agent with no Claude session, since a live session reports itself,
-       # and not for one that owns a probed task whose fresh reading says it waits (docs/probe.md)
-       ([ $s.tasks[] | select(.probe != null and (.state | IN("wip","review"))) | .owner ] as $pw
-        | $act[] | if .flag != "" then {kind:"flag", text:"\(.name) \(.flag)"}
-                 elif .status == "running" and .silent and .live == null and ((.id | IN($pw[])) | not)
-                 then {kind:"silent", text:"\(.name) \(.idle | sdur) 没有更新"} else empty end),
-       # a held resource whose holder has not worked for AWB_STALE: the rest queue behind it
-       ($holds[] | . as $hd | ($s.agents[$hd.owner] // null) as $a | ($sess[$hd.owner] // null) as $x
-        | (if $x != null then (if $x.status == "busy" then 0 else $nowep - $x.since end)
-           elif $a != null then $nowep - $a.lastEp else 0 end) as $q
-        | select($q >= ($stale | tonumber))
-        | {kind:"hold", text:"\($hd.res) 被 \(($a.name) // $hd.owner) 占着 \(($nowep - $hd.since) | sdur)，它 \($q | sdur) 没在干活"}),
-       (if $quiet >= $silent and $nrun > 0
-        then {kind:"board", text:"看板 \($quiet | ago)没有新事件，主控可能停了"} else empty end) ]) as $anom
   # the next open steps of the main line
   | ([ $trees[] | .kids[] | select(.state | IN("done","drop") | not) ][:3]
      # a task dispatched with awb send and not yet replied to is work in flight toward the goal
@@ -690,7 +647,6 @@ JQ_BRIEF=$JQ_DEFS'
 '
 
 dims() {
-  _d=$(
   if [ -n "${AWB_ROWS:-}" ] && [ -n "${AWB_COLS:-}" ]; then
     echo "$AWB_COLS $AWB_ROWS"
   elif [ -n "${TMUX:-}" ] && [ -n "${TMUX_PANE:-}" ]; then
@@ -699,13 +655,7 @@ dims() {
     tmux display-message -p -t "$TMUX_PANE" '#{pane_width} #{pane_height}' 2>/dev/null
   else
     stty size 2>/dev/null | awk '{print $2, $1}'
-  fi ) || _d=""
-  set -- ${_d:-80 24}
-  # a width under 40 is a bad probe (a pane id on another tmux server, a non-tty pipe), not a
-  # real pane: the brief view used to draw 4 columns. Fall back to 80 instead.
-  case $1 in ''|*[!0-9]*) set -- 80 24;; esac
-  [ "$1" -lt 40 ] 2>/dev/null && set -- 80 "${2:-24}"
-  echo "$1 $2"
+  fi || echo "80 24"
 }
 
 # the log as a JSON array, tolerating a half-appended line from a concurrent writer
@@ -2165,7 +2115,6 @@ EOF
   AWB_DIR=$wh "$BIN" snapshot 2>/dev/null | env -u TMUX -u TMUX_PANE "$BIN" view 50 13 | stripansi > "$t/v50"
   [ "$(wc -l < "$t/v50" | tr -d ' ')" -eq 13 ] || die "selftest: awb view ignored ROWS"
   mx=$(wmax < "$t/v50"); [ "$mx" -le 50 ] || die "selftest: awb view ignored COLS ($mx > 50)"
-  printf '' >/dev/null
   AWB_DIR=$wh "$BIN" snapshot 2>/dev/null | env -u AWB_COLS -u AWB_ROWS TMUX=/nonexistent,0,0 TMUX_PANE=%1 "$BIN" view 2>/dev/null | stripansi > "$t/vfb"
   [ "$(wmax < "$t/vfb")" -gt 10 ] && [ "$(wmax < "$t/vfb")" -le 80 ] \
     || die "selftest: awb view with an unreachable pane did not fall back to 80 columns"
@@ -2863,9 +2812,10 @@ case "$cmd" in
             : > "$EV" ;;
   render)   init_dir; render ;;
   replay)   replay "$@" ;;
-  view)     if printf '%s %s' "${1:-}" "${2:-}" | grep -Eq '^[0-9]+ [0-9]+$'; then _vc=$1; _vr=$2
-              else set -- $(dims); _vc=$1; _vr=$2; fi
-            brief_view "$_vc" "$_vr" ;;   # a snapshot on stdin, drawn as the brief view (awb view [COLS] [ROWS])
+  view)     # a snapshot on stdin, drawn as the brief view: awb view [COLS ROWS]. Probed, a width
+            # under 40 is a pane of another server or a worker's sliver, not where this output goes
+            printf '%s %s' "${1:-}" "${2:-}" | grep -Eq '^[0-9]+ [0-9]+$' || { set -- $(dims); [ "${1:-0}" -ge 40 ] || set -- 80 "${2:-24}"; }
+            brief_view "$1" "$2" ;;
   snapshot) init_dir; ( AWB_VIEW=snapshot AWB_COLS=100 AWB_ROWS=200; export AWB_VIEW AWB_COLS AWB_ROWS; render ) ;;
   watch)    init_dir; watch ;;
   _enter)   _enter ;;
