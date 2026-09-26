@@ -2114,7 +2114,7 @@ FT
     reg busy
     ! AWB_SILENT=1 ht snapshot | jq -e '.anomalies[] | select(.text | startswith("demo "))' >/dev/null \
       || die "selftest: a silent agent with a busy session listed as an anomaly"
-    AWB_SILENT=1 "$BIN" snapshot | jq -e '.anomalies[] | select(.kind == "silent" and (.text | startswith("demo ")))' >/dev/null \
+    HOME=$t/nohome AWB_SILENT=1 "$BIN" snapshot | jq -e '.anomalies[] | select(.kind == "silent" and (.text | startswith("demo ")))' >/dev/null \
       || die "selftest: a silent agent with no session not listed"
     reg idle "" 10
     ! ht render | grep -Fq "会话空闲" || die "selftest: running agent idle 10s flagged"
