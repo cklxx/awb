@@ -50,13 +50,13 @@ BIN=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
 JQ_FOLD='
 def fold:
 reduce (. // [])[] as $e (
-  {goal:"", agents:{}, gorder:{}, gseen:[], tasks:{}, torder:[], news:[], checks:{}};
+  {goal:"", agents:{}, gorder:{}, gseen:[], tasks:{}, torder:[], news:[], checks:{}, probes:{}};
   if   $e.t == "goal" then .goal = $e.text
   elif $e.t == "news" then .news += [{text:$e.text, time:($e.time // "")}]
   elif $e.t == "task" then
     (if .tasks[$e.id] == null then .torder += [$e.id] else . end)
     | .tasks[$e.id] = ((.tasks[$e.id] // {id:$e.id, state:"todo", text:$e.id, parent:"", owner:""})
-        + ({state:$e.state, text:$e.text, parent:$e.parent, owner:$e.owner}
+        + ({state:$e.state, text:$e.text, parent:$e.parent, owner:$e.owner, probe:$e.probe, pdir:$e.pdir}
            | with_entries(select(.value != null and .value != ""))))
   elif $e.t == "start" then
     if .agents[$e.id] != null then
@@ -76,6 +76,14 @@ reduce (. // [])[] as $e (
     | (.checks[$e.id].steps | map(.s) | index($e.step)) as $i
     | if $i == null then .checks[$e.id].steps += [{s:$e.step, state:$e.state, ep0:$e.ep, ep1:null, note:""}]
       else .checks[$e.id].steps[$i] += {state:$e.state, ep1:$e.ep, note:$e.note} end
+  # probe reading (model/Probe.lean pstep): keep the parsed one with the latest start ep0
+  elif $e.t == "probe" then
+    (.probes[$e.id].acc // null) as $a | ($e.ep0 // 0) as $t0
+    | .probes[$e.id].last = ($e.ep // 0)
+    | if $e.rc == 0 and ($e.st | IN("todo","wip","review","blocked","done","drop"))
+         and ($a == null or $t0 >= $a.ep0)
+      then .probes[$e.id].acc = {ep0:$t0, ep:($e.ep // 0), st:$e.st, text:($e.text // "")}
+      else .probes[$e.id].acc = $a end
   elif ($e.id | type) != "string" or .agents[$e.id] == null then .
   elif $e.t == "now" then
     (if .agents[$e.id].status == "done" then .agents[$e.id].status = "running" | .agents[$e.id].endEp = null | .agents[$e.id].reason = "" else . end)
@@ -206,6 +214,17 @@ def wrap($n):
         .value.sess = "自报进行，会话空闲 " + (($nowep - $x.since) | sdur)
       else . end)
 
+# a probed task shows its accepted reading while fresh (done/drop do not expire), else unknown
+| .probes as $P
+| .tasks |= map_values(
+    if .probe == null then .
+    else ($P[.id].acc // null) as $a
+      | if $a != null and (($a.st | IN("done","drop")) or $nowep - $a.ep <= $fresh)
+        then .state = $a.st | .text += " · " + $a.text + " · " + (($nowep - $a.ep0) | sdur) + "前"
+        else .state = "unknown"
+          | .text += (if $a == null then " · 未读到" else " · 读不到 " + (($nowep - $a.ep) | sdur) end)
+        end
+    end)
 | . as $s
 | ($s.gseen | map({g:., ids:$s.gorder[.]})) as $groups
 | ([$s.agents[]] | length) as $n
@@ -245,7 +264,7 @@ def wrap($n):
             "pr-without-passing-check":"没有通过的验收就开了 PR",
             "done-while-check-rejected":"验收被拒后仍报完成"}[.[1]] // .[1]) ] end)) as $chk
 | ({"todo":["○",$dm],"wip":["◔",$cy],"review":["◑",$cy],"blocked":["▲",$y],
-    "done":["✓",$g],"drop":["–",$dm],"ask":["?",$y]}) as $TI
+    "done":["✓",$g],"drop":["–",$dm],"ask":["?",$y],"unknown":["?",$r]}) as $TI
 | ([ kids($s.tasks; $s.torder; "")[] as $root | $s.tasks[$root] as $rt
      | prog($s.tasks; leaves($s.tasks; $s.torder; $root)) as $rp
      | [$cy + "■ " + ($rt.text | clip($inner - 36)) + $rs + "  " + bar($rp.d; $rp.t; 12) + $dm + " \($rp.d)/\($rp.t)" + $rs]
@@ -422,9 +441,11 @@ else
      | group_by(.ref) | map(select(length >= 2) | {ref:.[0].ref, names:map(.name)})) as $bott
   | ([ ($bott[] | {kind:"bottleneck", text:"\(.ref) 卡住 \(.names | join("、"))"}),
        # one line per agent: a flag (no code change, session disagrees) over silence; silence
-       # counts only for an agent with no Claude session, since a live session reports itself
-       ($act[] | if .flag != "" then {kind:"flag", text:"\(.name) \(.flag)"}
-                 elif .status == "running" and .silent and .live == null
+       # counts only for an agent with no Claude session, since a live session reports itself,
+       # and not for one that owns a probed task whose fresh reading says it waits (docs/probe.md)
+       ([ $s.tasks[] | select(.probe != null and (.state | IN("wip","review"))) | .owner ] as $pw
+        | $act[] | if .flag != "" then {kind:"flag", text:"\(.name) \(.flag)"}
+                 elif .status == "running" and .silent and .live == null and ((.id | IN($pw[])) | not)
                  then {kind:"silent", text:"\(.name) \(.idle | sdur) 没有更新"} else empty end),
        # a held resource whose holder has not worked for AWB_STALE: the rest queue behind it
        ($holds[] | . as $hd | ($s.agents[$hd.owner] // null) as $a | ($sess[$hd.owner] // null) as $x
@@ -558,8 +579,11 @@ model_bin() {
 # per-agent state from the jq fold, same format as `awbmodel fold`
 state() {
   init_dir
-  events_json | jq -r "$JQ_FOLD"' fold | .agents | to_entries | sort_by(.key)[] | .value as $a
-    | "\(.key) \($a.status) \($a.gate // false) \($a.endEp // "-") \(($a.done | last | .dur) // 0) \($a.done | length)"'
+  events_json | jq -r "$JQ_FOLD"' fold
+    | (.agents | to_entries | sort_by(.key)[] | .value as $a
+       | "\(.key) \($a.status) \($a.gate // false) \($a.endEp // "-") \(($a.done | last | .dur) // 0) \($a.done | length)"),
+      (.probes | to_entries | sort_by(.key)[] | .value.acc as $a
+       | if $a == null then "probe \(.key) - - -" else "probe \(.key) \($a.st) \($a.ep0) \($a.ep)" end)'
 }
 
 # protocol violations found by the verified Lean monitor (model/Audit.lean)
@@ -590,7 +614,7 @@ render() {
     --argjson w "$cols" --argjson h "$rows" \
     --arg now "$(date +$TS_FMT)" --argjson nowep "$(date +%s)" \
     --arg prog "$PROG" --argjson live "$live" --arg view "${AWB_VIEW:-brief}" --arg stale "${AWB_STALE:-600}" \
-    --argjson diffs "$diffs" --argjson frz "${AWB_FROZEN:-900}" \
+    --argjson diffs "$diffs" --argjson frz "${AWB_FROZEN:-900}" --argjson fresh "${AWB_PROBE_FRESH:-600}" \
     --argjson mstale "${AWB_METRIC_STALE:-21600}" --argjson tstale "${AWB_TASK_STALE:-21600}" --argjson sess "$(sessions_json)" \
     --arg g  "${ESC}[32m"  --arg cy "${ESC}[36m" --arg y "${ESC}[33m" \
     --arg r  "${ESC}[31m"  --arg dm "${ESC}[2m"  --arg rs "${ESC}[0m" \
@@ -660,6 +684,100 @@ freeze_once() {
     awk 'NR==FNR {seen[$1]=1; next} ($1 in seen)' "$df" "$nf" > "$nf.new" && mv "$nf.new" "$nf"
   fi
   unlock "freeze"
+}
+
+# probes (docs/probe.md): a task's probe is a command whose first stdout line is "STATE text"
+# with exit 0; anything else is a failed reading and the board shows unknown.
+
+# built-in probe: PR N of the repo in $PWD. The API head must equal the remote ref (anchor).
+probe_pr() {
+  [ $# -eq 1 ] || die "usage: $PROG probe pr N"
+  j=$(gh pr view "$1" --json state,headRefOid,mergeCommit,statusCheckRollup) || exit 1
+  api=$(printf '%s' "$j" | jq -r .headRefOid)
+  ref=$(git ls-remote origin "refs/pull/$1/head" | cut -f1)
+  [ -n "$api" ] && [ "$api" = "$ref" ] || { echo "anchor: api head $api != remote $ref" >&2; exit 1; }
+  printf '%s' "$j" | jq -r '
+    def bad: IN("FAILURE","ERROR","CANCELLED","TIMED_OUT","ACTION_REQUIRED","STARTUP_FAILURE");
+    def ok: IN("SUCCESS","NEUTRAL","SKIPPED");
+    [(.statusCheckRollup // [])[] | {n:(.name // .context // "?"),
+       s:(if .status == null or .status == "COMPLETED" then (.conclusion // .state // "") else "PENDING" end)}] as $k
+    | if .state == "MERGED" then "done merged \(.mergeCommit.oid // "" | .[0:8])"
+      elif .state == "CLOSED" then "drop closed unmerged"
+      elif any($k[]; .s | bad) then "blocked CI red: " + ([$k[] | select(.s | bad) | .n] | join(","))
+      elif ($k | length) == 0 or any($k[]; .s | ok | not) then "review CI pending \([$k[] | select(.s | ok)] | length)/\($k | length)"
+      else "review CI green, not merged" end'
+}
+
+# built-in probe: the last line of PATH matching REGEX. Two numeric groups read as n/total,
+# otherwise the first group (or the match) is the text. A log silent AWB_PROBE_SILENT is blocked.
+probe_log() {
+  [ $# -eq 2 ] || die "usage: $PROG probe log PATH REGEX"
+  [ -r "$1" ] || { echo "no log $1" >&2; exit 1; }
+  m=$(stat -f %m "$1" 2>/dev/null || stat -c %Y "$1")
+  tail -n 2000 "$1" | jq -R -s -r --arg re "$2" --argjson age $(($(date +%s) - m)) \
+      --argjson silent "${AWB_PROBE_SILENT:-1800}" '
+    def num: test("^[0-9]+([.][0-9]+)?$");
+    ([split("\n")[] | match($re)] | last) as $m
+    | if $m == null then error("no line matches") else . end
+    | [$m.captures[] | .string // empty] as $g
+    | (if $age >= $silent then "blocked log silent \($age / 60 | floor)m: " else "wip " end) as $pre
+    | if ($g | length) >= 2 and ($g[0] | num) and ($g[1] | num) then
+        ($g[0] | tonumber) as $n | ($g[1] | tonumber) as $t
+        | if $t > 0 and $n >= $t then "done \($n)/\($t)"
+          else $pre + "\($n)/\($t) \(if $t > 0 then ($n * 100 / $t | floor) else 0 end)%" end
+      else $pre + ($g[0] // $m.string) end'
+}
+
+# run CMD in DIR, at most SECS, in its own process group; prints "RC FIRST-LINE"
+probe_exec() {
+  _f=$(mktemp "$AWB_DIR/probe.XXXXXX")
+  set -m; (cd "$2" && exec sh -c "$3") > "$_f" 2>/dev/null < /dev/null & _p=$!; set +m
+  _n=0; _to=
+  while kill -0 "$_p" 2>/dev/null; do
+    _n=$((_n + 1))
+    if [ "$_n" -gt $(($1 * 5)) ]; then
+      kill -TERM -- "-$_p" 2>/dev/null || true; sleep 0.2; kill -KILL -- "-$_p" 2>/dev/null || true
+      _to=1; break
+    fi
+    sleep 0.2
+  done
+  wait "$_p" 2>/dev/null && _rc=0 || _rc=$?
+  [ -z "$_to" ] || _rc=124
+  printf '%s %s\n' "$_rc" "$(head -n 1 "$_f")"
+  rm -f "$_f"
+}
+
+# one probe round: every probed task not yet done/drop whose last reading is AWB_PROBE_EVERY old
+probe_once() {
+  init_dir
+  lock "probe"
+  events_json | jq -r --argjson now "$(date +%s)" --argjson every "${AWB_PROBE_EVERY:-120}" "$JQ_FOLD"'
+    fold | .probes as $P | .tasks as $T | .torder[] | $T[.] | select(.probe != null)
+    | ($P[.id] // {}) as $p
+    | select((($p.acc.st // "") | IN("done","drop")) | not)
+    | select($now - ($p.last // 0) >= $every)
+    | "\(.id) \(.pdir // "." | @base64) \(.probe | @base64)"' |
+  while read -r id dir cmd; do
+    dir=$(printf '%s' "$dir" | jq -Rr @base64d); cmd=$(printf '%s' "$cmd" | jq -Rr @base64d)
+    ep0=$(date +%s)
+    r=$(probe_exec "${AWB_PROBE_TIMEOUT:-30}" "$dir" "$cmd")
+    rc=${r%% *}; line=${r#* }
+    append '{t:"probe",time:$time,ep:$ep,id:$id,ep0:$ep0,rc:$rc,st:($l | split(" ")[0]),
+             text:($l | sub("^[^ ]* ?"; ""))}' \
+      --arg id "$id" --argjson ep0 "$ep0" --argjson rc "$rc" --arg l "$line"
+  done
+  unlock "probe"
+}
+
+probe() {
+  case "${1:-}" in
+    pr)  shift; probe_pr "$@" ;;
+    log) shift; probe_log "$@" ;;
+    run) init_dir
+         if [ "${2:-}" = --once ]; then probe_once
+         else while :; do probe_once; sleep "${AWB_PROBE_POLL:-30}"; done; fi ;;
+    *)   die "usage: $PROG probe pr N | probe log PATH REGEX | probe run [--once]" ;;
+  esac
 }
 
 # nudge: paste a reminder into the pane of every agent silent >= AWB_STALE,
@@ -1364,9 +1482,13 @@ Chat-driven: you talk to one Claude (the main agent); it keeps the board and run
                                     single value/target bar under GOAL (brief view)
                                     board view: AWB_VIEW=brief (default) | full
                                     AWB_STALE=SECS: list agents silent that long (default 600)
-  $PROG task ID STATE [TEXT] [PARENT] [OWNER]
+  $PROG task ID STATE [TEXT] [PARENT] [OWNER] [--probe CMD]
                                     task tree node; STATE todo|wip|review|blocked|done|drop;
-                                    re-issue to update (empty args keep old values)
+                                    re-issue to update (empty args keep old values);
+                                    --probe: the state comes from CMD (docs/probe.md)
+  $PROG probe run [--once]          run due task probes (AWB_PROBE_EVERY 120 s, timeout 30 s)
+  $PROG probe pr N                  built-in probe: PR state and CI, anchored to the remote ref
+  $PROG probe log PATH REGEX        built-in probe: last matching line, n/total from two groups
   $PROG now ID MILESTONE            set agent's current objective
   $PROG done ID [TEXT]              milestone achieved
   $PROG block ID REASON             mark blocked
@@ -1801,6 +1923,63 @@ FT
   ! printf '%s' "$fr" | grep -Fq "blk 无改动" || die "selftest: blocked agent marked frozen"
   printf 'zf 1 %s\nzfb 1 %s\n' "$(date +%s)" "$(date +%s)" > "$t/diffs"
   ! "$BIN" render | grep -Fq "无改动 " || die "selftest: fresh fingerprint shown frozen"
+  # probes (docs/probe.md; model/Probe.lean, model/tla/AwbProbe.tla)
+  pt=$t/probe; mkdir -p "$pt"
+  pb() { AWB_DIR=$pt "$BIN" "$@"; }
+  pev() { printf '{"t":"probe","time":"x","ep":%s,"id":"%s","ep0":%s,"rc":%s,"st":"%s","text":"%s"}\n' "$@" >> "$pt/events.jsonl"; }
+  pb task p0 todo probes
+  pb task pa wip pa p0 "" --probe 'echo "done merged 1234abcd"'
+  pb task pb wip pb p0 "" --probe 'echo "wip 3/10 30%"'
+  pb task pc wip pc p0 "" --probe 'echo "blocked CI red: lint"'
+  pb task pd wip pd p0 "" --probe 'echo garbage'
+  pb task pe done pe p0 "" --probe 'echo "done x"; exit 3'
+  pb task pf wip pf p0 "" --probe "echo 'done early'; sleep 30 & echo \$! > $(q "$pt/child"); wait"
+  AWB_PROBE_TIMEOUT=1 pb probe run --once
+  po=$(AWB_VIEW=full pb render)
+  pl() { printf '%s\n' "$po" | grep -F -- "$1 · "; }
+  pl pa | grep -Fq "✓ pa · merged 1234abcd" || die "selftest: probe done not shown done"
+  pl pb | grep -Fq "◔ pb · 3/10 30%" || die "selftest: probe wip not shown wip"
+  pl pc | grep -Fq "▲ pc · CI red: lint" || die "selftest: probe blocked not shown blocked"
+  pl pd | grep -Fq "? pd · 未读到" || die "selftest: unparseable probe output not shown unknown"
+  pl pe | grep -Fq "? pe · 未读到" || die "selftest: probe with rc != 0 not shown unknown"
+  pl pf | grep -Fq "? pf · 未读到" || die "selftest: timed-out probe not shown unknown"
+  c=$(cat "$pt/child"); case $(ps -o stat= -p "$c" 2>/dev/null || true) in ""|Z*) ;;
+    *) kill "$c"; die "selftest: timed-out probe left its child running" ;; esac
+  pl pa | grep -Eq "1234abcd · [0-9]+s前" || die "selftest: probe reading age not shown"
+  pn=$(date +%s)
+  pb task ps wip ps p0 "" --probe 'exit 1'
+  pev "$pn" ps "$pn" 0 wip new; pev "$pn" ps $((pn - 100)) 0 done old
+  AWB_VIEW=full pb render | grep -F "ps · " | grep -Fq "◔ ps · new" || die "selftest: older probe reading overrode a newer one"
+  pb task pq wip pq p0 "" --probe 'exit 1'
+  pev $((pn - 1000)) pq $((pn - 1000)) 0 wip old
+  AWB_VIEW=full pb render | grep -F "pq · " | grep -Fq "? pq · 读不到" || die "selftest: expired probe reading still shown"
+  pb task pw review pw p0 waiter --probe 'exit 1'
+  pev "$pn" pw "$pn" 0 review "CI pending 1/2"
+  printf '{"t":"start","time":"x","ep":%s,"id":"%s","name":"%s"}\n' $((pn - 2000)) waiter waiter \
+    $((pn - 2000)) idler idler >> "$pt/events.jsonl"
+  ps_=$(pb snapshot | jq -r '.anomalies[] | select(.kind == "silent") | .text')
+  printf '%s' "$ps_" | grep -Fq idler || die "selftest: silent agent missing from anomalies"
+  ! printf '%s' "$ps_" | grep -Fq waiter || die "selftest: owner of a waiting probed task listed silent"
+  # built-in probes against stub gh/git
+  sb=$pt/bin; mkdir -p "$sb"
+  printf '#!/bin/sh\ncat "$STUB_GH"\n' > "$sb/gh"; printf '#!/bin/sh\nprintf "%%s\\trefs/pull/7/head\\n" "$STUB_REF"\n' > "$sb/git"
+  chmod +x "$sb/gh" "$sb/git"
+  printf '{"state":"OPEN","headRefOid":"aaa","mergeCommit":null,"statusCheckRollup":[%s,%s]}' \
+    '{"name":"lint","status":"COMPLETED","conclusion":"FAILURE"}' '{"name":"test","status":"COMPLETED","conclusion":"SUCCESS"}' > "$pt/gh"
+  [ "$(PATH=$sb:$PATH STUB_GH=$pt/gh STUB_REF=aaa "$BIN" probe pr 7)" = "blocked CI red: lint" ] \
+    || die "selftest: probe pr did not report the red check"
+  ! PATH=$sb:$PATH STUB_GH=$pt/gh STUB_REF=bbb "$BIN" probe pr 7 >/dev/null 2>&1 \
+    || die "selftest: probe pr accepted an API head that differs from the remote ref"
+  printf '{"state":"MERGED","headRefOid":"aaa","mergeCommit":{"oid":"1234567890"},"statusCheckRollup":[]}' > "$pt/gh"
+  [ "$(PATH=$sb:$PATH STUB_GH=$pt/gh STUB_REF=aaa "$BIN" probe pr 7)" = "done merged 12345678" ] \
+    || die "selftest: probe pr did not report the merge"
+  printf 'step 1/10\nnoise\nstep 4/10\n' > "$pt/log"
+  [ "$("$BIN" probe log "$pt/log" 'step ([0-9]+)/([0-9]+)')" = "wip 4/10 40%" ] || die "selftest: probe log n/total wrong"
+  echo 'step 10/10' >> "$pt/log"
+  [ "$("$BIN" probe log "$pt/log" 'step ([0-9]+)/([0-9]+)')" = "done 10/10" ] || die "selftest: probe log did not finish"
+  ! "$BIN" probe log "$pt/log" 'nomatch' >/dev/null 2>&1 || die "selftest: probe log without a match exited 0"
+  printf 'step 2/10\n' > "$pt/log2"; touch -t 202001010000 "$pt/log2"
+  "$BIN" probe log "$pt/log2" 'step ([0-9]+)/([0-9]+)' | grep -q "^blocked log silent" || die "selftest: silent log not blocked"
   "$BIN" skill | grep -q "awb check" || die "selftest: skill manual not found"
   if m=$(model_bin); then
     "$BIN" audit | grep -q "^g1 done-while-check-rejected" || die "selftest: audit missed done after rejection"
@@ -2006,10 +2185,18 @@ case "$cmd" in
       --arg id "$1" --arg name "${2:-$1}" --arg kind "${3:-agent}" --arg pane "" \
       --arg group "${4:-default}"
     ;;
-  task)     [ $# -ge 2 ] || die "usage: $PROG task ID STATE [TEXT] [PARENT] [OWNER]"
+  task)     [ $# -ge 2 ] || die "usage: $PROG task ID STATE [TEXT] [PARENT] [OWNER] [--probe CMD]"
             case $2 in todo|wip|review|blocked|done|drop|ask) ;; *) die "state: todo|wip|review|blocked|done|drop|ask" ;; esac
-            append '{t:"task",time:$time,ep:$ep,id:$id,state:$st,text:$text,parent:$par,owner:$own}' \
-              --arg id "$1" --arg st "$2" --arg text "${3:-}" --arg par "${4:-}" --arg own "${5:-}" ;;
+            pcmd=; pdir=
+            if [ $# -ge 4 ] && eval "[ \"\${$(($# - 1))}\" = --probe ]"; then
+              eval "pcmd=\${$#}"; pdir=$PWD; _k=$(($# - 2)); _a=; _i=0
+              for _x; do _i=$((_i + 1)); [ $_i -le $_k ] && _a="$_a $(q "$_x")"; done
+              eval "set -- $_a"
+            fi
+            append '{t:"task",time:$time,ep:$ep,id:$id,state:$st,text:$text,parent:$par,owner:$own,probe:$pc,pdir:$pd}' \
+              --arg id "$1" --arg st "$2" --arg text "${3:-}" --arg par "${4:-}" --arg own "${5:-}" \
+              --arg pc "$pcmd" --arg pd "$pdir" ;;
+  probe)    probe "$@" ;;
   stale)    init_dir; now=$(date +%s)
             { [ -s "$EV" ] && cat "$EV" || true; } | jq -R -s -r --argjson now "$now" --argjson stale "${AWB_STALE:-600}" '
               rtrimstr("\n") | if . == "" then [] else split("\n") | map(fromjson? | select(type == "object")) end

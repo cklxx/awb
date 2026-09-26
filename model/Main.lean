@@ -1,11 +1,14 @@
 import Audit
 import Brief
+import Probe
 import Lean.Data.Json
 
 /-!
 `awbmodel` runs the proven model on a real `.awb/events.jsonl` (stdin):
 
-* `awbmodel fold`  — per-agent state from `step`: `ID STATUS GATE END DUR ND`, sorted by id;
+* `awbmodel fold`  — per-agent state from `step`: `ID STATUS GATE END DUR ND`, sorted by id,
+                     then the accepted probe reading per task from `prun`:
+                     `probe ID STATE T0 EP` (`- - -` when none parsed);
                      `awb state` prints the same from awb's jq fold (differential test).
 * `awbmodel audit` — protocol violations from the verified monitor `audit`; exit 1 if any.
 * `awbmodel brief` — each agent's brief-view section (`Brief.sec`): `ID work|idle|need`.
@@ -47,6 +50,30 @@ def parseLine (line : String) : Option (String × Ob) := do
   | "pr" => pure (id, .pr)
   | _ => none
 
+def PSt.ofString : String → Option PSt
+  | "todo" => some .todo | "wip" => some .wip | "review" => some .review
+  | "blocked" => some .blocked | "done" => some .done | "drop" => some .drop | _ => none
+
+def PSt.name : PSt → String
+  | .todo => "todo" | .wip => "wip" | .review => "review" | .blocked => "blocked"
+  | .done => "done" | .drop => "drop"
+
+/-- A probe log line as (task id, reading): parsed only when rc = 0 and the state is valid. -/
+def probeLine (line : String) : Option (String × PEv) := do
+  let j ← (Json.parse line).toOption
+  if str? j "t" != some "probe" then none
+  let id ← str? j "id"
+  let st := if int? j "rc" == some 0 then (str? j "st").bind PSt.ofString else none
+  pure (id, ⟨(int? j "ep0").getD 0, (int? j "ep").getD 0, st⟩)
+
+def probeTraces (lines : List String) : List (String × List PEv) := Id.run do
+  let mut tr : Std.HashMap String (Array PEv) := {}
+  for l in lines do
+    match probeLine l with
+    | none => pure ()
+    | some (id, e) => tr := tr.insert id ((tr.getD id #[]).push e)
+  return tr.toList.map fun (id, es) => (id, es.toList)
+
 /-- Per-agent traces in first-seen order. Like the jq fold, status events before an
 agent's first `start` are dropped; check and PR events are kept for the audit. -/
 def traces (lines : List String) : List (String × List Ob) := Id.run do
@@ -79,7 +106,7 @@ def gen (seed n : Nat) : List String := Id.run do
   for _ in [0:n] do
     s := lcg s; let r := s / 65536
     let id := #["a", "b", "c"][r % 3]!
-    let k := (r / 3) % 16
+    let k := (r / 3) % 18
     let d : Int := (((r / 48) % 7 : Nat) : Int) - 1          -- mostly forward, sometimes back
     ep := ep + d
     let base := s!"\"time\":\"x\",\"ep\":{ep},\"id\":\"{id}\""
@@ -98,6 +125,12 @@ def gen (seed n : Nat) : List String := Id.run do
       | 10 | 11 | 12 => s!"\{\"t\":\"chk\",{base},\"run\":\"{run}\",\"what\":\"w\",\"step\":\"{step}\",\"state\":\"{cs}\",\"note\":\"\"}"
       | 13 => s!"\{\"t\":\"pr\",{base},\"url\":\"u\"}"
       | 14 => s!"\{\"t\":\"goal\",\"time\":\"x\",\"ep\":{ep},\"text\":\"g\"}"
+      | 16 | 17 =>                                          -- probe readings, some older, some failed
+          let tid := #["t1", "t2"][(r / 20160) % 2]!
+          let ep0 := ep - (((r / 40320) % 4 : Nat) : Int)
+          let rc := #[0, 0, 0, 1, 124][(r / 161280) % 5]!
+          let pst := #["\"wip\"", "\"done\"", "\"review\"", "\"bogus\"", "null"][(r / 806400) % 5]!
+          s!"\{\"t\":\"probe\",\"time\":\"x\",\"ep\":{ep},\"id\":\"{tid}\",\"ep0\":{ep0},\"rc\":{rc},\"st\":{pst},\"text\":\"p\"}"
       | _ => "{\"t\":\"now\",\"id\":"                         -- a torn line
     out := out.push line
   return out.toList
@@ -116,6 +149,10 @@ def main (args : List String) : IO UInt32 := do
             let a := fold tr
             let e := match a.endEp with | some x => toString x | none => "-"
             IO.println s!"{id} {a.st.name} {a.gate} {e} {a.dur} {a.nd}"
+        for (id, es) in (probeTraces (input.splitOn "\n")).toArray.qsort (fun x y => x.1 < y.1) do
+          match Probe.prun es with
+          | some a => IO.println s!"probe {id} {a.st.name} {a.t0} {a.ep}"
+          | none => IO.println s!"probe {id} - - -"
         return 0
       else if cmd == "brief" then
         for (id, tr) in ts.toArray.qsort (fun x y => x.1 < y.1) do

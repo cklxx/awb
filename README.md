@@ -218,6 +218,22 @@ non-git directories are skipped.
   `ID PANE` per line (an optional third column overrides the working directory used for
   change detection); it overrides panes from start events.
 
+## Probes
+
+A task can read its state from an artifact instead of a self-report (design and proofs:
+[docs/probe.md](docs/probe.md)):
+
+```sh
+awb task t7 wip "merge #671" "" "" --probe 'awb probe pr 671'
+awb task t1 wip "train" "" de --probe 'awb probe log runs/x.log "step ([0-9]+)/([0-9]+)"'
+awb probe run                                         # loop: run due probes, log readings
+```
+
+A probe prints `STATE text` and exits 0; anything else is a failed read and the task shows
+`?` (unknown). A reading shows its age and expires after `AWB_PROBE_FRESH` seconds (default
+600); `done` and `drop` do not expire. An owner of a probed task that is fresh `wip` or
+`review` is not listed as stale.
+
 ## Contributing and releases
 
 Changes land by PR. Fix on a branch, then gate and open the PR with awb itself:
@@ -248,6 +264,8 @@ proven model:
 | dispatch/report loop (main ↔ worker) | TLA+ with liveness: no false done, no lost task | `model/tla/AwbLoop.tla` |
 | tell vs a permission dialog | TLA+: a dialog the registry reported before a keystroke is never typed into (registry re-read before the paste and every Enter); `AwbWaitRace.cfg` shows the window no check closes | `model/tla/AwbWait.tla` |
 | Lark sync (ticks, manual syncs, crashes vs one topic) | TLA+: one topic per board and the card never goes back to an older state; `AwbLarkOld*.cfg` reproduce two topics and a regressed card from breaking the lock by age | `model/tla/AwbLark.tla` |
+| probe fold (readings → task state) | proven: the accepted reading is the newest parsed one, a failed read changes nothing, `done` shows only from a done reading, expired readings show unknown; jq = Lean by the same differential test | `model/Probe.lean` |
+| probe timing (late, failed, foreign readings) | TLA+: `AwbProbeOld.cfg` shows false done, stale values, older-over-newer and waiting-as-stale; `AwbProbeFixed.cfg` passes with liveness | `model/tla/AwbProbe.tla` |
 | concurrency (check, pr, tell vs the agent) | TLA+, model-checked with TLC: `*Old.cfg` reproduces the races of 0.0.5, `*Fixed.cfg` passes | `model/tla/` |
 
 Races TLC found in 0.0.5, now fixed and covered by selftest: a check that passed after the
