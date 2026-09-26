@@ -683,7 +683,9 @@ render_jq() {
 
 # replay: the board's anomalies over the log's history, one snapshot every STEP seconds as of
 # that time (AWB_NOW), grouped into episodes (one anomaly on consecutive snapshots). This is
-# how a rule's thresholds are judged against what really happened, not by guess.
+# how a rule's thresholds are judged against what really happened, not by guess. Its last
+# section measures the core goal on the same log: tasks the main agent sent and whether their
+# replies came, how long a 需要你 item stayed on the board, how often workers restarted.
 replay() {
   init_dir
   step=${1:-1800}
@@ -695,20 +697,36 @@ replay() {
   while [ "$_t" -le "$_end" ] && [ "$_n" -lt "${AWB_REPLAY_MAX:-2000}" ]; do
     _t=$((_t + step)); _n=$((_n + 1))
     jq -Rc --argjson T "$_t" 'fromjson? | select(type == "object" and (.ep // 0) <= $T)' < "$EV" > "$_rd/events.jsonl"
-    AWB_DIR=$_rd AWB_NOW=$_t "$BIN" snapshot | jq -c --argjson T "$_t" '{T:$T, a:.anomalies}'
+    AWB_DIR=$_rd AWB_NOW=$_t "$BIN" snapshot | jq -c --argjson T "$_t" '{T:$T, a:.anomalies, n:[.need[] | {kind, id, text}]}'
   done > "$_rd/series"
-  jq -rs --argjson step "$step" '
+  jq -rs --argjson step "$step" --slurpfile E "$_rd/events.jsonl" '
     def at: strflocaltime("%m-%d %H:%M");
-    def dur: if . >= 86400 then "\((. / 8640 | floor) / 10)天" elif . >= 3600 then "\((. / 360 | floor) / 10)小时"
+    def dur: if . == null then "-" elif . >= 86400 then "\((. / 8640 | floor) / 10)天" elif . >= 3600 then "\((. / 360 | floor) / 10)小时"
              else "\(. / 60 | floor)分钟" end;
+    def med: sort | if length == 0 then null else .[length / 2 | floor] end;
+    # one item on consecutive snapshots is one episode
+    def episodes: group_by(.key) | [ .[] | sort_by(.T)
+        | reduce .[] as $x ([]; if length > 0 and $x.T - .[-1].last <= $step
+                               then .[-1].last = $x.T else . + [$x + {first:$x.T, last:$x.T}] end)[]
+        | . + {span:(.last - .first + $step)} ];
     . as $S
+    # a sent task (keyed now) ends with its reply (keyed done); with `finish` (status done, no
+    # reply recorded); or is lost: a restart, a failure or a newer task came first. The rest are
+    # open at the end of the log
+    | (reduce ($E[] | select(type == "object" and (.id | type) == "string")) as $e ({o:{}, r:[], seen:{}, restart:0, exit:0};
+        (if $e.t == "start" then (if .seen[$e.id] then .restart += 1 else . end) | .seen[$e.id] = true
+         elif $e.t == "status" and $e.status == "failed" and ($e.gate | not) then .exit += 1 else . end)
+        | if $e.t == "now" and ($e.key // "") != "" then
+            (if .o[$e.id] then .r += [.o[$e.id] + {how:"lost"}] else . end) | .o[$e.id] = {t0:$e.ep}
+          elif .o[$e.id] == null then .
+          elif $e.t == "done" and ($e.key // "") != "" then .r += [.o[$e.id] + {how:"reply", d:($e.ep - .o[$e.id].t0)}] | del(.o[$e.id])
+          elif $e.t == "status" and $e.status == "done" then .r += [.o[$e.id] + {how:"finish"}] | del(.o[$e.id])
+          elif $e.t == "start" or ($e.t == "status" and $e.status == "failed") then .r += [.o[$e.id] + {how:"lost"}] | del(.o[$e.id])
+          else . end)) as $K
+    | ([ $S[] | .T as $T | (.n // [])[] | . + {T:$T, key:(.kind + " " + .id)} ] | episodes) as $N
     | [ $S[] | .T as $T | .a[] | {T:$T, kind, text,
           key:(.kind + " " + (.text | gsub("[0-9]+([:.][0-9]+)*(s|分钟|小时|天)?"; "#")))} ]
-    | group_by(.key)
-    | [ .[] | sort_by(.T)
-        | reduce .[] as $x ([]; if length > 0 and $x.T - .[-1].last <= $step
-                               then .[-1].last = $x.T else . + [{kind:$x.kind, text:$x.text, first:$x.T, last:$x.T}] end)[]
-        | . + {span:(.last - .first + $step)} ] as $E
+    | episodes as $E
     | "回放 \($S[0].T - $step | at) → \($S[-1].T | at)，每 \($step / 60 | floor) 分钟一个时间点，共 \($S | length) 个",
       "只用日志：会话状态、pane 存活、代码指纹不在日志里，依赖它们的规则不会触发；\"没有更新\"对 Claude 会话会多报",
       "",
@@ -716,7 +734,14 @@ replay() {
       ( $E | group_by(.kind)[] | "\(.[0].kind)\t\(length)\t\([.[].span] | add | dur)" ),
       "",
       "开始\t持续\t规则\t异常（第一次出现时的文字）",
-      ( $E | sort_by(.first)[] | "\(.first | at)\t\(.span | dur)\t\(.kind)\t\(.text)" )' "$_rd/series"
+      ( $E | sort_by(.first)[] | "\(.first | at)\t\(.span | dur)\t\(.kind)\t\(.text)" ),
+      "",
+      "核心指标",
+      ([$K.r[] | select(.how == "reply") | .d] as $d | ($K.o | length) as $open
+       | "派单 \($K.r | length + $open)：回报 \($d | length)（中位 \($d | med | dur)，最长 \($d | max | dur)），finish 收尾未回报 \([$K.r[] | select(.how == "finish")] | length)，丢失 \([$K.r[] | select(.how == "lost")] | length)（重启、失败或新任务先到），未结 \($open)"),
+      ([$N[] | select(.last < $S[-1].T) | .span] as $d
+       | "需要你 \($N | length) 次：已解决 \($d | length)（在板上中位 \($d | med | dur)，最长 \($d | max | dur)），回放结束时仍在 \([$N[] | select(.last == $S[-1].T)] | length)"),
+      "下属重启 \($K.restart) 次，异常退出 \($K.exit) 次"' "$_rd/series"
   rm -rf "$_rd"
 }
 
@@ -1826,6 +1851,21 @@ selftest() {
   rp=$(AWB_DIR=$rd "$BIN" replay 600)
   [ "$(printf '%s\n' "$rp" | grep -c "	silent	quiet ")" = 1 ] || die "selftest: replay did not find one silent episode: $rp"
   ! printf '%s\n' "$rp" | grep -q "	silent	busy " || die "selftest: replay flagged an agent that kept reporting"
+  # core metrics: a reply, a finish, a restart (lost), one still open; a task at ask is one 需要你
+  kd=$t/core; mkdir -p "$kd"
+  { e() { printf '{"t":"%s","time":"x","ep":%s,"id":"%s"%s}\n' "$1" $((r0 + $2)) "$3" "${4-}"; }
+    e start 0 k1; e start 0 k2; e start 0 k3; e start 0 k4
+    e now 60 k1 ',"key":"a","text":"x"'; e done 660 k1 ',"key":"a"'
+    e now 60 k2 ',"key":"b","text":"x"'; e status 900 k2 ',"status":"done"'
+    e now 60 k3 ',"key":"c","text":"x"'; e start 1200 k3
+    e now 60 k4 ',"key":"d","text":"x"'
+    e task 60 q ',"state":"ask","text":"pick"'; e task 2000 q ',"state":"done","text":"pick"'
+    e now 3000 k1 ',"text":"y"'; } > "$kd/events.jsonl"
+  kp=$(AWB_DIR=$kd "$BIN" replay 600)
+  printf '%s\n' "$kp" | grep -Fq "派单 4：回报 1（中位 10分钟，最长 10分钟），finish 收尾未回报 1，丢失 1" \
+    || die "selftest: replay core metrics on sent tasks: $kp"
+  printf '%s\n' "$kp" | grep -Fq "需要你 1 次：已解决 1" || die "selftest: replay core metrics on 需要你: $kp"
+  printf '%s\n' "$kp" | grep -Fq "下属重启 1 次" || die "selftest: replay core metrics on restarts: $kp"
   AWB_DIR=$rd AWB_NOW=$((r0 + 600)) "$BIN" snapshot | jq -e '.clock != "" and (.agents | length) == 2' >/dev/null \
     || die "selftest: AWB_NOW did not render the board as of that time"
   # a task dispatched with awb send shows under 下一步 until its reply closes it
