@@ -38,8 +38,8 @@ Claude, follow this and do not ask the user to type commands:
 4. Results:
    - A reply starting with `[awb <id>#<key>]` → `awb reply <id> <key> "<result in one line>"`:
      the task is done, with its result. A reply with another key is stale or duplicate. The
-     board also reads your transcript (read-only) and closes the task when the keyed reply
-     arrives, so a forgotten `awb reply` loses only the result text; it also records every
+     board also reads the transcripts of its agents (read-only) and closes the task when the
+     keyed reply arrives, so a forgotten `awb reply` loses only the result text; it also records every
      SendMessage to and from a board agent, keyed or not.
    - An idle notice → `awb idle <id>`. The first time it prints an ask; SendMessage it (again
      with notify_when_idle). The second time it marks the task blocked: tell the user, since the
