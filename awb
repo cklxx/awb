@@ -2003,7 +2003,9 @@ EOF
   "$BIN" _state | grep -q '^g1 failed true ' || die "selftest: done overrode a rejected check"
   "$BIN" start r1 rerun; "$BIN" finish r1; "$BIN" start r1 rerun
   "$BIN" _state | grep -q '^r1 running ' || die "selftest: re-start kept done"
-  ! "$BIN" status r1 done 2>/dev/null || die "selftest: the removed status command still runs"
+  # status, merged into block/unblock/fail/finish, still answers scripts that call it
+  "$BIN" status r1 blocked "wait" && "$BIN" _state | grep -q '^r1 blocked ' || die "selftest: the status alias did not block"
+  "$BIN" status r1 running && "$BIN" _state | grep -q '^r1 running ' || die "selftest: the status alias did not unblock"
 
   if command -v tmux >/dev/null; then
     boardpane=$(tmux -L "$S" new-session -d -s awb -n board -x 200 -y 120 -P -F '#{pane_id}' \
@@ -2617,6 +2619,11 @@ case "$cmd" in
   hold)     hold "$@" ;;
   merge)    merge "$@" ;;
   # merged into other commands; kept for scripts: holder RES = "OWNER EP NOTE", exit 1 when free
+  status)   [ $# -ge 2 ] || die "usage: $PROG status ID running|blocked|failed|done [REASON]"
+            case $2 in running) main unblock "$1" ;; blocked) main block "$1" "${3:-}" ;;
+              failed) main fail "$1" "${3:-}" ;; done) main finish "$1" "${3:-}" ;;
+              *) die "status: running|blocked|failed|done" ;; esac ;;
+  board)    up ;;
   holder)   [ $# -ge 1 ] || die "usage: $PROG holder RES"; holder "$1" ;;
   audit)    init_dir; m=$(model_bin) || die "audit needs the Lean model: (cd $(src_dir)/model && lake build)"
             [ ! -s "$EV" ] || "$m" audit < "$EV" ;;
