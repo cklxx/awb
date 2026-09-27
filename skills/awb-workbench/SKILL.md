@@ -37,7 +37,10 @@ Claude, follow this and do not ask the user to type commands:
    reply must echo. One open task per worker; send the next after the reply.
 4. Results:
    - A reply starting with `[awb <id>#<key>]` → `awb reply <id> <key> "<result in one line>"`:
-     the task is done, with its result. A reply with another key is stale or duplicate.
+     the task is done, with its result. A reply with another key is stale or duplicate. The
+     board also reads your transcript (read-only) and closes the task when the keyed reply
+     arrives, so a forgotten `awb reply` loses only the result text; it also records every
+     SendMessage to and from a board agent, keyed or not.
    - An idle notice → `awb idle <id>`. The first time it prints an ask; SendMessage it (again
      with notify_when_idle). The second time it marks the task blocked: tell the user, since the
      worker's session is probably holding your message for its user's approval. Never mark a

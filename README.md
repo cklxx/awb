@@ -28,7 +28,9 @@ since the view is cut at the pane height:
 6. 异常, one line per agent: a bottleneck (an issue or PR, `#N`, two or more blocked agents
    wait for), no code change, a session that contradicts the report, a silent agent that has
    no Claude session to report for it, a board nobody writes to, a command awb does not have
-   that some caller ran in the last 24 hours (a script that hides stderr). Silence counts after
+   that some caller ran in the last 24 hours (a script that hides stderr), an agent whose session
+   sits idle with a message from the main agent of the last 24 hours unanswered (observed, see
+   Model). Silence counts after
    `AWB_SILENT` (3600 s), not the nudge threshold `AWB_STALE` (600 s): on a real three-day log
    the median gap between two updates of one agent was 772 s.
 
@@ -40,7 +42,9 @@ Its last section, 核心指标, measures the goal awb serves on the same log: ta
 `awb send` and how each ended (reply, `finish` without a reply, lost to a restart, failure or
 newer task, still open), how long each 需要你 item stayed on the board, and worker restarts.
 On team-board's log (1847 events): 29 sent, 10 replies (median 9 minutes), 11 closed by
-`finish`, 5 lost.
+`finish`, 5 lost. A last line counts the main agent's messages as observed from its transcript
+(below): from 09-26 00:00 to 09-27 17:14 on team-board, 52 messages and 31 replies (median 21
+minutes), against 4 tasks sent with `awb send`.
 7. News (the last 3; lines with one `--key` are one fact, the latest shows), the task tree
    without the steps already under 下一步 (folded on the card), acceptance runs. Agents show
    only in 需要你 and 异常; `awb peers` lists every agent, and the snapshot has each one's
@@ -55,6 +59,12 @@ On team-board's log (1847 events): 29 sent, 10 replies (median 9 minutes), 11 cl
   each agent's current and finished milestones, durations and idle time, never process output.
 - Agents report with the same `awb` CLI. The main agent changes content by appending
   events and changes presentation by editing `awb` itself.
+- The main agent's messaging is also observed, without its help: each board round reads the
+  new lines of every live Claude session's transcript (`~/.claude/projects/*/SESSION.jsonl`,
+  read-only) and records a SendMessage to, or a peer message from, one of this board's agents
+  as a `msg` event: time, direction, agent, the observing session and the `[awb ID#KEY]` key,
+  never the text. A reply with an open task's key closes the task as `awb reply` would. The
+  transcript format is Claude Code's own and unversioned; `AWB_OBSERVE=0` turns this off.
 - An agent's own `done` is a claim. `awb check` runs a check the main agent chose; only a
   passing check marks the milestone verified (`⊢`), and a rejected check blocks `done`
   until a later check passes.
