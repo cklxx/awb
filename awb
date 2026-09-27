@@ -306,8 +306,8 @@ JQ_SNAP=$JQ_FOLD$JQ_DEFS'
    | group_by(.id) | map(sort_by(.ep // 0) | .[0].id as $i
      | ([.[] | select(.dir == "in") | .ep // 0] | max // 0) as $li
      | {id:$i, name:(($s.agents[$i].name) // $i),
-        out:([.[] | select(.dir == "out" and (.ep // 0) >= $nowep - 86400)] | length),
-        in:([.[] | select(.dir == "in" and (.ep // 0) >= $nowep - 86400)] | length),
+        to_agent:([.[] | select(.dir == "out" and (.ep // 0) >= $nowep - 86400)] | length),
+        from_agent:([.[] | select(.dir == "in" and (.ep // 0) >= $nowep - 86400)] | length),
         wait:([.[] | select(.dir == "out" and (.ep // 0) > $li) | .ep // 0] | min)})) as $talk
 | ([ ($bott[] | {kind:"bottleneck", text:"\(.ref) 卡住 \(.names | join("、"))"}),
      # one line per agent: a flag (no code change, session disagrees) over silence; silence
@@ -2379,7 +2379,7 @@ FT
     [ "$(grep -F '"t":"msg"' "$EV" | grep -cF '"dir":"out"')" = 5 ] || die "selftest: a queued message not counted once: $(grep -F '"t":"msg"' "$EV" | grep -cF '"dir":"out"')"
     # the last message has no reply and the session sits idle past AWB_REPLY_IDLE: an anomaly
     SID=s-zz reg idle "" 700
-    ht view --json | jq -e 'any(.anomalies[]; .kind == "noreply") and (.talk[] | select(.id == "z1") | .out == 5 and .in == 2)' >/dev/null \
+    ht view --json | jq -e 'any(.anomalies[]; .kind == "noreply") and (.talk[] | select(.id == "z1") | .to_agent == 5 and .from_agent == 2)' >/dev/null \
       || die "selftest: no-reply not on the board: $(ht view --json | jq -c '{a:.anomalies, t:.talk}')"
     SID=s-zz reg busy; ! ht view --json | jq -e 'any(.anomalies[]; .kind == "noreply")' >/dev/null || die "selftest: a busy session flagged as not replying"
     # an open board observes with its nudges off too (AWB_NUDGE=0 is the selftest's setting)
