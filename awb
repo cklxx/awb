@@ -300,6 +300,15 @@ JQ_SNAP=$JQ_FOLD$JQ_DEFS'
 | ([ $act[] | select(.status == "blocked")
      | .name as $n | [(.text | match("#[0-9]+"; "g") | .string)] | unique[] | {ref:., name:$n} ]
    | group_by(.ref) | map(select(length >= 2) | {ref:.[0].ref, names:map(.name)})) as $bott
+# messages between the main agent and each agent, observed from its Claude transcript
+# (observe_once): counts of the last 24 hours, and the first message still without a reply
+| ([$raw[] | select(type == "object" and .t == "msg" and (.id | type) == "string")]
+   | group_by(.id) | map(sort_by(.ep // 0) | .[0].id as $i
+     | ([.[] | select(.dir == "in") | .ep // 0] | max // 0) as $li
+     | {id:$i, name:(($s.agents[$i].name) // $i),
+        out:([.[] | select(.dir == "out" and (.ep // 0) >= $nowep - 86400)] | length),
+        in:([.[] | select(.dir == "in" and (.ep // 0) >= $nowep - 86400)] | length),
+        wait:([.[] | select(.dir == "out" and (.ep // 0) > $li) | .ep // 0] | min)})) as $talk
 | ([ ($bott[] | {kind:"bottleneck", text:"\(.ref) 卡住 \(.names | join("、"))"}),
      # one line per agent: a flag (no code change, session disagrees) over silence; silence
      # counts only for an agent with no Claude session, since a live session reports itself
@@ -312,6 +321,13 @@ JQ_SNAP=$JQ_FOLD$JQ_DEFS'
          elif $a != null then $nowep - $a.lastEp else 0 end) as $q
       | select($q >= ($stale | tonumber))
       | {kind:"hold", text:"\($hd.res) 被 \(($a.name) // $hd.owner) 占着 \((($nowep - $hd.since) | ago))，它 \($q | ago)没在干活"}),
+     # a message from the main agent with no reply while the session of the agent sits idle for
+     # AWB_REPLY_IDLE: it finished without replying, or never started (unless a flag says so)
+     ($talk[] | select(.wait != null) | . as $k | ($sess[$k.id] // null) as $x
+      # many messages are notices that need no reply: one unanswered for a day is dropped
+      | select($x != null and $x.status == "idle" and (($s.agents[$k.id].sess // "") == "")
+               and $nowep - ([$k.wait, $x.since] | max) >= $replyidle and $nowep - $k.wait < 86400)
+      | {kind:"noreply", text:"\($k.name) 空闲 \(($nowep - $x.since) | ago)，主控 \(($nowep - $k.wait) | ago)前的消息还没回"}),
      (if $quiet >= $silent and $nrun > 0
       then {kind:"board", text:"看板 \($quiet | ago)没有新事件，主控可能停了"} else empty end),
      # a caller (a script, often with stderr thrown away) ran a command awb does not have: in the
@@ -415,7 +431,7 @@ JQ_SNAP=$JQ_FOLD$JQ_DEFS'
        now:$nowep, clock:$now, progress:$tp, hour:{done:finished($raw; $h1)}, day:$D,
        verified:{v:$mver, n:($mdone | length)}, running:$nrun, metric:$M, need:$need,
        anomalies:$anom, next:$next, holds:$holds,
-       agents:$act, idle:$idl, tasks:$trees, tasks_old:$nold,
+       agents:$act, idle:$idl, tasks:$trees, tasks_old:$nold, talk:$talk,
        news:$news, refs:$refs,
        checks:[$s.checks[] | {id, name:(($s.agents[.id].name) // .id), what, startEp,
          ok:(all(.steps[]; .state == "ok")), fail:any(.steps[]; .state == "fail"),
@@ -601,7 +617,7 @@ snapshot() {
   fi
   events_json | jq -r --arg viol "$viol" --arg lean "$lean" --argjson undeliv "${AWB_UNDELIVERED:-180}" \
     --arg now "$(jq -nr --argjson t "$nowep" '$t | strflocaltime("%H:%M:%S")')" --argjson nowep "$nowep" \
-    --argjson live "$live" --arg stale "${AWB_STALE:-600}" \
+    --argjson live "$live" --arg stale "${AWB_STALE:-600}" --argjson replyidle "${AWB_REPLY_IDLE:-600}" \
     --argjson diffs "$diffs" --argjson frz "${AWB_FROZEN:-900}" --argjson silent "${AWB_SILENT:-3600}" \
     --argjson mstale "${AWB_METRIC_STALE:-21600}" --argjson tstale "${AWB_TASK_STALE:-21600}" --argjson sess "$sess" \
     "$JQ_SNAP"
@@ -652,6 +668,12 @@ replay() {
           elif $e.t == "status" and $e.status == "done" then .r += [.o[$e.id] + {how:"finish"}] | del(.o[$e.id])
           elif $e.t == "start" or ($e.t == "status" and $e.status == "failed") then .r += [.o[$e.id] + {how:"lost"}] | del(.o[$e.id])
           else . end)) as $K
+    # messages observed from the transcript of the main agent: consecutive messages before a
+    # reply are one wait, closed by the reply
+    | ([$E[] | select(type == "object" and .t == "msg" and (.id | type) == "string")] | group_by(.id)
+       | map(sort_by(.ep // 0) | reduce .[] as $m ({w:null, r:[], o:0};
+           if $m.dir == "out" then .o += 1 | (if .w == null then .w = $m.ep else . end)
+           elif .w != null then .r += [$m.ep - .w] | .w = null else . end))) as $T
     | ([ $S[] | .T as $T | (.n // [])[] | . + {T:$T, key:(.kind + " " + .id)} ] | episodes) as $N
     | [ $S[] | .T as $T | .a[] | {T:$T, kind, text,
           key:(.kind + " " + (.text | gsub("[0-9]+([:.][0-9]+)*(s|分钟|小时|天)?"; "#")))} ]
@@ -670,7 +692,10 @@ replay() {
        | "派单 \($K.r | length + $open)：回报 \($d | length)（中位 \($d | med | dur)，最长 \($d | max | dur)），finish 收尾未回报 \([$K.r[] | select(.how == "finish")] | length)，丢失 \([$K.r[] | select(.how == "lost")] | length)（重启、失败或新任务先到），未结 \($open)"),
       ([$N[] | select(.last < $S[-1].T) | .span] as $d
        | "需要你 \($N | length) 次：已解决 \($d | length)（在板上中位 \($d | med | dur)，最长 \($d | max | dur)），回放结束时仍在 \([$N[] | select(.last == $S[-1].T)] | length)"),
-      "下属重启 \($K.restart) 次，异常退出 \($K.exit) 次"' "$_rd/series"
+      "下属重启 \($K.restart) 次，异常退出 \($K.exit) 次",
+      (if ($T | length) == 0 then empty
+         else ([$T[].r[]]) as $d
+           | "主控消息（从会话记录观察）：发出 \([$T[].o] | add)，得到回复 \($d | length)（中位 \($d | med | dur)，最长 \($d | max | dur)），结束时等回复的 agent \([$T[] | select(.w != null)] | length) 个" end)' "$_rd/series"
   rm -rf "$_rd"
 }
 
@@ -762,7 +787,67 @@ nudge_round() {
   rm -f "$_nl"
 }
 
+# the main agent's messaging, observed read-only from Claude Code transcripts
+# (~/.claude/projects/*/SESSION.jsonl, never written): a SendMessage to the session of one of
+# this board's agents is "out", a peer message from one is "in". Only metadata is kept: time,
+# direction, agent, the observing session and the [awb ID#KEY] key; a reply with an open
+# task's key closes it, as awb reply would. Each transcript of a live session that is not one
+# of this board's agents is read from where the last round stopped ($AWB_DIR/obs: "OFFSET
+# PATH"), a new or rewound one from its end. AWB_OBSERVE=0 turns it off.
+observe_once() {
+  [ "${AWB_OBSERVE:-1}" != 0 ] && [ -s "$EV" ] || return 0
+  _reg=$({ awk 1 "$HOME"/.claude/sessions/*.json 2>/dev/null || true; } \
+         | jq -Rsc '[split("\n")[] | fromjson? | select(type == "object")]') || return 0
+  _ag=$(sessions_json | jq -c 'to_entries | map({key:.value.name, value:.key}) | from_entries')
+  [ "$_ag" != '{}' ] || return 0
+  _of=$AWB_DIR/obs; touch "$_of"; _nf=$(mktemp "$_of.XXXXXX"); _new=$(mktemp "$_of.XXXXXX")
+  printf '%s' "$_reg" | jq -r --argjson ag "$_ag" '.[] | select($ag[.name // ""] == null and (.sessionId // "") != "")
+    | "\(.sessionId) \(.name // "-")"' | while read -r sid via; do
+    f=$(ls "$HOME"/.claude/projects/*/"$sid.jsonl" 2>/dev/null | head -1); [ -n "$f" ] || continue
+    sz=$(wc -c < "$f" | tr -d ' ')
+    off=$(awk -v p="$f" '{o = $1; sub(/^[^ ]+ /, "")} $0 == p {print o}' "$_of")
+    # ponytail: a gap over 50 MB (a board down for days) is skipped, not replayed
+    [ -n "$off" ] && [ "$off" -le "$sz" ] && [ $((sz - off)) -le 50000000 ] || off=$sz
+    [ "$off" -lt "$sz" ] || { printf '%s %s\n' "$off" "$f" >> "$_nf"; continue; }
+    # only whole lines: a line being written is read next round
+    _c=$_new.c; tail -c +$((off + 1)) "$f" | head -c $((sz - off)) > "$_c"
+    n=$(wc -c < "$_c" | tr -d ' ')
+    [ "$n" = 0 ] || [ "$(tail -c 1 "$_c" | od -An -tx1 | tr -d ' ')" = 0a ] || n=$((n - $(tail -n 1 "$_c" | wc -c)))
+    printf '%s %s\n' $((off + n)) "$f" >> "$_nf"
+    [ "$n" -gt 0 ] || continue
+    head -c "$n" "$_c" | jq -Rc --argjson ag "$_ag" --argjson reg "$_reg" --arg via "$via" '
+      fromjson? | select(type == "object") | (.timestamp // "") as $ts
+      | ($ts | sub("\\.[0-9]+Z$"; "Z") | fromdate? // empty) as $ep
+      | def key: (capture("^\\[awb [^#\\]]+#(?<k>[0-9]+)\\]").k // "");
+        def ev($d; $n; $k): select($ag[$n] != null)
+          | {t:"msg", time:($ep | strflocaltime("%H:%M:%S")), ep:$ep, id:$ag[$n], dir:$d, via:$via}
+            + (if $k == "" then {} else {key:$k} end);
+      if .type == "assistant" then
+        .message.content[]? | select(type == "object" and .type == "tool_use" and .name == "SendMessage")
+        | (.input.to // "" | tostring) as $to
+        | (if ($to | startswith("uds:"))
+           then ($to | capture("cc-socks/(?<p>[0-9]+)\\.sock").p | tonumber) as $p
+                | (first($reg[] | select(.pid == $p) | .name) // "")
+           else $to | sub(" \\[[0-9a-f]+\\]$"; "") end) as $n
+        | ev("out"; $n; (.input.message // "" | tostring | key))
+      elif (.origin.kind // "") == "peer" then
+        .origin | (.name // (.verifiedPeerPid as $p | first($reg[] | select(.pid == $p) | .name)) // "") as $n
+        | ev("in"; $n; (.body // "" | tostring | key))
+      else empty end' 2>/dev/null
+  done > "$_new"
+  rm -f "$_new.c"
+  mv "$_nf" "$_of"
+  [ -s "$_new" ] || { rm -f "$_new"; return 0; }
+  cat "$_new" >> "$EV"
+  jq -r 'select(.dir == "in" and (.key // "") != "") | "\(.id) \(.key)"' "$_new" | while read -r id k; do
+    [ "$(open_key "$id")" != "$k" ] \
+      || append '{t:"done",time:$time,ep:$ep,id:$id,text:null,key:$k,observed:true}' --arg id "$id" --arg k "$k"
+  done
+  rm -f "$_new"
+}
+
 nudge_once() {
+  observe_once
   freeze_once
   stuck_once
   hold_once
@@ -2236,6 +2321,35 @@ FT
     ! AWB_STALE=0 ht peers | grep '^z1 ' | grep -q silent || die "selftest: an agent with a Claude session listed silent"
     "$BIN" finish z1
     [ "$(ht peers | grep '^z1 ')" = "z1 $zp zz-1 idle" ] || die "selftest: peers lost the session"
+    # observed messaging: a main session (pid $$, not an agent) whose transcript holds a
+    # SendMessage to zz-1 (by name and by socket) and a peer message from it; read from where
+    # the last round stopped, a line being written is read once it is whole
+    mkdir -p "$t/home/.claude/projects/p"; tr_=$t/home/.claude/projects/p/s-main.jsonl
+    printf '{"pid":%s,"name":"main-x","sessionId":"s-main","status":"busy","statusUpdatedAt":1}\n' $$ > "$t/home/.claude/sessions/2.json"
+    ts_() { date -u -r "$1" +%Y-%m-%dT%H:%M:%S.000Z; }
+    out_() { jq -cn --arg ts "$(ts_ "$1")" --arg to "$2" --arg m "$3" \
+      '{type:"assistant", timestamp:$ts, message:{content:[{type:"tool_use", name:"SendMessage", input:{to:$to, message:$m}}]}}'; }
+    in_() { jq -cn --arg ts "$(ts_ "$1")" --arg n "$2" --arg b "$3" '{type:"user", timestamp:$ts, origin:{kind:"peer", name:$n, body:$b}}'; }
+    no=$(date +%s); out_ $((no - 5000)) zz-1 "before" > "$tr_"
+    ht _observe; ! grep -qF '"t":"msg"' "$EV" || die "selftest: observe read a transcript from its start"
+    ok_=$("$BIN" send z1 "observed task" 2>/dev/null | sed -n '1s/^\[awb z1#\([0-9]*\)\].*/\1/p')
+    { out_ $((no - 1500)) zz-1 "hello"; out_ $((no - 1400)) "uds:/tmp/cc-socks/$zpid.sock" "again"
+      out_ $((no - 1300)) other-9 "not ours"; in_ $((no - 1200)) zz-1 "reply"
+      out_ $((no - 1100)) "zz-1 [abc123]" "[awb z1#$ok_] observed task"; in_ $((no - 1000)) zz-1 "[awb z1#$ok_] done"
+      out_ $((no - 900)) zz-1 "last" | tr -d '\n'; } >> "$tr_"
+    ht _observe
+    [ "$(jq -sc '[.[] | select(.t == "msg") | .id + " " + .dir]' "$EV")" = '["z1 out","z1 out","z1 in","z1 out","z1 in"]' ] \
+      || die "selftest: observed messages: $(jq -sc '[.[] | select(.t == "msg") | .id + " " + .dir]' "$EV")"
+    [ -z "$(open_key z1)" ] || die "selftest: an observed keyed reply did not close the task"
+    echo >> "$tr_"; ht _observe; ht _observe
+    [ "$(grep -F '"t":"msg"' "$EV" | grep -cF '"dir":"out"')" = 4 ] || die "selftest: a line finished later was read not once"
+    # the last message has no reply and the session sits idle past AWB_REPLY_IDLE: an anomaly
+    reg idle "" 700
+    ht view --json | jq -e 'any(.anomalies[]; .kind == "noreply") and (.talk[] | select(.id == "z1") | .out == 4 and .in == 2)' >/dev/null \
+      || die "selftest: no-reply not on the board: $(ht view --json | jq -c '{a:.anomalies, t:.talk}')"
+    reg busy; ! ht view --json | jq -e 'any(.anomalies[]; .kind == "noreply")' >/dev/null || die "selftest: a busy session flagged as not replying"
+    reg idle
+    rm -f "$t/home/.claude/sessions/2.json"
     # a pane given as session:window.pane in .awb/panes resolves to the same session
     printf 'zt %s\n' "$(tmux -L "$S" display-message -p -t "$zp" '#{session_name}:#{window_index}.#{pane_index}')" >> "$t/panes"
     [ "$(ht peers | grep '^zt ')" = "zt $zp zz-1 idle" ] || die "selftest: a session:window.pane target was not resolved"
@@ -2638,6 +2752,7 @@ case "$cmd" in
   send)     send "$@" ;;
   reply)    reply "$@" ;;
   idle)     idle "$@" ;;
+  _observe) init_dir; observe_once ;;   # one observation round (the board runs it with nudge)
   _state)   state ;;   # the jq fold per agent, for the differential test against the Lean model
   version|--version|-V) echo "$PROG $VERSION" ;;
   skill)    skill ;;
