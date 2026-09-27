@@ -139,6 +139,8 @@ awb check a1 -- pytest -q ~/accept/test_a1.py       # any command, exit 0 = acce
 awb check a1 -- model/accept.sh proj ACCEPT.lean    # Lean 4: build, no sorry, theorems typecheck
                                                     # with standard axioms only
 awb pr a1 -- pytest -q ~/accept/test_a1.py          # runs the acceptance, then opens the PR
+awb merge 42 --watch                                # merge once the newest verdict on the head approves
+                                                    # and the required checks ran green
 awb hold gpu0 a1 "bench"; awb release gpu0          # one holder per shared resource; awb hold lists
 awb view --once                                     # the board drawn once, works outside tmux
 awb reset                                           # clear all events
@@ -278,7 +280,7 @@ proven model:
 | board / Lark card (events → sections) | proven: every agent is in one snapshot section, an agent with a rejected check is never idle, and one that stopped after a rejected check is always drawn under 需要你; the jq snapshot is differentially tested against it (every 4th random log) | `model/Brief.lean` vs `awb view --json` |
 | protocol audit | proven: the one-pass monitor reports nothing iff every event obeys the rules given its prefix (`audit_iff_clean`); corollary: every PR in a clean log followed a passing check | `model/Audit.lean` |
 | deliverables | `awb check ID -- CMD` (tests; for Lean, `model/accept.sh`: kernel-checked theorems, standard axioms only) | `awb check` |
-| PR | `awb pr ID -- CMD` runs the acceptance itself and opens the PR only on that pass (a pass read from the log could be forged, check events and all), refuses with audit violations, and logs the PR for the audit | `awb pr` |
+| PR | `awb pr ID -- CMD` runs the acceptance itself and opens the PR only on that pass (a pass read from the log could be forged, check events and all), refuses with audit violations, and logs the PR for the audit; `awb merge` merges only on an approve of the current head (newest verdict wins, whole-line match) with the required checks green, pinned by `--match-head-commit` | `awb pr`, `awb merge` |
 | dispatch/report loop (main ↔ worker) | TLA+ with liveness: no false done, every task ends replied or blocked, also when the worker's session holds messages or the worker crashes and is restarted (7,110 states). `AwbLoopStage.cfg` and `AwbLoopRestart.cfg` reproduce the 0.0.8 bugs: a worker's own stage report closed its task, a restarted worker's lost task stayed open. Until 0.0.9 `AwbLoopFixed.cfg` stopped on a TLC error (a tuple compared with a string) and never checked its liveness | `model/tla/AwbLoop.tla` |
 | tell vs a permission dialog | TLA+: a dialog the registry reported before a keystroke is never typed into (registry re-read before the paste and every Enter); `AwbWaitRace.cfg` shows the window no check closes | `model/tla/AwbWait.tla` |
 | Lark sync (ticks, manual syncs, crashes vs one topic) | TLA+: one topic per board and the card never goes back to an older state; `AwbLarkOld*.cfg` reproduce two topics and a regressed card from breaking the lock by age | `model/tla/AwbLark.tla` |

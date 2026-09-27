@@ -54,7 +54,8 @@ Claude, follow this and do not ask the user to type commands:
    `awb check <id> -- <command>` runs it; after a rejected check the agent cannot become done
    until a later check passes. Keep acceptance files (tests, ACCEPT.lean) outside the worker's
    directory. Then `awb pr <id> -- <command>` runs the acceptance again itself and opens the PR
-   only on that pass.
+   only on that pass; merge with `awb merge PR` (a retracted or conditional
+   approve, an approve of an older head, or a check that never started is not a green light).
 6. Read the board with `awb view --json` (one JSON object: goal, metric, need, anomalies,
    agents, tasks, checks); `awb view --once` draws the same for a person.
 7. Subagents you start with your Agent tool take tasks the same way: `awb start <id> <name>`
@@ -115,12 +116,15 @@ not process, one per stage. Full rules: `awb skill`.
 ## Commands
 
 `awb help` lists them in three groups: the task loop (up, goal, tui, send, reply, idle, fail,
-task, block/unblock, check, pr, metric, news), self-reporting workers (run, start,
+task, block/unblock, check, pr, merge, metric, news), self-reporting workers (run, start,
 now/done/finish), and coordination and reading (peers, tell, nudge, hold/release, view,
 replay, down/reset). Details worth knowing:
 
 - `awb check ID -- CMD`: exit 0 verifies the worker's latest work (`⊢`); else ✗ with the reason,
   the log in `.awb/check-ID.log`, and the worker is told (`AWB_NOTIFY=0` turns that off).
+- `awb merge PR`: only on an approve of the current head (a review, or a comment whose first
+  line names the head sha and matches `AWB_APPROVE_RE`) with `AWB_MIN_CHECKS` checks named by
+  `AWB_REQUIRE_CHECKS` green.
 - `awb peers`: `ID PANE SESSION STATUS [#KEY] [silent MINm]`. Sessions not started by awb:
   add `ID PANE` lines to `.awb/panes`.
 - `awb hold RES OWNER`: one holder per shared resource; `awb hold` alone lists the holders

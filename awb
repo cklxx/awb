@@ -1219,6 +1219,47 @@ release() {
   unlock "res-$res"
 }
 
+# merge a PR only when the newest verdict on its CURRENT head approves and the required checks
+# actually ran green. A verdict is a PR review on the head, or a comment whose first line names
+# the head's short sha; a comment verdict counts only when that whole line matches
+# AWB_APPROVE_RE, so "APPROVE ... with one fix" or a later correction does not. A check that
+# never started is not green: at least AWB_MIN_CHECKS successes named by AWB_REQUIRE_CHECKS.
+merge() {
+  [ $# -ge 1 ] || die "usage: $PROG merge PR [--watch]"
+  n=$1; _watch=0; [ "${2:-}" != --watch ] || _watch=1; init_dir
+  for _i in $(seq 1 "${AWB_MERGE_POLLS:-240}"); do
+    j=$(gh pr view "$n" --json state,headRefOid,reviews,comments,statusCheckRollup) || die "gh cannot read PR $n"
+    v=$(printf '%s' "$j" | jq -r --arg re "${AWB_APPROVE_RE:-^\\*\\*APPROVE \\([^)]*\\)\\*\\*\$}" \
+          --arg req "${AWB_REQUIRE_CHECKS:-.}" --argjson min "${AWB_MIN_CHECKS:-1}" '
+      .headRefOid as $sha | $sha[:8] as $h
+      | ([(.reviews // [])[] | select((.commit.oid // "") == $sha and (.state | IN("APPROVED","CHANGES_REQUESTED")))
+          | {ep:.submittedAt, ok:(.state == "APPROVED")}]
+         + [(.comments // [])[] | (.body | split("\n")[0]) as $l
+            | select(($l | contains($h)) and ($l | test("APPROVE|REQUEST CHANGES|CHANGES REQUESTED")))
+            | {ep:.createdAt, ok:($l | test($re))}]
+         | sort_by(.ep) | last) as $v
+      | [(.statusCheckRollup // [])[] | {name:(.name // .context // ""), c:((.conclusion // "") | if . == "" then null else . end) // (.state // "")}] as $cs
+      | ([$cs[] | select(.c | IN("","PENDING","EXPECTED","QUEUED","IN_PROGRESS"))] | length) as $pend
+      | ([$cs[] | select(.c | IN("FAILURE","ERROR","CANCELLED","TIMED_OUT","ACTION_REQUIRED","STARTUP_FAILURE"))] | length) as $bad
+      | ([$cs[] | select(.c == "SUCCESS" and (.name | test($req)))] | length) as $good
+      | (if $v == null then "none" elif $v.ok then "approve" else "changes" end) as $vd
+      | (if $bad > 0 then "red" elif $pend > 0 then "pending" elif $good < $min then "missing" else "green" end) as $ck
+      | "\(.state) \($sha) \($vd) \($ck) \($good)/\($min)"')
+    set -- $v
+    echo "#$n $(date +%H:%M) head ${2%"${2#????????}"} verdict $3 checks $4 ($5 required-green)"
+    [ "$1" != MERGED ] || return 0
+    if [ "$3" = approve ] && [ "$4" = green ]; then
+      gh pr merge "$n" "--${AWB_MERGE_METHOD:-merge}" --match-head-commit "$2" || die "merge of #$n refused"
+      append '{t:"news",time:$time,ep:$ep,text:$x,key:$k}' --arg k "pr#$n" --arg x "PR #$n merged (head ${2%"${2#????????}"})"
+      echo "#$n merged"; return 0
+    fi
+    [ "$4" != red ] || [ "$3" != approve ] || die "#$n: approved but checks are red"
+    [ "$_watch" = 1 ] || return 1
+    sleep "${AWB_MERGE_POLL:-60}"
+  done
+  die "#$n not mergeable after ${AWB_MERGE_POLLS:-240} polls"
+}
+
 # board beside the current tmux pane (the conversation), for chat-driven use
 board() {
   init_dir; [ -f "$EV" ] || : > "$EV"
@@ -1494,6 +1535,9 @@ One unit of work, the task. You talk to one Claude (the main agent); it keeps th
   $PROG check ID -- CMD...          acceptance: CMD exit 0 verifies the worker's work (⊢), else ✗
                                     (Lean 4: -- model/accept.sh DIR [ACCEPT.lean])
   $PROG pr ID [gh args...] -- CMD...  run the acceptance here, then push and open a PR on a pass
+  $PROG merge PR [--watch]          merge only when the newest verdict on the current head approves
+                                    and required checks ran green (AWB_APPROVE_RE, AWB_REQUIRE_CHECKS,
+                                    AWB_MIN_CHECKS); --watch polls until then (AWB_MERGE_POLL/POLLS)
   $PROG metric [--at EPOCH] [--step N] [--by EPOCH] [--ref] NAME VALUE TARGET [NOTE]
                                     a reading of the goal's number; --by: deadline; --ref: a
                                     baseline series drawn by step beside it
@@ -1717,8 +1761,36 @@ selftest() {
     || die "selftest: a quiet holder is not an anomaly"
   ! hb view --once | grep -Fq "gpu" || die "selftest: a resource held by a working agent is on the brief view"
   hb release gpu; [ -z "$(hb hold)" ] || die "selftest: release did not free the resource"
+  # the merged-away holder still answers scripts: free = exit 1; an unknown command exits 2
+  hb hold gpu h1; [ "$(hb holder gpu | cut -d' ' -f1)" = h1 ] || die "selftest: holder alias lost"
+  hb release gpu; rc=0; hb holder gpu >/dev/null || rc=$?; [ "$rc" = 1 ] || die "selftest: holder of a free resource exited $rc"
+  rc=0; hb nosuchcmd 2>/dev/null || rc=$?; [ "$rc" = 2 ] || die "selftest: unknown command exited $rc, not 2"
   AWB_STALE=0 hb view --json | jq -e '(.holds | length) == 0 and (any(.anomalies[]; .kind == "hold") | not)' >/dev/null \
     || die "selftest: a released resource still shown"
+  # merge: only the newest verdict naming the current head counts, a conditional or retracted
+  # approve does not, and checks that never ran are not green (fake gh replays each PR state)
+  mkdir -p "$t/fgh"; printf '#!/bin/sh\ncase "$1 $2" in "pr view") cat %s/fgh/pr.json ;; "pr merge") echo "$*" >> %s/fgh/log ;; esac\n' "$t" "$t" > "$t/fgh/gh"
+  chmod +x "$t/fgh/gh"; : > "$t/fgh/log"
+  mh=891472afdeadbeef00000000000000000000beef
+  mpr() { printf '{"state":"OPEN","headRefOid":"%s","reviews":[],"comments":[%s],"statusCheckRollup":[%s]}' "$mh" "$1" "$2" > "$t/fgh/pr.json"; }
+  mc() { printf '{"createdAt":"2026-01-01T0%s:00:00Z","body":"%s"}' "$1" "$2"; }
+  mg() { printf '{"name":"gate (%s)","conclusion":"%s"},{"name":"gate (%s2)","conclusion":"%s"}' "$1" "$1" "$1" "$2"; }
+  mm() { PATH=$t/fgh:$PATH AWB_DIR=$hd AWB_REQUIRE_CHECKS='^gate' AWB_MIN_CHECKS=2 "$BIN" merge 7 >/dev/null 2>&1; }
+  ok='**APPROVE (rev, head 891472af)**'
+  mpr "$(mc 1 '**APPROVE (rev, head 891472af) with one doc fix**'),$(mc 2 'REQUEST CHANGES (rev) head 891472af')" "$(mg SUCCESS SUCCESS)"
+  ! mm || die "selftest: merge took a retracted approve"
+  mpr "$(mc 1 '**APPROVE (rev, head 891472af) with one doc fix**')" "$(mg SUCCESS SUCCESS)"
+  ! mm || die "selftest: merge took a conditional approve"
+  mpr "$(mc 1 "$ok")" '{"name":"GitGuardian","conclusion":"SUCCESS"}'
+  ! mm || die "selftest: merge took checks that never ran as green"
+  mpr "$(mc 1 "$ok")" "$(mg SUCCESS "")"
+  ! mm || die "selftest: merge did not wait for a pending check"
+  mpr "$(mc 1 '**APPROVE (rev, head 1c56633a)**')" "$(mg SUCCESS SUCCESS)"
+  ! mm || die "selftest: merge took an approve of an older head"
+  [ ! -s "$t/fgh/log" ] || die "selftest: merge called gh pr merge before it was ready"
+  mpr "$(mc 1 'REQUEST CHANGES (rev, head 891472af)'),$(mc 2 "$ok")" "$(mg SUCCESS SUCCESS)"
+  mm || die "selftest: merge refused an exact approve with green checks"
+  grep -qx "pr merge 7 --merge --match-head-commit $mh" "$t/fgh/log" || die "selftest: merge not pinned to the head: $(cat "$t/fgh/log")"
   # the drawing, pinned: a fixed snapshot gives exactly this brief view. A change of wording
   # or layout is made here once; everything else is asserted on the snapshot above.
   fx='{"goal":"G","title":"G","about":["what it is"],"headline":"需要你 1 件 · m 按当前趋势截止前达不到 · 异常 1",
@@ -2539,6 +2611,11 @@ case "$cmd" in
   check)    check "$@" ;;
   pr)       pr "$@" ;;
   hold)     hold "$@" ;;
+  merge)    merge "$@" ;;
+  # merged into other commands; kept for scripts: holder RES = "OWNER EP NOTE", exit 1 when free
+  holder)   [ $# -ge 1 ] || die "usage: $PROG holder RES"; holder "$1" ;;
+  audit)    init_dir; m=$(model_bin) || die "audit needs the Lean model: (cd $(src_dir)/model && lake build)"
+            [ ! -s "$EV" ] || "$m" audit < "$EV" ;;
   release)  release "$@" ;;
   send)     send "$@" ;;
   reply)    reply "$@" ;;
@@ -2550,7 +2627,7 @@ case "$cmd" in
   peers)    peers ;;
   selftest) selftest ;;
   ""|-h|--help|help) usage ;;
-  *) die "unknown command: $cmd (commands: $PROG help)" ;;
+  *) printf '%s: unknown command: %s (commands: %s help)\n' "$PROG" "$cmd" "$PROG" >&2; exit 2 ;;
 esac
 }
 
