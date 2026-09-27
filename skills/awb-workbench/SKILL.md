@@ -125,7 +125,8 @@ replay, down/reset). Details worth knowing:
 - `awb merge PR`: only on an approve of the current head (a review, or a comment whose first
   line names the head sha and matches `AWB_APPROVE_RE`) with `AWB_MIN_CHECKS` checks named by
   `AWB_REQUIRE_CHECKS` green.
-- `awb peers`: `ID PANE SESSION STATUS [#KEY] [silent MINm]`. Sessions not started by awb:
+- `awb peers`: `ID PANE SESSION STATUS [#KEY] [silent MINm]` (silent only without a Claude session;
+  STATUS is the session's own: busy|idle|waiting|shell). Sessions not started by awb:
   add `ID PANE` lines to `.awb/panes`.
 - `awb hold RES OWNER`: one holder per shared resource; `awb hold` alone lists the holders
   (`RES OWNER SINCE NOTE`), which scripts that must not disturb one read first.
