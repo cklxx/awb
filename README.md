@@ -171,6 +171,14 @@ Status: ◔ running · ✓ done · ▲ blocked · ✗ failed · ■ dead (pane g
 `tmux -S .awb/sock attach -t awb` attaches from another terminal (for a deep project path the
 socket is `/tmp/awb-UID-HASH.sock`, since unix socket paths are limited to about 104 bytes).
 
+awb talks tmux on the board's own server. Resolution order: a pane started by awb exports
+`AWB_TMUX_SOCKET` (the board socket) and `AWB_TMUX_FOR` (the board's AWB_DIR); if
+`AWB_TMUX_FOR` is set and differs from the current `AWB_DIR`, `AWB_TMUX_SOCKET` is ignored, so
+a worker experimenting with its own board cannot act on another board's server. With no usable
+exported socket, commands use `AWB_TMUX_SOCKET` if it points at a live socket, then
+`$AWB_DIR/sock` (falling back to `/tmp/awb-UID-HASH.sock` on deep paths), and finally the
+tmux default server.
+
 ## Lark (Feishu) topics
 
 With [lark-cli](https://github.com/larksuite/cli) logged in as a bot, a board mirrors into

@@ -1222,17 +1222,26 @@ ${ESC}[2m  ${hint}${ESC}[0m"
 
 up() {
   command -v tmux >/dev/null || die "tmux not installed"
-  # inside tmux the board opens beside this pane; a nested attach does not work there
-  if [ -n "${TMUX:-}" ] && [ -n "${TMUX_PANE:-}" ]; then board; return; fi
   init_dir
   SOCK=$(sock_path)
+  _have=0
+  [ -S "$SOCK" ] && tmux -S "$SOCK" has-session -t awb 2>/dev/null && _have=1
+  # inside tmux a nested attach does not work: the board opens beside this pane. But when
+  # this board already has a session on its own socket, say where it is instead of opening
+  # a second board next to the current pane.
+  if [ -n "${TMUX:-}" ] && [ -n "${TMUX_PANE:-}" ]; then
+    if [ "$_have" = 1 ]; then
+      echo "awb session already up for $AWB_DIR; attach in another terminal: tmux -S $(q "$SOCK") attach -t awb"
+      return 0
+    fi
+    board; return
+  fi
   # without a terminal (an agent runs awb up) the session is made and the user attaches later
   _att() {
     if [ -t 0 ] && [ -t 1 ]; then exec tmux -S "$SOCK" attach-session -t awb; fi
-    echo "awb session ready (board + work pane); to watch it, run in a terminal: cd $(q "$(dirname "$AWB_DIR")") && awb up"
-    [ "$(basename "$AWB_DIR")" = .awb ] || echo "  (with AWB_DIR=$(q "$AWB_DIR"))"
+    echo "awb session ready (board + work pane); to watch it, run in a terminal: tmux -S $(q "$SOCK") attach -t awb"
   }
-  if [ -S "$SOCK" ] && tmux -S "$SOCK" has-session -t awb 2>/dev/null; then _att; return 0; fi
+  if [ "$_have" = 1 ]; then _att; return 0; fi
   rm -f "$SOCK"
   tmux -S "$SOCK" new-session -d -s awb -n board -P -F '#{pane_id}' \
     -e "AWB_DIR=$AWB_DIR" -e "AWB_TMUX_SOCKET=$SOCK" -e "AWB_TMUX_FOR=$AWB_DIR" \
@@ -1329,7 +1338,7 @@ $(q "$BIN") _enter; $tui_cmd; exec $(q "$SHELL")"
     fi
     sleep 1; i=$((i + 1))
   done
-  [ -n "$sess" ] || { echo "$id: Claude not ready; message it later ('$PROG peers', '$PROG tell')"; return 0; }
+  [ -n "$sess" ] || { echo "$id: Claude not ready; message it later ('$PROG peers', '$PROG tell')"; return 1; }
   tell "$id" "$prompt"
   echo "$id session: $sess"
 }
@@ -1584,6 +1593,13 @@ need_agent() {
 
 # type a message into an agent's TUI (claude, codex, any): a named buffer, then Enter.
 # Claude queues it if a turn is running. Plain send-keys Enter does not submit in claude.
+# a run agent back at a plain shell prompt is a command line, not an agent TUI: a rejected
+# check must not type at it (foreground: sh/bash/zsh/fish)
+shell_pane() {
+  case $(tm display-message -p -t "$1" '#{pane_current_command}' 2>/dev/null) in
+    sh|bash|zsh|fish) return 0 ;; *) return 1 ;;
+  esac
+}
 tell() {
   [ $# -ge 2 ] || die "usage: $PROG tell ID MESSAGE"
   _id=$1; shift; init_dir
@@ -1594,6 +1610,17 @@ tell() {
   # the registry is read again before every keystroke: a dialog reported before a key is
   # never typed into (model/tla/AwbWait.tla). One that opens between the read and the key
   # still takes it; no check can close that window.
+  # a run pane whose command just exited is being replaced by its shell: telling at that
+  # moment can race the teardown. Wait for a shell prompt (bounded) before typing. A tui
+  # agent runs a TUI in the foreground and queues the paste, so it must not wait.
+  _kind=$([ -s "$EV" ] && grep -F "\"id\":\"$_id\"" "$EV" | jq -R -s -r \
+            '[split("\n")[] | fromjson? | select(.t == "start")] | last | .kind // ""' || true)
+  if [ "$_kind" != claude ]; then
+    _i=0
+    while [ "$_i" -lt "${AWB_TELL_WAIT_SHELL:-10}" ] && ! shell_pane "$_p"; do
+      sleep 0.5; _i=$((_i + 1))
+    done
+  fi
   _dialog() { [ "$(sessions_json | jq -r --arg i "$_id" '.[$i].status // ""')" = waiting ]; }
   if _dialog; then   # return, not die: check and nudge call tell as a function
     echo "$PROG: $_id is waiting on a permission dialog; answer it in pane $_p, awb will not type into it" >&2
@@ -1796,8 +1823,10 @@ check() {
     [ -n "$why" ] || why="exit $rc"
     append '{t:"status",time:$time,ep:$ep,id:$id,status:"failed",reason:$r,gate:true}' \
       --arg id "$id" --arg r "验收未过($what): $why"
-    # tell the agent, unless the agent ran the check itself and already sees the output
-    if [ "${AWB_NOTIFY:-1}" = 1 ] && [ "$(agent_pane "$id")" != "${TMUX_PANE:-}" ]; then
+    # tell the agent, unless the agent ran the check itself and already sees the output;
+    # a run agent back at a plain shell prompt is a command line, not an agent TUI
+    if [ "${AWB_NOTIFY:-1}" = 1 ] && [ "$(agent_pane "$id")" != "${TMUX_PANE:-}" ] \
+       && ! shell_pane "$(agent_pane "$id")"; then
       ( tell "${id}" "awb 验收未过（${what}）：${why}。完整日志：${CHK_LOG}。修复后重新验收：awb check ${id} ..." ) 2>/dev/null \
         && echo "notified $id" || true
     fi
@@ -2365,6 +2394,43 @@ EOF
     "$BIN" fail zw1 "stopped"; "$BIN" run zw1 again -- true || die "selftest: run refused the id of a failed agent"
     i=1; while [ $i -le 9 ]; do tmux -L "$S" kill-pane -t "$(agent_pane zw$i)" 2>/dev/null || true; i=$((i + 1)); done
 
+    # tui that never becomes ready exits non-zero while still printing the hint
+    mkdir -p "$t/fakebin"; printf '#!/bin/sh\nsleep 30\n' > "$t/fakebin/neverclaude"; chmod +x "$t/fakebin/neverclaude"
+    PATH=$t/fakebin:$PATH AWB_TUI_CMD=neverclaude AWB_TUI_WAIT=1 \
+      "$BIN" tui zt1 worker >"$t/tui.out" 2>&1 && die "selftest: tui returned 0 though Claude never got ready"
+    grep -Fq "Claude not ready" "$t/tui.out" || die "selftest: tui readiness timeout lost its hint"
+    tmux -L "$S" kill-pane -t "$(agent_pane zt1)" 2>/dev/null || true
+    # tell waits for a run pane whose foreground command is still running, then types at the shell
+    "$BIN" run zsh1 waiter -- sleep 1
+    i=0; until [ -n "$(agent_pane zsh1)" ]; do i=$((i + 1)); [ $i -lt 20 ] || die "selftest: zsh1 pane never registered"; sleep 0.2; done
+    "$BIN" tell zsh1 "echo shell-wait-marker-\$((6*7))" >/dev/null 2>&1 || true
+    i=0; until tmux -L "$S" capture-pane -p -t "$(agent_pane zsh1)" | grep -q shell-wait-marker-42; do
+      i=$((i + 1)); [ $i -lt 20 ] || { for pa in $(tmux -L "$S" list-panes -a -F '#{pane_id}'); do
+          echo "== $pa =="; tmux -L "$S" capture-pane -J -p -t "$pa" | grep -v '^[[:space:]]*$' | tail -4; done > "$t/zsh1-fail.txt"
+        die "selftest: tell did not wait for the shell prompt (dump: $t/zsh1-fail.txt)"; }; sleep 0.5; done
+    # start refuses an id whose pane is alive with the agent still running
+    "$BIN" run zk1 keep -- sleep 30
+    i=0; until [ -n "$(agent_pane zk1)" ]; do i=$((i + 1)); [ $i -lt 20 ] || die "selftest: zk1 pane never registered"; sleep 0.2; done
+    ! "$BIN" start zk1 dup 2>/dev/null || die "selftest: start took the id of a live running agent"
+    tmux -L "$S" kill-pane -t "$(agent_pane zk1)" 2>/dev/null || true
+    # a rejected check does not tell a run agent that is back at a plain shell prompt
+    "$BIN" now zsh1 "gate-me"
+    chkout=$("$BIN" check zsh1 -- false 2>&1 || true)
+    ! printf '%s\n' "$chkout" | grep -q "notified" || die "selftest: a shell pane was notified of a rejected check"
+    sleep 0.5
+    ! tmux -L "$S" capture-pane -p -t "$(agent_pane zsh1)" | grep -q "验收未过" \
+      || die "selftest: the rejection was typed into a shell command line"
+    tmux -L "$S" kill-pane -t "$(agent_pane zsh1)" 2>/dev/null || true
+    # inside tmux, up prints the existing board's location instead of splitting a second board
+    d2=$t/up2; mkdir -p "$d2"; tmux -S "$d2/sock" new-session -d -s awb >/dev/null
+    before=$(tmux -S "$d2/sock" list-panes -a | wc -l | tr -d ' ')
+    upout=$(TMUX=x TMUX_PANE=%0 AWB_TMUX_SOCKET= AWB_DIR=$d2 "$BIN" up 2>&1)
+    after=$(tmux -S "$d2/sock" list-panes -a | wc -l | tr -d ' ')
+    [ "$before" = "$after" ] || die "selftest: up split a second board for a board already running"
+    printf '%s\n' "$upout" | grep -Fq "attach -t awb" || die "selftest: up did not print the attach command"
+    tmux -S "$d2/sock" kill-server 2>/dev/null || true
+
+
     # tell must confirm a paste actually submitted. A real Claude pane does NOT
     # end on the input line: it is `❯ <text>`, then a divider, then a ⏵⏵
     # footer. faketui mirrors that: while pending it draws the `❯` input line
@@ -2611,6 +2677,10 @@ FT
   printf 'step 2/10\n' > "$pt/log2"; touch -t 202001010000 "$pt/log2"
   "$BIN" probe log "$pt/log2" 'step ([0-9]+)/([0-9]+)' | grep -q "^blocked log silent" || die "selftest: silent log not blocked"
   "$BIN" skill | grep -q "awb check" || die "selftest: skill manual not found"
+  # README documents the socket resolution order: FOR mismatch drops SOCKET, then sock_path
+  rd=$(dirname "$BIN")/README.md
+  grep -Fq "AWB_TMUX_FOR" "$rd" && grep -Fq "AWB_TMUX_SOCKET" "$rd" \
+    || die "selftest: README does not document AWB_TMUX_SOCKET/AWB_TMUX_FOR resolution"
   if m=$(model_bin); then
     "$BIN" audit | grep -q "^g1 done-while-check-rejected" || die "selftest: audit missed done after rejection"
     # fixed differential case: unknown events with NO id (and unknown t with an
@@ -2868,6 +2938,7 @@ case "$cmd" in
   tui)      tui "$@" ;;
   start)
     [ $# -ge 1 ] || die "usage: $PROG start ID NAME [KIND] [GROUP]"
+    init_dir; not_running "$1"
     append '{t:"start",time:$time,ep:$ep,id:$id,name:$name,kind:$kind,pane:$pane,group:$group}' \
       --arg id "$1" --arg name "${2:-$1}" --arg kind "${3:-agent}" --arg pane "" \
       --arg group "${4:-default}"
