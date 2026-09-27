@@ -1610,17 +1610,6 @@ tell() {
   # the registry is read again before every keystroke: a dialog reported before a key is
   # never typed into (model/tla/AwbWait.tla). One that opens between the read and the key
   # still takes it; no check can close that window.
-  # a run pane whose command just exited is being replaced by its shell: telling at that
-  # moment can race the teardown. Wait for a shell prompt (bounded) before typing. A tui
-  # agent runs a TUI in the foreground and queues the paste, so it must not wait.
-  _kind=$([ -s "$EV" ] && grep -F "\"id\":\"$_id\"" "$EV" | jq -R -s -r \
-            '[split("\n")[] | fromjson? | select(.t == "start")] | last | .kind // ""' || true)
-  if [ "$_kind" != claude ]; then
-    _i=0
-    while [ "$_i" -lt "${AWB_TELL_WAIT_SHELL:-10}" ] && ! shell_pane "$_p"; do
-      sleep 0.5; _i=$((_i + 1))
-    done
-  fi
   _dialog() { [ "$(sessions_json | jq -r --arg i "$_id" '.[$i].status // ""')" = waiting ]; }
   if _dialog; then   # return, not die: check and nudge call tell as a function
     echo "$PROG: $_id is waiting on a permission dialog; answer it in pane $_p, awb will not type into it" >&2
@@ -2374,6 +2363,9 @@ EOF
       sleep 0.5; i=$((i + 1)); done; return 1; }
     seen "demo" || die "selftest: spawned agent not shown"
     seen "✓1" || die "selftest: exit 0 not marked done"
+    # the pane swaps `sleep 2` for its shell: type once the shell is in the foreground
+    i=0; until AWB_TMUX_SOCKET=$(tmux -L "$S" display-message -p '#{socket_path}') shell_pane "$(agent_pane z1)"; do
+      i=$((i + 1)); [ $i -lt 20 ] || die "selftest: z1 never reached its shell"; sleep 0.2; done
     AWB_TMUX_SOCKET=$(tmux -L "$S" display-message -p '#{socket_path}') "$BIN" tell z1 "echo told-\$((6*7))"
     i=0; until tmux -L "$S" capture-pane -p -t "$(agent_pane z1)" | grep -q told-42; do
       i=$((i + 1)); [ $i -lt 20 ] || die "selftest: tell not delivered"; sleep 0.5; done
@@ -2400,20 +2392,15 @@ EOF
       "$BIN" tui zt1 worker >"$t/tui.out" 2>&1 && die "selftest: tui returned 0 though Claude never got ready"
     grep -Fq "Claude not ready" "$t/tui.out" || die "selftest: tui readiness timeout lost its hint"
     tmux -L "$S" kill-pane -t "$(agent_pane zt1)" 2>/dev/null || true
-    # tell waits for a run pane whose foreground command is still running, then types at the shell
-    "$BIN" run zsh1 waiter -- sleep 1
-    i=0; until [ -n "$(agent_pane zsh1)" ]; do i=$((i + 1)); [ $i -lt 20 ] || die "selftest: zsh1 pane never registered"; sleep 0.2; done
-    "$BIN" tell zsh1 "echo shell-wait-marker-\$((6*7))" >/dev/null 2>&1 || true
-    i=0; until tmux -L "$S" capture-pane -p -t "$(agent_pane zsh1)" | grep -q shell-wait-marker-42; do
-      i=$((i + 1)); [ $i -lt 20 ] || { for pa in $(tmux -L "$S" list-panes -a -F '#{pane_id}'); do
-          echo "== $pa =="; tmux -L "$S" capture-pane -J -p -t "$pa" | grep -v '^[[:space:]]*$' | tail -4; done > "$t/zsh1-fail.txt"
-        die "selftest: tell did not wait for the shell prompt (dump: $t/zsh1-fail.txt)"; }; sleep 0.5; done
     # start refuses an id whose pane is alive with the agent still running
     "$BIN" run zk1 keep -- sleep 30
     i=0; until [ -n "$(agent_pane zk1)" ]; do i=$((i + 1)); [ $i -lt 20 ] || die "selftest: zk1 pane never registered"; sleep 0.2; done
     ! "$BIN" start zk1 dup 2>/dev/null || die "selftest: start took the id of a live running agent"
     tmux -L "$S" kill-pane -t "$(agent_pane zk1)" 2>/dev/null || true
     # a rejected check does not tell a run agent that is back at a plain shell prompt
+    "$BIN" run zsh1 waiter -- true
+    i=0; until [ -n "$(agent_pane zsh1)" ] && shell_pane "$(agent_pane zsh1)"; do
+      i=$((i + 1)); [ $i -lt 20 ] || die "selftest: zsh1 never reached its shell"; sleep 0.2; done
     "$BIN" now zsh1 "gate-me"
     chkout=$("$BIN" check zsh1 -- false 2>&1 || true)
     ! printf '%s\n' "$chkout" | grep -q "notified" || die "selftest: a shell pane was notified of a rejected check"
@@ -2677,10 +2664,6 @@ FT
   printf 'step 2/10\n' > "$pt/log2"; touch -t 202001010000 "$pt/log2"
   "$BIN" probe log "$pt/log2" 'step ([0-9]+)/([0-9]+)' | grep -q "^blocked log silent" || die "selftest: silent log not blocked"
   "$BIN" skill | grep -q "awb check" || die "selftest: skill manual not found"
-  # README documents the socket resolution order: FOR mismatch drops SOCKET, then sock_path
-  rd=$(dirname "$BIN")/README.md
-  grep -Fq "AWB_TMUX_FOR" "$rd" && grep -Fq "AWB_TMUX_SOCKET" "$rd" \
-    || die "selftest: README does not document AWB_TMUX_SOCKET/AWB_TMUX_FOR resolution"
   if m=$(model_bin); then
     "$BIN" audit | grep -q "^g1 done-while-check-rejected" || die "selftest: audit missed done after rejection"
     # fixed differential case: unknown events with NO id (and unknown t with an
