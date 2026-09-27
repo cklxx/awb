@@ -1824,7 +1824,8 @@ One unit of work, the task. You talk to one Claude (the main agent); it keeps th
   $PROG check ID --lean DIR [ACCEPT.lean]
                                     Lean 4: lake build, no sorry, ACCEPT.lean theorems typecheck
                                     with standard axioms only
-  $PROG pr ID [gh args...]          push this branch and open a PR, only after a passing check
+  $PROG pr ID [gh args...] -- CMD...  run the acceptance here, then push and open a PR on a pass
+                                    (-- --lean DIR [ACCEPT.lean] for a Lean gate)
   $PROG merge PR [--watch]          merge only when the newest verdict on the current head approves
                                     and required checks ran green (AWB_APPROVE_RE, AWB_REQUIRE_CHECKS,
                                     AWB_MIN_CHECKS); --watch polls until then (AWB_MERGE_POLL/POLLS)

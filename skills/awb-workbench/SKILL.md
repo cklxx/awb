@@ -53,7 +53,8 @@ Claude, follow this and do not ask the user to type commands:
 5. Acceptance: a worker's claim is not a result. You choose the command and
    `awb check <id> -- <command>` runs it; after a rejected check the agent cannot become done
    until a later check passes. Keep acceptance files (tests, ACCEPT.lean) outside the worker's
-   directory. Then `awb pr <id>`, and merge with `awb merge PR` (a retracted or conditional
+   directory. Then `awb pr <id> -- <command>` runs the acceptance again itself and opens the PR
+   only on that pass; merge with `awb merge PR` (a retracted or conditional
    approve, an approve of an older head, or a check that never started is not a green light).
 6. Read the board with `awb snapshot` (one JSON object: goal, metric, need, anomalies, agents,
    tasks, checks); `awb render` draws the same for a person.
@@ -160,8 +161,11 @@ started before other commands use it. States: ◔ running · ✓ done · ▲ blo
   agent; a check verifies only the milestone it started on; concurrent `tell`s into one pane
   take a per-pane lock; `tell` re-reads the session registry before each keystroke and never
   types into a dialog already reported (`AwbWait.tla`).
-- Limits: agents append events, so the audit catches a forged `verified` but not an agent that
-  also forges the check events; jq and the model are equal by test, not by proof.
+- The gate never trusts the log an agent can write: `awb pr` runs the acceptance itself. A
+  forgery with check events can still put `⊢` on the board, not open a PR. With the model
+  built, the board takes agent status from the proven fold; else from jq, equal by test.
+- A task sent to a worker idle since before the send and still idle is flagged
+  "消息可能没发出" after `AWB_UNDELIVERED` seconds (180): SendMessage is your step.
 
 ## Found a problem in awb itself: open a PR
 
@@ -175,8 +179,7 @@ cd /tmp/awb-fix-<slug> && git switch -c fix/<slug>
 export AWB_DIR=$PWD/.awb                         # this board, never the one your pane belongs to
 ./awb start fix-<slug> fixer && ./awb now fix-<slug> "<the problem in one line>"
 git commit -am "<English summary>"              # no attribution trailers
-./awb check fix-<slug> -- ./awb selftest
-./awb pr fix-<slug>                              # refused unless the check passed
+./awb pr fix-<slug> -- ./awb selftest            # runs the acceptance, opens the PR only on a pass
 ```
 
 PR descriptions describe the change only, with no "Generated with ..." lines. Do not change
