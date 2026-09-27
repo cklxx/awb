@@ -143,7 +143,7 @@ awb metric tps 32 40 "V100 target"      # brief: one value/target bar under GOAL
 awb check a1 -- pytest -q ~/accept/test_a1.py       # any command, exit 0 = accepted
 awb check a1 --lean proj ~/accept/ACCEPT.lean       # Lean 4: build, no sorry, theorems typecheck
                                                     # with standard axioms only
-awb pr a1                                           # open a PR for a1's branch, only after a pass
+awb pr a1 -- pytest -q ~/accept/test_a1.py          # runs the acceptance, then opens the PR
 awb merge 42 --watch                                # merge once the newest verdict on the head approves
                                                     # and the required checks ran green
 awb hold gpu0 a1 "bench"; awb release gpu0          # one holder per shared resource
@@ -272,8 +272,8 @@ A probe prints `STATE text` and exits 0; anything else is a failed read and the 
 Changes land by PR. Fix on a branch, then gate and open the PR with awb itself:
 
 ```sh
-awb check fix1 -- ./awb selftest     # the acceptance gate
-awb pr fix1                          # pushes the branch; refuses without a passing check
+awb check fix1 -- ./awb selftest     # try the acceptance while fixing
+awb pr fix1 -- ./awb selftest        # runs it again here; pushes and opens the PR only on a pass
 ```
 
 CI does not test; it only publishes: pushing a tag `vX.Y.Z` that matches `VERSION` in `awb`
@@ -293,7 +293,7 @@ proven model:
 | brief view / Lark card (events → sections) | proven: every agent is in one snapshot section, an agent with a rejected check is never idle, and one that stopped after a rejected check is always drawn under 需要你; the jq snapshot is differentially tested against it (every 4th random log) | `model/Brief.lean` vs `awb snapshot` |
 | protocol audit | proven: the one-pass monitor reports nothing iff every event obeys the rules given its prefix (`audit_iff_clean`); corollary: every PR in a clean log followed a passing check | `model/Audit.lean` |
 | deliverables | `awb check` (tests, or Lean with kernel-checked theorems and standard axioms only) | `awb check` |
-| merge | `awb pr` refuses without a passing check or with audit violations, and logs the PR for the audit; `awb merge` merges only on an approve of the current head (newest verdict wins, whole-line match) with the required checks green, pinned by `--match-head-commit` | `awb pr`, `awb merge` |
+| merge | `awb pr ID -- CMD` runs the acceptance itself and opens the PR only on that pass (a pass read from the log could be forged, check events and all), refuses with audit violations, and logs the PR for the audit; `awb merge` merges only on an approve of the current head (newest verdict wins, whole-line match) with the required checks green, pinned by `--match-head-commit` | `awb pr`, `awb merge` |
 | dispatch/report loop (main ↔ worker) | TLA+ with liveness: no false done, every task ends replied or blocked, also when the worker's session holds messages or the worker crashes and is restarted (7,110 states). `AwbLoopStage.cfg` and `AwbLoopRestart.cfg` reproduce the 0.0.8 bugs: a worker's own stage report closed its task, a restarted worker's lost task stayed open. Until 0.0.9 `AwbLoopFixed.cfg` stopped on a TLC error (a tuple compared with a string) and never checked its liveness | `model/tla/AwbLoop.tla` |
 | tell vs a permission dialog | TLA+: a dialog the registry reported before a keystroke is never typed into (registry re-read before the paste and every Enter); `AwbWaitRace.cfg` shows the window no check closes | `model/tla/AwbWait.tla` |
 | Lark sync (ticks, manual syncs, crashes vs one topic) | TLA+: one topic per board and the card never goes back to an older state; `AwbLarkOld*.cfg` reproduce two topics and a regressed card from breaking the lock by age | `model/tla/AwbLark.tla` |
@@ -325,6 +325,11 @@ differential test. Proofs are checked with:
 awb check model --lean model model/Accept.lean
 ```
 
-Limits: events are appended by agents, so the audit flags a forged `verified` event but
-cannot stop an agent that also forges the check events; the jq fold is tested against the
-model, not proven.
+Where the log could be written by an agent, the gate does not read it: `awb pr` runs the
+acceptance in its own process. The audit flags a forged `verified` without check events; a
+forgery that includes check events can still put a `⊢` on the board, but not open a PR.
+With the Lean model built, the board takes each agent's status, gate and end from the proven
+fold (`awbmodel fold`); without it, from the jq fold, equal to it by the differential test.
+Delivery is the main agent's step (SendMessage), outside awb: a task sent to a worker whose
+session stays idle since before the send is flagged after `AWB_UNDELIVERED` seconds (180) as
+"消息可能没发出".
