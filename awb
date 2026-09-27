@@ -800,6 +800,7 @@ observe_once() {
          | jq -Rsc '[split("\n")[] | fromjson? | select(type == "object")]') || return 0
   _ag=$(sessions_json | jq -c 'to_entries | map({key:.value.name, value:.key}) | from_entries')
   [ "$_ag" != '{}' ] || return 0
+  lock obs     # one round at a time: two open boards of one .awb would record a message twice
   _of=$AWB_DIR/obs; touch "$_of"; _nf=$(mktemp "$_of.XXXXXX"); _new=$(mktemp "$_of.XXXXXX")
   printf '%s' "$_reg" | jq -r --argjson ag "$_ag" '.[] | select($ag[.name // ""] == null and (.sessionId // "") != "")
     | "\(.sessionId) \(.name // "-")"' | while read -r sid via; do
@@ -837,13 +838,13 @@ observe_once() {
   done > "$_new"
   rm -f "$_new.c"
   mv "$_nf" "$_of"
-  [ -s "$_new" ] || { rm -f "$_new"; return 0; }
+  [ -s "$_new" ] || { rm -f "$_new"; unlock obs; return 0; }
   cat "$_new" >> "$EV"
   jq -r 'select(.dir == "in" and (.key // "") != "") | "\(.id) \(.key)"' "$_new" | while read -r id k; do
     [ "$(open_key "$id")" != "$k" ] \
       || append '{t:"done",time:$time,ep:$ep,id:$id,text:null,key:$k,observed:true}' --arg id "$id" --arg k "$k"
   done
-  rm -f "$_new"
+  rm -f "$_new"; unlock obs
 }
 
 nudge_once() {
@@ -961,8 +962,11 @@ watch() {
         ( AWB="$BIN" "$lk" sync >/dev/null 2>&1 & )
       fi
     fi
-    if [ "${AWB_NUDGE:-1}" != 0 ] && [ $(($(date +%s) - nudged)) -ge "${AWB_NUDGE_POLL:-60}" ]; then
-      nudged=$(date +%s); ( "$BIN" nudge --once >/dev/null 2>&1 & )
+    if [ $(($(date +%s) - nudged)) -ge "${AWB_NUDGE_POLL:-60}" ]; then
+      nudged=$(date +%s)
+      # AWB_NUDGE=0 stops the reminders typed into agents, not the read-only observation
+      if [ "${AWB_NUDGE:-1}" != 0 ]; then ( "$BIN" nudge --once >/dev/null 2>&1 & )
+      else ( "$BIN" _observe >/dev/null 2>&1 & ); fi
     fi
     set -- $(dims); cols=${1:-80}; rows=${2:-24}
     # a key within the same second scrolls what is on screen instead of rendering again
@@ -2348,6 +2352,13 @@ FT
     ht view --json | jq -e 'any(.anomalies[]; .kind == "noreply") and (.talk[] | select(.id == "z1") | .out == 4 and .in == 2)' >/dev/null \
       || die "selftest: no-reply not on the board: $(ht view --json | jq -c '{a:.anomalies, t:.talk}')"
     reg busy; ! ht view --json | jq -e 'any(.anomalies[]; .kind == "noreply")' >/dev/null || die "selftest: a busy session flagged as not replying"
+    # an open board observes with its nudges off too (AWB_NUDGE=0 is the selftest's setting)
+    in_ "$(date +%s)" zz-1 "late reply" >> "$tr_"
+    HOME=$t/home AWB_NUDGE_POLL=1 AWB_INTERVAL=0.2 "$BIN" view >/dev/null 2>&1 &
+    wp=$!; i=0
+    until [ "$(grep -F '"t":"msg"' "$EV" | grep -cF '"dir":"in"')" = 3 ]; do
+      i=$((i + 1)); [ $i -lt 40 ] || { kill $wp; die "selftest: a board with AWB_NUDGE=0 did not observe"; }; sleep 0.25; done
+    kill $wp; wait $wp 2>/dev/null || true
     reg idle
     rm -f "$t/home/.claude/sessions/2.json"
     # a pane given as session:window.pane in .awb/panes resolves to the same session
