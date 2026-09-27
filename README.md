@@ -27,7 +27,8 @@ since the view is cut at the pane height:
 5. 下一步: the main line's next open steps.
 6. 异常, one line per agent: a bottleneck (an issue or PR, `#N`, two or more blocked agents
    wait for), no code change, a session that contradicts the report, a silent agent that has
-   no Claude session to report for it, a board nobody writes to. Silence counts after
+   no Claude session to report for it, a board nobody writes to, a command awb does not have
+   that some caller ran in the last 24 hours (a script that hides stderr). Silence counts after
    `AWB_SILENT` (3600 s), not the nudge threshold `AWB_STALE` (600 s): on a real three-day log
    the median gap between two updates of one agent was 772 s.
 

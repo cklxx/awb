@@ -313,7 +313,12 @@ JQ_SNAP=$JQ_FOLD$JQ_DEFS'
       | select($q >= ($stale | tonumber))
       | {kind:"hold", text:"\($hd.res) 被 \(($a.name) // $hd.owner) 占着 \((($nowep - $hd.since) | ago))，它 \($q | ago)没在干活"}),
      (if $quiet >= $silent and $nrun > 0
-      then {kind:"board", text:"看板 \($quiet | ago)没有新事件，主控可能停了"} else empty end) ]) as $anom
+      then {kind:"board", text:"看板 \($quiet | ago)没有新事件，主控可能停了"} else empty end),
+     # a caller (a script, often with stderr thrown away) ran a command awb does not have: in the
+     # last 24 hours, one line per command
+     ([$raw[] | select(type == "object" and .t == "badcmd" and (.ep // 0) >= $nowep - 86400)]
+      | group_by(.cmd)[] | {kind:"badcmd",
+        text:"有调用方在用不存在的命令 awb \(.[0].cmd | tostring | .[0:24])：24 小时内 \(length) 次，最近 \(($nowep - (map(.ep // 0) | max)) | ago)前"}) ]) as $anom
 # the live roots of the task tree: a fully-done root untouched for an hour is
 # folded away (counted in tasks_old) and left out of the total progress
 | ([ kids($s.tasks; $s.torder; "")[] as $root
@@ -1767,6 +1772,8 @@ selftest() {
   hb hold gpu h1; [ "$(hb holder gpu | cut -d' ' -f1)" = h1 ] || die "selftest: holder alias lost"
   hb release gpu; rc=0; hb holder gpu >/dev/null || rc=$?; [ "$rc" = 1 ] || die "selftest: holder of a free resource exited $rc"
   rc=0; hb nosuchcmd 2>/dev/null || rc=$?; [ "$rc" = 2 ] || die "selftest: unknown command exited $rc, not 2"
+  hb view --json | jq -e 'any(.anomalies[]; .kind == "badcmd" and (.text | contains("awb nosuchcmd") and contains("1 次")))' >/dev/null \
+    || die "selftest: an unknown command is not on the board: $(hb view --json | jq -c .anomalies)"
   AWB_STALE=0 hb view --json | jq -e '(.holds | length) == 0 and (any(.anomalies[]; .kind == "hold") | not)' >/dev/null \
     || die "selftest: a released resource still shown"
   # merge: only the newest verdict naming the current head counts, a conditional or retracted
@@ -2638,7 +2645,10 @@ case "$cmd" in
   peers)    peers ;;
   selftest) selftest ;;
   ""|-h|--help|help) usage ;;
-  *) printf '%s: unknown command: %s (commands: %s help)\n' "$PROG" "$cmd" "$PROG" >&2; exit 2 ;;
+  *) printf '%s: unknown command: %s (commands: %s help)\n' "$PROG" "$cmd" "$PROG" >&2
+     # the board shows it too: a script that throws stderr away would otherwise fail unseen
+     [ ! -s "$EV" ] || append '{t:"badcmd",time:$time,ep:$ep,cmd:$c}' --arg c "$cmd"
+     exit 2 ;;
 esac
 }
 
