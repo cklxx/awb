@@ -105,7 +105,7 @@ reduce (. // [])[] as $e (
     | .agents[$e.id].lastEp = ($e.ep // .agents[$e.id].lastEp)
     # awb send: the task is a node of the task tree, owned by the worker; its key is its id
     | if ($e.key // "") == "" then .
-      else lose($e.id) | .agents[$e.id].key = $e.key
+      else lose($e.id) | .agents[$e.id].key = $e.key | .agents[$e.id].keyEp = ($e.ep // 0)
         | (if .tasks[$e.key] == null then .torder += [$e.key] else . end)
         | .tasks[$e.key] = {id:$e.key, state:"wip", text:($e.text // ""), parent:($e.parent // ""), owner:$e.id}
       end
@@ -232,6 +232,12 @@ JQ_RENDER=$JQ_FOLD$JQ_DEFS'
 | ([$raw[] | select(type == "object" and .t == "nudge" and .why == "stuck" and (.id | type) == "string")]
    | group_by(.id) | map(sort_by(.ep // 0) | last | {key:.id, value:.}) | from_entries) as $stk
 | ($raw | fold)
+# with the Lean model built, the status, gate and end of every agent come from the proven fold
+# (model/AwbModel.lean, awbmodel fold); the jq fold equals it only by the differential test
+| reduce ($lean | split("\n")[] | select(. != "" and (startswith("probe ") | not)) | split(" ")) as $l (.;
+    if .agents[$l[0]] == null then .
+    else .agents[$l[0]] += {status:$l[1], gate:($l[2] == "true"),
+                            endEp:(if $l[3] == "-" then null else ($l[3] | tonumber) end)} end)
 
 # pane closed without a finish/fail event -> dead (empty pane = remote agent)
 | .agents |= map_values(
@@ -250,6 +256,11 @@ JQ_RENDER=$JQ_FOLD$JQ_DEFS'
         | .value.sess = "待批准：" + (if $x.waiting != "" then $x.waiting else "对话框" end) + " " + (($nowep - $x.since) | sdur)
       elif $x.status == "busy" and (.value.status | IN("done","failed")) then
         .value.sess = "自报" + {"done":"完成","failed":"失败"}[.value.status] + "，会话在忙"
+      # a task sent to a session idle since before it, still idle: the message may never have
+      # left the main agent (SendMessage is its step, outside awb)
+      elif $x.status == "idle" and (.value.key // null) != null and $x.since <= (.value.keyEp // 0)
+           and ($nowep - (.value.keyEp // $nowep)) >= $undeliv then
+        .value.sess = "任务 #" + .value.key + " 派出 " + (($nowep - .value.keyEp) | sdur) + " 仍没开始：消息可能没发出"
       # only an agent that claims work (a milestone or a sent task open): a worker idle
       # between tasks, or started and waiting for its first, is not a contradiction
       elif $x.status == "idle" and .value.status == "running" and .value.current != null and ($nowep - $x.since) >= $silent then
@@ -724,7 +735,7 @@ render() {
   # live facts below (panes, sessions, code fingerprints, audit) describe now, so none is read
   nowep=${AWB_NOW:-$(date +%s)}
   if [ -n "${AWB_NOW:-}" ]; then
-    live=null; viol=; diffs='[]'; sess='{}'
+    live=null; viol=; lean=; diffs='[]'; sess='{}'
     render_jq "$(jq -nr --argjson t "$nowep" '$t | strflocaltime("%H:%M:%S")')"
     return
   fi
@@ -735,7 +746,10 @@ render() {
   else
     live=null
   fi
-  viol=; m=$(model_bin) && [ -s "$EV" ] && viol=$("$m" audit < "$EV" 2>/dev/null || true)
+  viol=; lean=
+  if m=$(model_bin) && [ -s "$EV" ]; then
+    viol=$("$m" audit < "$EV" 2>/dev/null || true); lean=$("$m" fold < "$EV" 2>/dev/null || true)
+  fi
   # working-tree fingerprints written by freeze_once: "ID HASH EP" (epoch of
   # last change). Fed to render as data, never through the proven fold.
   if [ -s "$AWB_DIR/diffs" ]; then
@@ -749,7 +763,7 @@ render() {
 render_jq() {
   # the brief view is drawn from the snapshot only; the full view renders the fold itself
   _v=${AWB_VIEW:-brief}; [ "$_v" = full ] || _v=snapshot
-  events_json | jq -r --arg viol "$viol" \
+  events_json | jq -r --arg viol "$viol" --arg lean "${lean:-}" --argjson undeliv "${AWB_UNDELIVERED:-180}" \
     --argjson w "$cols" --argjson h "$rows" \
     --arg now "$1" --argjson nowep "$nowep" \
     --arg prog "$PROG" --argjson live "$live" --arg view "$_v" --arg stale "${AWB_STALE:-600}" \
@@ -1378,8 +1392,20 @@ idle() {
 # open a PR for an agent's work from the current git checkout, only when the agent's
 # latest `awb check` passed; the body lists its milestones and that check's steps
 pr() {
-  [ $# -ge 1 ] || die "usage: $PROG pr ID [gh pr create args...]"
-  id=$1; shift; init_dir
+  _u="usage: $PROG pr ID [gh pr create args...] -- CMD... | -- --lean DIR [ACCEPT.lean]"
+  [ $# -ge 1 ] || die "$_u"
+  id=$1; shift; need_agent "$id"
+  _gh=; _acc=
+  while [ $# -gt 0 ]; do
+    if [ "$1" = -- ]; then shift; _acc=1; break; fi
+    _gh="$_gh $(q "$1")"; shift
+  done
+  [ -n "$_acc" ] && [ $# -ge 1 ] || die "$_u (the acceptance runs here, then the PR)"
+  # the acceptance runs in this process: a passing check read from the log could have been
+  # written there by the agent, check events and all
+  if [ "$1" = --lean ]; then "$BIN" check "$id" "$@" || die "acceptance failed: no PR"
+  else "$BIN" check "$id" -- "$@" || die "acceptance failed: no PR"; fi
+  eval "set -- $_gh"
   lock "gate-$id"     # no check of this agent can interleave between the gate and the PR
   info=$({ [ -s "$EV" ] && cat "$EV" || true; } | jq -R -s --arg id "$id" '
     [split("\n")[] | fromjson? | select(type == "object" and .id == $id)] as $es
@@ -1848,6 +1874,11 @@ selftest() {
   [ ! -e "$t/help-probe" ] || die "selftest: up --help created AWB_DIR"
   ( cd "$t" && AWB_DIR=help-probe "$BIN" --help >/dev/null ) || die "selftest: --help failed"
   [ ! -e "$t/help-probe" ] || die "selftest: --help ran a command (created AWB_DIR)"
+  # with the Lean model built, the board takes status from it, not from the jq fold
+  lm=$t/lean; mkdir -p "$lm"; printf '#!/bin/sh\n[ "$1" = fold ] && echo "l1 failed false 1 0 0"\nexit 0\n' > "$lm/model"
+  chmod +x "$lm/model"; AWB_DIR=$lm "$BIN" start l1 lagent
+  AWB_DIR=$lm AWB_MODEL=$lm/model "$BIN" snapshot | jq -e '.need | any(.kind == "fail" and .id == "l1")' >/dev/null \
+    || die "selftest: the board did not take the status of the proven fold"
   # a typo is an error, never an event the fold drops or a title (own log)
   ud=$t/usage; ub() { AWB_DIR=$ud "$BIN" "$@"; }
   [ "$(ub bogus 2>&1 | wc -l | tr -d ' ')" = 1 ] || die "selftest: an unknown command printed more than one line"
@@ -2188,7 +2219,10 @@ EOF
   "$BIN" check a1 -- true >/dev/null || die "selftest: passing check rejected"
   AWB_VIEW=full "$BIN" render | grep -Fq "⊢ gated" || die "selftest: verified milestone not marked"
   ! AWB_VIEW=full "$BIN" render | grep -F "⊢ gated" | grep -Fq "自报" || die "selftest: verified milestone wrongly marked 自报"
-  ! "$BIN" pr a2 2>/dev/null || die "selftest: pr opened without a passing check"
+  ! "$BIN" pr a2 2>/dev/null || die "selftest: pr opened without an acceptance command"
+  # a pass forged in the log does not open a PR: pr runs the acceptance itself
+  printf '{"t":"chk","ep":%s,"id":"a2","run":"forged","what":"true","step":"cmd","state":"ok","note":""}\n' "$(date +%s)" >> "$EV"
+  ! "$BIN" pr a2 -- false >/dev/null 2>&1 || die "selftest: pr trusted a check pass from the log"
   "$BIN" start v1 late; "$BIN" now v1 "shipped"; "$BIN" done v1; "$BIN" check v1 -- true >/dev/null
   out=$(AWB_VIEW=full "$BIN" render)
   printf '%s' "$out" | grep -Fq "⊢ shipped" || die "selftest: late check did not verify last milestone"
@@ -2357,6 +2391,14 @@ FT
       || die "selftest: a silent agent with no session not listed"
     reg idle "" 10
     ! ht render | grep -Fq "会话空闲" || die "selftest: running agent idle 10s flagged"
+    # a task sent to a session idle since before it, and still idle: not delivered
+    reg idle "" 400; zm=$("$BIN" send z1 "undelivered" 2>/dev/null); zk=$(printf '%s' "$zm" | sed -n '1s/^\[awb z1#\([0-9]*\)\].*/\1/p')
+    AWB_UNDELIVERED=0 ht snapshot | jq -e '.anomalies | any(.text | contains("消息可能没发出"))' >/dev/null \
+      || die "selftest: a sent task the idle worker never started is not flagged"
+    reg busy
+    ! AWB_UNDELIVERED=0 ht snapshot | jq -e '.anomalies | any(.text | contains("消息可能没发出"))' >/dev/null \
+      || die "selftest: a started task flagged as undelivered"
+    "$BIN" reply z1 "$zk" >/dev/null; "$BIN" now z1 "still going"; reg idle "" 10
     # a session stopped with a tool call printed as text is told to re-issue it, once per
     # AWB_STUCK_EVERY, and flagged until it works again; an idle pane without one is left alone
     reg idle "" 300
