@@ -54,10 +54,9 @@ Claude, follow this and do not ask the user to type commands:
    `awb check <id> -- <command>` runs it; after a rejected check the agent cannot become done
    until a later check passes. Keep acceptance files (tests, ACCEPT.lean) outside the worker's
    directory. Then `awb pr <id> -- <command>` runs the acceptance again itself and opens the PR
-   only on that pass; merge with `awb merge PR` (a retracted or conditional
-   approve, an approve of an older head, or a check that never started is not a green light).
-6. Read the board with `awb snapshot` (one JSON object: goal, metric, need, anomalies, agents,
-   tasks, checks); `awb render` draws the same for a person.
+   only on that pass.
+6. Read the board with `awb view --json` (one JSON object: goal, metric, need, anomalies,
+   agents, tasks, checks); `awb view --once` draws the same for a person.
 7. Subagents you start with your Agent tool take tasks the same way: `awb start <id> <name>`
    once, `awb send <id> "<task>"`, give the printed message to the Agent tool as its prompt,
    and `awb reply` with the key when its result comes back.
@@ -116,26 +115,26 @@ not process, one per stage. Full rules: `awb skill`.
 ## Commands
 
 `awb help` lists them in three groups: the task loop (up, goal, tui, send, reply, idle, fail,
-task, block/unblock, check, pr, merge, metric, news), self-reporting workers (run, start,
-now/done/finish), and coordination and reading (peers, tell, nudge, hold/release/holder,
-snapshot/render/watch, replay, audit, probe, down/reset). Details worth knowing:
+task, block/unblock, check, pr, metric, news), self-reporting workers (run, start,
+now/done/finish), and coordination and reading (peers, tell, nudge, hold/release, view,
+replay, down/reset). Details worth knowing:
 
 - `awb check ID -- CMD`: exit 0 verifies the worker's latest work (`⊢`); else ✗ with the reason,
   the log in `.awb/check-ID.log`, and the worker is told (`AWB_NOTIFY=0` turns that off).
-- `awb merge PR`: only on an approve of the current head (a review, or a comment whose first
-  line names the head sha and matches `AWB_APPROVE_RE`) with `AWB_MIN_CHECKS` checks named by
-  `AWB_REQUIRE_CHECKS` green.
 - `awb peers`: `ID PANE SESSION STATUS [#KEY] [silent MINm]`. Sessions not started by awb:
   add `ID PANE` lines to `.awb/panes`.
-- `awb hold RES OWNER`: one holder per shared resource; scripts that must not disturb it check
-  `awb holder RES` first.
+- `awb hold RES OWNER`: one holder per shared resource; `awb hold` alone lists the holders
+  (`RES OWNER SINCE NOTE`), which scripts that must not disturb one read first.
 - `awb tell`: types into a pane; for Claude workers prefer SendMessage.
 
-Settings: `AWB_VIEW=brief|full` (default brief), `AWB_STALE` (seconds, default 600),
+Settings: `AWB_STALE` (seconds, default 600),
 `AWB_INTERVAL` (refresh seconds, default 1). IDs match `[A-Za-z0-9_-]`; an agent id must be
 started before other commands use it. States: ◔ running · ✓ done · ▲ blocked · ✗ failed · ■ dead.
 
 ## Lean 4 acceptance
+
+`awb check <id> -- <awb clone>/model/accept.sh <project dir> ACCEPT.lean` runs `lake build`, then
+rejects `sorry`/`admit` in the sources, then checks ACCEPT.lean:
 
 1. ACCEPT.lean contains only top-level named `theorem`s that refer to the worker's definitions:
    ```lean
@@ -144,7 +143,7 @@ started before other commands use it. States: ◔ running · ✓ done · ▲ blo
    ```
    `example`, `lemma`, `namespace` or any unrecognised form fails the check (fail-closed).
 2. Rejected: `sorry`, custom `axiom`s, `native_decide`, a weaker restatement. About 2s warm; no Mathlib needed.
-3. The board's 验收 section shows `build → sorry → types → axioms` live, with the reason under a failed step.
+3. The reason of a failure is the last line of `.awb/check-ID.log`, shown under the check on the board.
 4. Only Lean deliverables; a weak statement gives a weak check. The project needs a
    `lean-toolchain`; elan in `~/.elan/bin` is found too.
 
@@ -152,11 +151,11 @@ started before other commands use it. States: ◔ running · ✓ done · ▲ blo
 
 - State fold: `model/AwbModel.lean` proves four invariants; the jq fold in awb is differentially
   tested against the compiled Lean model on random logs (200 per selftest).
-- Audit: `awb audit` runs the proven Lean monitor (`audit_iff_clean`: no report ⇔ every event
+- Audit: the board runs the proven Lean monitor (`audit_iff_clean`: no report ⇔ every event
   obeys the rules given its prefix). A `⊢` verified milestone and a PR must follow a passing
   check; no `done` while a check is rejected. Violations show on the board under 审计违规.
 - The model is built in a clone (`./install.sh` runs `lake build` when Lean is present);
-  without it, audit is unavailable and selftest skips the differential test.
+  without it, the board has no audit and selftest skips the differential test.
 - Concurrency: TLA+ specs in `model/tla/`, checked with TLC. `check` / `pr` are serialized per
   agent; a check verifies only the milestone it started on; concurrent `tell`s into one pane
   take a per-pane lock; `tell` re-reads the session registry before each keystroke and never

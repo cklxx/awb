@@ -62,13 +62,13 @@ def finish($id): (.agents[$id].key // null) as $k
   | if $k == null then . else .tasks[$k].state = "done" | .agents[$id].key = null end;
 def fold:
 reduce (. // [])[] as $e (
-  {goal:"", agents:{}, gorder:{}, gseen:[], tasks:{}, torder:[], news:[], checks:{}, probes:{}};
+  {goal:"", agents:{}, gorder:{}, gseen:[], tasks:{}, torder:[], news:[], checks:{}};
   if   $e.t == "goal" then .goal = $e.text
   elif $e.t == "news" then .news += [{text:$e.text, time:($e.time // ""), key:($e.key // "")}]
   elif $e.t == "task" then
     (if .tasks[$e.id] == null then .torder += [$e.id] else . end)
     | .tasks[$e.id] = ((.tasks[$e.id] // {id:$e.id, state:"todo", text:$e.id, parent:"", owner:""})
-        + ({state:$e.state, text:$e.text, parent:$e.parent, owner:$e.owner, probe:$e.probe, pdir:$e.pdir}
+        + ({state:$e.state, text:$e.text, parent:$e.parent, owner:$e.owner}
            | with_entries(select(.value != null and .value != ""))))
   elif $e.t == "start" then
     if .agents[$e.id] != null then
@@ -89,14 +89,6 @@ reduce (. // [])[] as $e (
     | (.checks[$e.id].steps | map(.s) | index($e.step)) as $i
     | if $i == null then .checks[$e.id].steps += [{s:$e.step, state:$e.state, ep0:$e.ep, ep1:null, note:""}]
       else .checks[$e.id].steps[$i] += {state:$e.state, ep1:$e.ep, note:$e.note} end
-  # probe reading (model/Probe.lean pstep): keep the parsed one with the latest start ep0
-  elif $e.t == "probe" then
-    (.probes[$e.id].acc // null) as $a | ($e.ep0 // 0) as $t0
-    | .probes[$e.id].last = ($e.ep // 0)
-    | if $e.rc == 0 and ($e.st | IN("todo","wip","review","blocked","done","drop"))
-         and ($a == null or $t0 >= $a.ep0)
-      then .probes[$e.id].acc = {ep0:$t0, ep:($e.ep // 0), st:$e.st, text:($e.text // "")}
-      else .probes[$e.id].acc = $a end
   elif ($e.id | type) != "string" or .agents[$e.id] == null then .
   elif $e.t == "now" then
     (if .agents[$e.id].status == "done" then .agents[$e.id].status = "running" | .agents[$e.id].endEp = null | .agents[$e.id].reason = "" else . end)
@@ -140,7 +132,7 @@ reduce (. // [])[] as $e (
   else . end);
 '
 
-# formatting helpers shared by the board views (JQ_RENDER) and the brief view (JQ_BRIEF)
+# formatting helpers shared by the snapshot (JQ_SNAP) and the brief view drawn from it (JQ_BRIEF)
 JQ_DEFS='
 def wide($c):
   ($c >= 4352 and $c <= 4447) or ($c >= 11904 and $c <= 42191)
@@ -163,12 +155,6 @@ def pad($n):
   . as $s | ($n - ($s | dwidth)) as $slack
   | if $slack <= 0 then $s else $s + (" " * $slack) end;
 def pad2: if . < 10 then "0" + tostring else tostring end;
-def hms:
-  (.) as $s | ($s / 3600 | floor) as $h
-  | (($s % 3600) / 60 | floor) as $m | ($s % 60 | floor) as $sc
-  | if $h > 0 then "\($h):\($m|pad2):\($sc|pad2)" else "\($m):\($sc|pad2)" end;
-def dur: (if . == null then "--:--" else hms end) as $t
-  | (" " * (8 - (($t|length) | if . > 8 then 8 else . end))) + $t;
 def sdur:
   if . == null then "·"
   elif . < 60 then "\(.)s"
@@ -184,10 +170,6 @@ def bar($d; $t; $n):
 def kids($T; $O; $id): [$O[] | select(($T[.].parent // "") == $id and (($T[.].state) | IN("ask","drop") | not))];
 def leaves($T; $O; $id): kids($T; $O; $id) as $k
   | if ($k | length) == 0 then [$id] else [$k[] | leaves($T; $O; .)[]] end;
-def tree($T; $O; $id; $pre): kids($T; $O; $id) as $k | ($k | length) as $n
-  | [range(0; $n) as $i | ($i == $n - 1) as $l
-     | [{pre:($pre + (if $l then "└─ " else "├─ " end)), t:$T[$k[$i]], depth:($pre | length)}]
-       + tree($T; $O; $k[$i]; $pre + (if $l then "   " else "│  " end))] | add // [];
 def prog($T; $ids): [$ids[] | $T[.] | select(.state != "drop")] as $x
   | {d:([$x[] | select(.state == "done")] | length), t:($x | length)};
 # one count of finished work since an epoch: a sent task replied, a milestone of a
@@ -196,9 +178,6 @@ def prog($T; $ids): [$ids[] | $T[.] | select(.state != "drop")] as $x
 def finished($raw; $since): [$raw[] | select(type == "object" and (.ep // 0) >= $since)]
   | ([.[] | select(.t == "done" and ((.verified == true and .text == null and (.key // "") == "") | not))] | length)
     + ([.[] | select(.t == "task" and .state == "done") | .id] | unique | length);
-def live: .current != null and (.status == "running" or .status == "blocked");
-def lpad($n):
-  . as $s | (" " * ($n - (($s|length) | if . < 0 then 0 elif . > $n then $n else . end))) + $s;
 def wrap($n):
   # CJK (no spaces) wraps per character; when the current line has a space, an overflow wraps at
   # its last space so a Latin word is not split across lines
@@ -217,10 +196,10 @@ def wrap($n):
   end;
 '
 
-JQ_RENDER=$JQ_FOLD$JQ_DEFS'
-($w   | if . < 40 then 40 elif . > 240 then 240 else . end) as $w |
-($h   | if . < 12 then 12 elif . > 5000 then 5000 else . end) as $h |
-($w - 1) as $inner |
+# the snapshot: the board as JSON (awb view --json), drawn by JQ_BRIEF on the pane and by
+# awb-lark as a card. It answers, in order, how far from the goal and is it moving; what needs
+# you; what each agent is doing; how much of it is verified.
+JQ_SNAP=$JQ_FOLD$JQ_DEFS'
 
 . as $raw
 # the newest reading by its time, so a backfilled older one (metric --at) does not replace it.
@@ -242,7 +221,7 @@ JQ_RENDER=$JQ_FOLD$JQ_DEFS'
 | ($raw | fold)
 # with the Lean model built, the status, gate and end of every agent come from the proven fold
 # (model/AwbModel.lean, awbmodel fold); the jq fold equals it only by the differential test
-| reduce ($lean | split("\n")[] | select(. != "" and (startswith("probe ") | not)) | split(" ")) as $l (.;
+| reduce ($lean | split("\n")[] | select(. != "") | split(" ")) as $l (.;
     if .agents[$l[0]] == null then .
     else .agents[$l[0]] += {status:$l[1], gate:($l[2] == "true"),
                             endEp:(if $l[3] == "-" then null else ($l[3] | tonumber) end)} end)
@@ -275,23 +254,7 @@ JQ_RENDER=$JQ_FOLD$JQ_DEFS'
         .value.sess = "自报进行，会话空闲 " + (($nowep - $x.since) | sdur)
       else . end)
 
-# a probed task shows its accepted reading while fresh (done/drop do not expire), else unknown
-| .probes as $P
-| .tasks |= map_values(
-    if .probe == null then .
-    else ($P[.id].acc // null) as $a
-      | if $a != null and (($a.st | IN("done","drop")) or $nowep - $a.ep <= $fresh)
-        then .state = $a.st | .text += " · " + $a.text + " · " + (($nowep - $a.ep0) | sdur) + "前"
-        else .state = "unknown"
-          | .text += (if $a == null then " · 未读到" else " · 读不到 " + (($nowep - $a.ep) | sdur) end)
-        end
-    end)
 | . as $s
-| ($s.gseen | map({g:., ids:$s.gorder[.]})) as $groups
-| ([$s.agents[]] | length) as $n
-| ([$s.agents[] | .status] | group_by(.) | map({key:.[0], value:length}) | from_entries) as $c
-# what needs you and what is off, computed once for both views (the full view used to show
-# neither, so a short full-view pane could hide every failure)
 # the last change of each task: its task events, and the send and reply of a sent task
 | ([$raw[] | select(type == "object")
     | if .t == "task" and .id != null then {k:.id, ep:(.ep // 0)}
@@ -339,11 +302,9 @@ JQ_RENDER=$JQ_FOLD$JQ_DEFS'
    | group_by(.ref) | map(select(length >= 2) | {ref:.[0].ref, names:map(.name)})) as $bott
 | ([ ($bott[] | {kind:"bottleneck", text:"\(.ref) 卡住 \(.names | join("、"))"}),
      # one line per agent: a flag (no code change, session disagrees) over silence; silence
-     # counts only for an agent with no Claude session, since a live session reports itself,
-     # and not for one that owns a probed task whose fresh reading says it waits (docs/probe.md)
-     ([ $s.tasks[] | select(.probe != null and (.state | IN("wip","review"))) | .owner ] as $pw
-      | $act[] | if .flag != "" then {kind:"flag", text:"\(.name) \(.flag)"}
-               elif .status == "running" and .silent and .live == null and ((.id | IN($pw[])) | not)
+     # counts only for an agent with no Claude session, since a live session reports itself
+     ($act[] | if .flag != "" then {kind:"flag", text:"\(.name) \(.flag)"}
+               elif .status == "running" and .silent and .live == null
                then {kind:"silent", text:"\(.name) \(.idle | ago)没有更新"} else empty end),
      # a held resource whose holder has not worked for AWB_STALE: the rest queue behind it
      ($holds[] | . as $hd | ($s.agents[$hd.owner] // null) as $a | ($sess[$hd.owner] // null) as $x
@@ -353,16 +314,7 @@ JQ_RENDER=$JQ_FOLD$JQ_DEFS'
       | {kind:"hold", text:"\($hd.res) 被 \(($a.name) // $hd.owner) 占着 \((($nowep - $hd.since) | ago))，它 \($q | ago)没在干活"}),
      (if $quiet >= $silent and $nrun > 0
       then {kind:"board", text:"看板 \($quiet | ago)没有新事件，主控可能停了"} else empty end) ]) as $anom
-| (if $s.goal == "" then "(no goal yet:  " + $prog + " goal \"ship it\")" else $s.goal end) as $goal
-# the box head shows the goal title, like the brief view (it used to be a GOAL placeholder);
-# the remaining goal lines stay inside the box
-| (($s.goal | gsub("\r";"") | split("\n")) as $gl
-   | {title:($gl[0] // ""), about:($gl[1:] | map(select(. != "")))}) as $Gf
-| (if $Gf.title == "" then "╭" + ("─" * ($inner - 2)) + "╮"
-   else ($Gf.title | clip($inner - 6)) as $tt
-     | "╭─ " + $tt + " " + ("─" * ([$inner - 5 - ($tt | dwidth), 2] | max)) end) as $top
-| (if $s.goal == "" then [] else [$Gf.about[] | wrap($inner - 4)[]] end) as $goal_lines
-# the live roots of the task tree, for both views: a fully-done root untouched for an hour is
+# the live roots of the task tree: a fully-done root untouched for an hour is
 # folded away (counted in tasks_old) and left out of the total progress
 | ([ kids($s.tasks; $s.torder; "")[] as $root
      | leaves($s.tasks; $s.torder; $root) as $lv | prog($s.tasks; $lv) as $rp
@@ -370,127 +322,7 @@ JQ_RENDER=$JQ_FOLD$JQ_DEFS'
      | {id:$root, old:($rp.t > 0 and $rp.d == $rp.t and ($nowep - $last) >= 3600)} ]) as $roots
 | ([$roots[] | select(.old | not) | .id]) as $lroots
 | ([$roots[] | select(.old)] | length) as $nold
-| ("╰─ " +
-    (if $n == 0 then "no agents yet:  " + $prog + " run id name -- claude"
-     else ([$s.agents[] | .done | length] | add // 0) as $md
-       | ([$s.agents[] | select(live)] | length) as $mo
-       | prog($s.tasks; [$lroots[] | leaves($s.tasks; $s.torder; .)[]]) as $tp
-       | (if $tp.t > 0 then "总进度 " + bar($tp.d; $tp.t; 20) + " \($tp.d)/\($tp.t) 任务 · " else "" end)
-         + "里程碑 \($md)/\($md + $mo) · "
-         + "\($n) agents ◔\($c.running // 0) ▲\($c.blocked // 0) ✓\($c.done // 0) ✗\($c.failed // 0) ■\($c.dead // 0)"
-     end)
-    + "   " + $now) as $foot
-| ([$s.checks[]] | sort_by(-.startEp) | .[:3]) as $cks
-| (if ($cks | length) == 0 then [] else ["", $g + "验收" + $rs]
-   + [ $cks[] | .steps as $ss
-       | (if any($ss[]; .state == "fail") then ["✗",$r] elif any($ss[]; .state == "run") then ["◔",$cy]
-          else ["⊢",$g] end) as $ov
-       | ([$ss[] | (.ep1 // $nowep) - .ep0] | add // 0) as $el
-       | ([ $ss[] | ({"ok":"✓","fail":"✗","run":"◔"}[.state] // "·") as $i
-            # a single running step already shows its time as the row total; only multi-step
-            # checks time each running step in the chain
-            | .s + " " + $i + (if .state == "run" and ($ss | length) > 1 then " " + (($nowep - .ep0) | sdur) else "" end) ]
-          | join(" → ")) as $chain
-       | ([$ss[] | select(.state == "fail") | .note] | first // "") as $why
-       | "  " + $ov[1] + $ov[0] + $rs + " " + ((($s.agents[.id].name) // .id) | clip(10) | pad(10)) + " "
-         + $dm + (.what | clip(18) | pad(18)) + $rs + " "
-         + ($chain | clip([$inner - 43, 10] | max)) + $dm + "  " + ($el | sdur) + $rs
-       , (if $why != "" then "    " + $r + "└ " + ($why | clip($inner - 8)) + $rs else empty end) ]
-   end) as $chk
 | ($viol | split("\n") | map(select(. != "") | split(" "))) as $vs
-| ($chk + (if ($vs | length) == 0 then [] else ["", $r + "审计违规（Lean 监控）" + $rs]
-    + [ $vs[] | "  " + $r + "✗ " + $rs + ((($s.agents[.[0]].name) // .[0]) | clip(10) | pad(10)) + " "
-        + ({"verified-without-passing-check":"验收标记前没有通过的验收（疑似伪造）",
-            "pr-without-passing-check":"没有通过的验收就开了 PR",
-            "done-while-check-rejected":"验收被拒后仍报完成"}[.[1]] // .[1]) ] end)) as $chk
-| ({"todo":["○",$dm],"wip":["◔",$cy],"review":["◑",$cy],"blocked":["▲",$y],
-    "done":["✓",$g],"drop":["–",$dm],"ask":["?",$y],"unknown":["?",$r]}) as $TI
-| ([ kids($s.tasks; $s.torder; "")[] as $root | $s.tasks[$root] as $rt
-     | prog($s.tasks; leaves($s.tasks; $s.torder; $root)) as $rp
-     | [$cy + "■ " + ($rt.text | clip($inner - 36)) + $rs + "  " + bar($rp.d; $rp.t; 12) + $dm + " \($rp.d)/\($rp.t)" + $rs]
-     + [ tree($s.tasks; $s.torder; $root; "  ")[]
-         | . as $n | ($TI[.t.state] // ["•",$dm]) as $ic
-         | (if .t.owner != "" then " @" + .t.owner else "" end) as $ow
-         | $ic[1] + .pre + $ic[0] + " " + ($n.t.text | clip($inner - $n.depth - 6 - ($ow | dwidth)))
-           + $dm + $ow + $rs ]
-   ] | add // []) as $ttree
-# what needs you and what is off, in the head of the full view too (the full view used to
-# show neither); up to three of each, then a count of the rest
-| ((if ($need | length) > 0 then ["", $y + "需要你（\($need | length)）" + $rs]
-      + [ $need[] | (if .age != null then $dm + " · 已 " + (.age | ago) + $rs else "" end) as $ag
-          | if .kind == "wait" then $y + "  ▲ " + $rs + (.name | clip(10) | pad(10)) + " " + (.text | clip($inner - 16))
-            elif .kind == "fail" then $r + "  ✗ " + $rs + (.name | clip(10) | pad(10)) + " " + (.text | clip($inner - 26)) + $ag
-            else $y + "  ? " + $rs + (.text | clip($inner - 16)) + $ag end ][:3]
-      + (if ($need | length) > 3 then [$dm + "    还有 \($need[3:] | length) 件" + $rs] else [] end)
-    else [] end)
-   + (if ($anom | length) > 0 then ["", $y + "异常（\($anom | length)）" + $rs]
-      + [ $anom[] | "  " + $y + "! " + $rs + (.text | clip($inner - 6)) ][:3]
-      + (if ($anom | length) > 3 then [$dm + "    还有 \($anom[3:] | length) 条" + $rs] else [] end)
-    else [] end)) as $warn
-| ([$top] + [$goal_lines[] | "│ " + .] + [($foot | clip($inner))] + [""]
-   + $warn
-   + (if ($ttree | length) > 0 then $ttree + [""] else [] end) + (if ($chk | length) > 0 then $chk[1:] + [""] else [] end)) as $head
-
-| ([ $groups[] as $gr
-    | [$gr.ids[] | $s.agents[.] | select(. != null)] as $as
-    | ([$as[] | .done | length] | add // 0) as $gd
-    | ([$as[] | select(live)] | length) as $go
-    | ([$as[] | select(.status == "blocked")] | length) as $gb
-    | ($as | length) as $na
-    | [[$cy + "◆ " + ($gr.g | clip([$inner - 30, 4] | max)) + $rs + "  " + bar($gd; $gd + $go; 10)
-        + $dm + "  \($gd)/\($gd + $go)  " + "\($na) agents" + (if $gb > 0 then "  ▲\($gb)" else "" end) + $rs]]
-    + [ range(0; $na) as $i | $as[$i] as $a | ($i == $na - 1) as $last
-      | (if $last then "└─ " else "├─ " end) as $br
-      | (if $last then "   " else "│  " end) as $ind
-      | (if $a.wait then ["▲",$y,"待批准"] else
-          {"running":["◔",$cy,"进行中"],"done":["✓",$g,"完成"],"blocked":["▲",$y,"阻塞"],
-           "failed":["✗",$r,"失败"],"dead":["■",$r,"已退出"]}[$a.status] // ["•",$dm,$a.status] end) as $st
-      | (($a.endEp // $nowep) - $a.startEp) as $tot
-      | ($nowep - $a.lastEp) as $idle
-      | ((($a.done|length) | tostring) + " ✓") as $cnt
-      | ((if $idle >= 600 and ($a.status == "running" or $a.status == "blocked")
-            then "  " + ($idle | ago) + " 无更新" else "" end)) as $stale
-      | (($br + $st[0] + " " + ($a.name | clip(12) | pad(12)) + " " + $st[2] + "  " + $cnt + $stale)
-         | clip($inner - 9) | pad($inner - 9)) as $hd
-      | ([ (if ($a.done | length) > 3 then {k:"more", n:(($a.done|length) - 3)} else empty end) ]
-         + [ $a.done[-3:][] | {k:"done", text, dur, time} ]
-         + (if ($a | live) then [{k:"cur", text:$a.current.text, ep:$a.current.ep}] else [] end)
-         + (if $a.reason != "" then [{k:"why", text:$a.reason}] else [] end)
-         + (if ($a.sess // "") != "" then [{k:"sess", text:$a.sess}] else [] end)) as $ch
-      | ($ch | length) as $nc
-      | [ $st[1] + $hd + $dm + ($tot | dur) + $rs ]
-      + [ range(0; $nc) as $j | $ch[$j] as $c
-          | ($ind + (if $j == $nc - 1 then "└─ " else "├─ " end)) as $pre
-          | if $c.k == "done" then
-              (($c.text | startswith("⊢ ")) | not) as $unv
-              | $g + $pre + "✓ "
-              + ($c.text | clip($inner - (if $unv then 32 else 26 end))
-                         | pad($inner - (if $unv then 32 else 26 end)))
-              + (if $unv then $dm + " 自报 " + $rs else "" end)
-              + $dm + ((($c.dur // null) | sdur) | lpad(6)) + " " + $c.time + $rs
-            elif $c.k == "cur" then
-              $cy + $pre + "▸ " + ($c.text | clip($inner - 26) | pad($inner - 26))
-              + ((($nowep - $c.ep) | sdur) | lpad(6)) + " 进行" + $rs
-            elif $c.k == "sess" then $y + $pre + "≠ " + ($c.text | clip($inner - 10)) + $rs
-            elif $c.k == "why" then
-              ({"blocked":$y,"failed":$r,"dead":$r}[$a.status] // $dm) + $pre + "▲ " + ($c.text | clip($inner - 10)) + $rs
-            else $dm + $pre + "… 更早 \($c.n) 条" + $rs end ]
-      ]
-  ] | add // []) as $blocks
-
-| ($h - ($head | length)) as $avail
-| (reduce $blocks[] as $b ({lines:[], rows:0, hidden:0};
-    if .rows + ($b|length) <= $avail
-    then .lines += $b | .rows += ($b|length)
-    else .hidden += 1 end)) as $fit
-| if $view == "full" then $head + $fit.lines
-+ (if $fit.hidden > 0 then ["    … +\($fit.hidden) more rows (resize pane)"] else [] end)
-else
-  # brief: answers, in order, how far from the goal and is it moving; what needs you;
-  # what each agent is doing; how much of it is verified. Least important last, since
-  # the view is cut at the pane height. The same data, as JSON, is the snapshot view
-  # (awb snapshot) that awb-lark turns into a card.
-  ([$inner, 100] | min) as $bw
   | prog($s.tasks; [$lroots[] | leaves($s.tasks; $s.torder; .)[]]) as $tp
   | ($nowep - 3600) as $h1
   | ([$s.agents[].done[]? | .text // ""]) as $mdone
@@ -574,7 +406,7 @@ else
             elif $D.metric < 0 then "\($M.name) \($win)在降"
             else "\($M.name) \($win)没变" end end),
        (if ($anom | length) > 0 then "异常 \($anom | length)" else empty end) ] | join(" · ")) as $headline
-  | [ {goal:$s.goal, title:$G.title, about:$G.about, headline:$headline, quiet:$quiet,
+  | {goal:$s.goal, title:$G.title, about:$G.about, headline:$headline, quiet:$quiet,
        now:$nowep, clock:$now, progress:$tp, hour:{done:finished($raw; $h1)}, day:$D,
        verified:{v:$mver, n:($mdone | length)}, running:$nrun, metric:$M, need:$need,
        anomalies:$anom, next:$next, holds:$holds,
@@ -583,16 +415,14 @@ else
        checks:[$s.checks[] | {id, name:(($s.agents[.id].name) // .id), what, startEp,
          ok:(all(.steps[]; .state == "ok")), fail:any(.steps[]; .state == "fail"),
          steps:[.steps[] | {s, state, el:((.ep1 // $nowep) - .ep0), note}]}],
-       violations:[$vs[] | {id:.[0], name:(($s.agents[.[0]].name) // .[0]), kind:.[1]}]} | tojson ]
-end
-| .[:$h] | .[]
+       violations:[$vs[] | {id:.[0], name:(($s.agents[.[0]].name) // .[0]), kind:.[1]}]} | tojson
 '
 
-# the brief view, drawn from the snapshot alone (awb snapshot); the Lark card is the other view
+# the brief view, drawn from the snapshot alone (awb view --json); the Lark card is the other view
 # of it. README "What the brief view shows" is the rule each line is held to.
 JQ_BRIEF=$JQ_DEFS'
 ({"todo":["○",$dm],"wip":["◔",$cy],"review":["◑",$cy],"blocked":["▲",$y],
-  "done":["✓",$g],"drop":["–",$dm],"ask":["?",$y],"unknown":["?",$r]}) as $TI
+  "done":["✓",$g],"drop":["–",$dm],"ask":["?",$y]}) as $TI
 | ([$w - 1, 100] | min) as $bw
 | . as $S | .metric as $M | .day as $D
 | (if $S.title == "" then "╭" + ("─" * ($bw - 2)) + "╮"
@@ -739,66 +569,41 @@ state() {
   init_dir
   events_json | jq -r "$JQ_FOLD"' fold
     | (.agents | to_entries | sort_by(.key)[] | .value as $a
-       | "\(.key) \($a.status) \($a.gate // false) \($a.endEp // "-") \(($a.done | last | .dur) // 0) \($a.done | length)"),
-      (.probes | to_entries | sort_by(.key)[] | .value.acc as $a
-       | if $a == null then "probe \(.key) - - -" else "probe \(.key) \($a.st) \($a.ep0) \($a.ep)" end)'
+       | "\(.key) \($a.status) \($a.gate // false) \($a.endEp // "-") \(($a.done | last | .dur) // 0) \($a.done | length)")'
 }
 
-# protocol violations found by the verified Lean monitor (model/Audit.lean)
-audit() {
+# the snapshot JSON of the board now, or as of AWB_NOW=EPOCH from the log alone (awb replay):
+# the live facts (panes, sessions, code fingerprints, audit) describe now, so none is read then
+snapshot() {
   init_dir
-  m=$(model_bin) || die "audit needs the Lean model: (cd $(src_dir)/model && lake build)"
-  [ -s "$EV" ] || return 0
-  "$m" audit < "$EV"
-}
-
-render() {
-  set -- $(dims)
-  cols=${1:-80}; rows=${2:-24}
-  # AWB_NOW=EPOCH renders the board as of that time from the log alone (awb replay): the
-  # live facts below (panes, sessions, code fingerprints, audit) describe now, so none is read
   nowep=${AWB_NOW:-$(date +%s)}
-  if [ -n "${AWB_NOW:-}" ]; then
-    live=null; viol=; lean=; diffs='[]'; sess='{}'
-    render_jq "$(jq -nr --argjson t "$nowep" '$t | strflocaltime("%H:%M:%S")')"
-    return
+  live=null; viol=; lean=; diffs='[]'; sess='{}'
+  if [ -z "${AWB_NOW:-}" ]; then
+    sess=$(sessions_json)
+    # live panes of the server awb uses; no reachable server = liveness unknown (null)
+    if live=$(tm list-panes -a -F '#{pane_id}' 2>/dev/null); then
+      live=$(printf '%s\n' "$live" | jq -Rn '[inputs | select(. != "")]')
+    else live=null; fi
+    if m=$(model_bin) && [ -s "$EV" ]; then
+      viol=$("$m" audit < "$EV" 2>/dev/null || true); lean=$("$m" fold < "$EV" 2>/dev/null || true)
+    fi
+    # working-tree fingerprints written by freeze_once: "ID HASH EP" (epoch of
+    # last change). Fed to the snapshot as data, never through the proven fold.
+    if [ -s "$AWB_DIR/diffs" ]; then
+      diffs=$(jq -Rn '[inputs | select(length > 0) | split(" ")
+               | {id:.[0], hash:.[1], ep:(.[2] | tonumber)}]' < "$AWB_DIR/diffs")
+    fi
   fi
-  sess=$(sessions_json)
-  # live panes of the server awb uses; no reachable server = liveness unknown (null)
-  if live=$(tm list-panes -a -F '#{pane_id}' 2>/dev/null); then
-    live=$(printf '%s\n' "$live" | jq -Rn '[inputs | select(. != "")]')
-  else
-    live=null
-  fi
-  viol=; lean=
-  if m=$(model_bin) && [ -s "$EV" ]; then
-    viol=$("$m" audit < "$EV" 2>/dev/null || true); lean=$("$m" fold < "$EV" 2>/dev/null || true)
-  fi
-  # working-tree fingerprints written by freeze_once: "ID HASH EP" (epoch of
-  # last change). Fed to render as data, never through the proven fold.
-  if [ -s "$AWB_DIR/diffs" ]; then
-    diffs=$(jq -Rn '[inputs | select(length > 0) | split(" ")
-             | {id:.[0], hash:.[1], ep:(.[2] | tonumber)}]' < "$AWB_DIR/diffs")
-  else diffs='[]'; fi
-  render_jq "$(date +$TS_FMT)"
+  events_json | jq -r --arg viol "$viol" --arg lean "$lean" --argjson undeliv "${AWB_UNDELIVERED:-180}" \
+    --arg now "$(jq -nr --argjson t "$nowep" '$t | strflocaltime("%H:%M:%S")')" --argjson nowep "$nowep" \
+    --argjson live "$live" --arg stale "${AWB_STALE:-600}" \
+    --argjson diffs "$diffs" --argjson frz "${AWB_FROZEN:-900}" --argjson silent "${AWB_SILENT:-3600}" \
+    --argjson mstale "${AWB_METRIC_STALE:-21600}" --argjson tstale "${AWB_TASK_STALE:-21600}" --argjson sess "$sess" \
+    "$JQ_SNAP"
 }
 
-# the render program over the log; the caller sets cols rows nowep live viol diffs sess
-render_jq() {
-  # the brief view is drawn from the snapshot only; the full view renders the fold itself
-  _v=${AWB_VIEW:-brief}; [ "$_v" = full ] || _v=snapshot
-  events_json | jq -r --arg viol "$viol" --arg lean "${lean:-}" --argjson undeliv "${AWB_UNDELIVERED:-180}" \
-    --argjson w "$cols" --argjson h "$rows" \
-    --arg now "$1" --argjson nowep "$nowep" \
-    --arg prog "$PROG" --argjson live "$live" --arg view "$_v" --arg stale "${AWB_STALE:-600}" \
-    --argjson diffs "$diffs" --argjson frz "${AWB_FROZEN:-900}" --argjson fresh "${AWB_PROBE_FRESH:-600}" \
-    --argjson silent "${AWB_SILENT:-3600}" \
-    --argjson mstale "${AWB_METRIC_STALE:-21600}" --argjson tstale "${AWB_TASK_STALE:-21600}" --argjson sess "$sess" \
-    --arg g  "${ESC}[32m"  --arg cy "${ESC}[36m" --arg y "${ESC}[33m" \
-    --arg r  "${ESC}[31m"  --arg dm "${ESC}[2m"  --arg rs "${ESC}[0m" \
-    "$JQ_RENDER" |
-  if [ "${AWB_VIEW:-brief}" = brief ]; then brief_view "$cols" "$rows"; else cat; fi
-}
+# the board drawn once at the pane size (or AWB_COLS x AWB_ROWS)
+render() { set -- $(dims); snapshot | brief_view "${1:-80}" "${2:-24}"; }
 
 # replay: the board's anomalies over the log's history, one snapshot every STEP seconds as of
 # that time (AWB_NOW), grouped into episodes (one anomaly on consecutive snapshots). This is
@@ -816,7 +621,7 @@ replay() {
   while [ "$_t" -le "$_end" ] && [ "$_n" -lt "${AWB_REPLAY_MAX:-2000}" ]; do
     _t=$((_t + step)); _n=$((_n + 1))
     jq -Rc --argjson T "$_t" 'fromjson? | select(type == "object" and (.ep // 0) <= $T)' < "$EV" > "$_rd/events.jsonl"
-    AWB_DIR=$_rd AWB_NOW=$_t "$BIN" snapshot | jq -c --argjson T "$_t" '{T:$T, a:.anomalies, n:[.need[] | {kind, id, text}]}'
+    AWB_DIR=$_rd AWB_NOW=$_t "$BIN" view --json | jq -c --argjson T "$_t" '{T:$T, a:.anomalies, n:[.need[] | {kind, id, text}]}'
   done > "$_rd/series"
   jq -rs --argjson step "$step" --slurpfile E "$_rd/events.jsonl" '
     def at: strflocaltime("%m-%d %H:%M");
@@ -864,7 +669,7 @@ replay() {
   rm -rf "$_rd"
 }
 
-# the brief view of a snapshot on stdin (awb snapshot | awb brief-view renders the same board)
+# the brief view of a snapshot on stdin (awb view --json | awb _view renders the same board)
 brief_view() {
   jq -r --argjson w "$1" --argjson h "$(( $2 < 12 ? 12 : $2 ))" \
     --arg g  "${ESC}[32m"  --arg cy "${ESC}[36m" --arg y "${ESC}[33m" \
@@ -935,100 +740,6 @@ freeze_once() {
     awk 'NR==FNR {seen[$1]=1; next} ($1 in seen)' "$df" "$nf" > "$nf.new" && mv "$nf.new" "$nf"
   fi
   unlock "freeze"
-}
-
-# probes (docs/probe.md): a task's probe is a command whose first stdout line is "STATE text"
-# with exit 0; anything else is a failed reading and the board shows unknown.
-
-# built-in probe: PR N of the repo in $PWD. The API head must equal the remote ref (anchor).
-probe_pr() {
-  [ $# -eq 1 ] || die "usage: $PROG probe pr N"
-  j=$(gh pr view "$1" --json state,headRefOid,mergeCommit,statusCheckRollup) || exit 1
-  api=$(printf '%s' "$j" | jq -r .headRefOid)
-  ref=$(git ls-remote origin "refs/pull/$1/head" | cut -f1)
-  [ -n "$api" ] && [ "$api" = "$ref" ] || { echo "anchor: api head $api != remote $ref" >&2; exit 1; }
-  printf '%s' "$j" | jq -r '
-    def bad: IN("FAILURE","ERROR","CANCELLED","TIMED_OUT","ACTION_REQUIRED","STARTUP_FAILURE");
-    def ok: IN("SUCCESS","NEUTRAL","SKIPPED");
-    [(.statusCheckRollup // [])[] | {n:(.name // .context // "?"),
-       s:(if .status == null or .status == "COMPLETED" then (.conclusion // .state // "") else "PENDING" end)}] as $k
-    | if .state == "MERGED" then "done merged \(.mergeCommit.oid // "" | .[0:8])"
-      elif .state == "CLOSED" then "drop closed unmerged"
-      elif any($k[]; .s | bad) then "blocked CI red: " + ([$k[] | select(.s | bad) | .n] | join(","))
-      elif ($k | length) == 0 or any($k[]; .s | ok | not) then "review CI pending \([$k[] | select(.s | ok)] | length)/\($k | length)"
-      else "review CI green, not merged" end'
-}
-
-# built-in probe: the last line of PATH matching REGEX. Two numeric groups read as n/total,
-# otherwise the first group (or the match) is the text. A log silent AWB_PROBE_SILENT is blocked.
-probe_log() {
-  [ $# -eq 2 ] || die "usage: $PROG probe log PATH REGEX"
-  [ -r "$1" ] || { echo "no log $1" >&2; exit 1; }
-  m=$(stat -f %m "$1" 2>/dev/null || stat -c %Y "$1")
-  tail -n 2000 "$1" | jq -R -s -r --arg re "$2" --argjson age $(($(date +%s) - m)) \
-      --argjson silent "${AWB_PROBE_SILENT:-1800}" '
-    def num: test("^[0-9]+([.][0-9]+)?$");
-    ([split("\n")[] | match($re)] | last) as $m
-    | if $m == null then error("no line matches") else . end
-    | [$m.captures[] | .string // empty] as $g
-    | (if $age >= $silent then "blocked log silent \($age / 60 | floor)m: " else "wip " end) as $pre
-    | if ($g | length) >= 2 and ($g[0] | num) and ($g[1] | num) then
-        ($g[0] | tonumber) as $n | ($g[1] | tonumber) as $t
-        | if $t > 0 and $n >= $t then "done \($n)/\($t)"
-          else $pre + "\($n)/\($t) \(if $t > 0 then ($n * 100 / $t | floor) else 0 end)%" end
-      else $pre + ($g[0] // $m.string) end'
-}
-
-# run CMD in DIR, at most SECS, in its own process group; prints "RC FIRST-LINE"
-probe_exec() {
-  _f=$(mktemp "$AWB_DIR/probe.XXXXXX")
-  set -m; (cd "$2" && exec sh -c "$3") > "$_f" 2>/dev/null < /dev/null & _p=$!; set +m
-  _n=0; _to=
-  while kill -0 "$_p" 2>/dev/null; do
-    _n=$((_n + 1))
-    if [ "$_n" -gt $(($1 * 5)) ]; then
-      kill -TERM -- "-$_p" 2>/dev/null || true; sleep 0.2; kill -KILL -- "-$_p" 2>/dev/null || true
-      _to=1; break
-    fi
-    sleep 0.2
-  done
-  wait "$_p" 2>/dev/null && _rc=0 || _rc=$?
-  [ -z "$_to" ] || _rc=124
-  printf '%s %s\n' "$_rc" "$(head -n 1 "$_f")"
-  rm -f "$_f"
-}
-
-# one probe round: every probed task not yet done/drop whose last reading is AWB_PROBE_EVERY old
-probe_once() {
-  init_dir
-  lock "probe"
-  events_json | jq -r --argjson now "$(date +%s)" --argjson every "${AWB_PROBE_EVERY:-120}" "$JQ_FOLD"'
-    fold | .probes as $P | .tasks as $T | .torder[] | $T[.] | select(.probe != null)
-    | ($P[.id] // {}) as $p
-    | select((($p.acc.st // "") | IN("done","drop")) | not)
-    | select($now - ($p.last // 0) >= $every)
-    | "\(.id) \(.pdir // "." | @base64) \(.probe | @base64)"' |
-  while read -r id dir cmd; do
-    dir=$(printf '%s' "$dir" | jq -Rr @base64d); cmd=$(printf '%s' "$cmd" | jq -Rr @base64d)
-    ep0=$(date +%s)
-    r=$(probe_exec "${AWB_PROBE_TIMEOUT:-30}" "$dir" "$cmd")
-    rc=${r%% *}; line=${r#* }
-    append '{t:"probe",time:$time,ep:$ep,id:$id,ep0:$ep0,rc:$rc,st:($l | split(" ")[0]),
-             text:($l | sub("^[^ ]* ?"; ""))}' \
-      --arg id "$id" --argjson ep0 "$ep0" --argjson rc "$rc" --arg l "$line"
-  done
-  unlock "probe"
-}
-
-probe() {
-  case "${1:-}" in
-    pr)  shift; probe_pr "$@" ;;
-    log) shift; probe_log "$@" ;;
-    run) init_dir
-         if [ "${2:-}" = --once ]; then probe_once
-         else while :; do probe_once; sleep "${AWB_PROBE_POLL:-30}"; done; fi ;;
-    *)   die "usage: $PROG probe pr N | probe log PATH REGEX | probe run [--once]" ;;
-  esac
 }
 
 # nudge: paste a reminder into the pane of every agent silent >= AWB_STALE,
@@ -1245,7 +956,7 @@ up() {
   rm -f "$SOCK"
   tmux -S "$SOCK" new-session -d -s awb -n board -P -F '#{pane_id}' \
     -e "AWB_DIR=$AWB_DIR" -e "AWB_TMUX_SOCKET=$SOCK" -e "AWB_TMUX_FOR=$AWB_DIR" \
-    "AWB_DIR=$(q "$AWB_DIR") AWB_TMUX_SOCKET=$(q "$SOCK") AWB_TMUX_FOR=$(q "$AWB_DIR") $(q "$BIN") watch" >/dev/null
+    "AWB_DIR=$(q "$AWB_DIR") AWB_TMUX_SOCKET=$(q "$SOCK") AWB_TMUX_FOR=$(q "$AWB_DIR") $(q "$BIN") view" >/dev/null
   board=$(tmux -S "$SOCK" list-panes -t awb:board -F '#{pane_id}' | head -1)
   work=$(tmux -S "$SOCK" split-window -v -t "$board" -d -p 45 -P -F '#{pane_id}' \
            -e "AWB_DIR=$AWB_DIR" -e "AWB_TMUX_SOCKET=$SOCK" -e "AWB_TMUX_FOR=$AWB_DIR" "$SHELL")
@@ -1425,7 +1136,7 @@ idle() {
 # open a PR for an agent's work from the current git checkout, only when the agent's
 # latest `awb check` passed; the body lists its milestones and that check's steps
 pr() {
-  _u="usage: $PROG pr ID [gh pr create args...] -- CMD... | -- --lean DIR [ACCEPT.lean]"
+  _u="usage: $PROG pr ID [gh pr create args...] -- CMD..."
   [ $# -ge 1 ] || die "$_u"
   id=$1; shift; need_agent "$id"
   _gh=; _acc=
@@ -1436,8 +1147,7 @@ pr() {
   [ -n "$_acc" ] && [ $# -ge 1 ] || die "$_u (the acceptance runs here, then the PR)"
   # the acceptance runs in this process: a passing check read from the log could have been
   # written there by the agent, check events and all
-  if [ "$1" = --lean ]; then "$BIN" check "$id" "$@" || die "acceptance failed: no PR"
-  else "$BIN" check "$id" -- "$@" || die "acceptance failed: no PR"; fi
+  "$BIN" check "$id" -- "$@" || die "acceptance failed: no PR"
   eval "set -- $_gh"
   lock "gate-$id"     # no check of this agent can interleave between the gate and the PR
   info=$({ [ -s "$EV" ] && cat "$EV" || true; } | jq -R -s --arg id "$id" '
@@ -1482,7 +1192,13 @@ holder() {   # "OWNER EP NOTE" of RES; exit 1 when free
   case $_h in hold\ *) printf '%s\n' "${_h#hold }" ;; *) return 1 ;; esac
 }
 hold() {
-  [ $# -ge 2 ] || die "usage: $PROG hold RES OWNER [NOTE]"
+  if [ $# -eq 0 ]; then   # every held resource: RES OWNER SINCE NOTE
+    init_dir; events_json | jq -r '[.[] | select((.t == "hold" or .t == "release") and (.res | type) == "string")]
+      | group_by(.res)[] | sort_by(.ep // 0) | last | select(.t == "hold")
+      | "\(.res) \(.owner // "-") \((.ep // 0) | strflocaltime("%H:%M")) \(.note // "")"'
+    return 0
+  fi
+  [ $# -ge 2 ] || die "usage: $PROG hold [RES OWNER [NOTE]]"
   res=$1; own=$2; shift 2; init_dir
   lock "res-$res"
   if cur=$(holder "$res"); then
@@ -1503,60 +1219,19 @@ release() {
   unlock "res-$res"
 }
 
-# merge a PR only when the newest verdict on its CURRENT head approves and the required checks
-# actually ran green. A verdict is a PR review on the head, or a comment whose first line names
-# the head's short sha; a comment verdict counts only when that whole line matches
-# AWB_APPROVE_RE, so "APPROVE ... with one fix" or a later correction does not. A check that
-# never started is not green: at least AWB_MIN_CHECKS successes named by AWB_REQUIRE_CHECKS.
-merge() {
-  [ $# -ge 1 ] || die "usage: $PROG merge PR [--watch]"
-  n=$1; _watch=0; [ "${2:-}" != --watch ] || _watch=1; init_dir
-  for _i in $(seq 1 "${AWB_MERGE_POLLS:-240}"); do
-    j=$(gh pr view "$n" --json state,headRefOid,reviews,comments,statusCheckRollup) || die "gh cannot read PR $n"
-    v=$(printf '%s' "$j" | jq -r --arg re "${AWB_APPROVE_RE:-^\\*\\*APPROVE \\([^)]*\\)\\*\\*\$}" \
-          --arg req "${AWB_REQUIRE_CHECKS:-.}" --argjson min "${AWB_MIN_CHECKS:-1}" '
-      .headRefOid as $sha | $sha[:8] as $h
-      | ([(.reviews // [])[] | select((.commit.oid // "") == $sha and (.state | IN("APPROVED","CHANGES_REQUESTED")))
-          | {ep:.submittedAt, ok:(.state == "APPROVED")}]
-         + [(.comments // [])[] | (.body | split("\n")[0]) as $l
-            | select(($l | contains($h)) and ($l | test("APPROVE|REQUEST CHANGES|CHANGES REQUESTED")))
-            | {ep:.createdAt, ok:($l | test($re))}]
-         | sort_by(.ep) | last) as $v
-      | [(.statusCheckRollup // [])[] | {name:(.name // .context // ""), c:((.conclusion // "") | if . == "" then null else . end) // (.state // "")}] as $cs
-      | ([$cs[] | select(.c | IN("","PENDING","EXPECTED","QUEUED","IN_PROGRESS"))] | length) as $pend
-      | ([$cs[] | select(.c | IN("FAILURE","ERROR","CANCELLED","TIMED_OUT","ACTION_REQUIRED","STARTUP_FAILURE"))] | length) as $bad
-      | ([$cs[] | select(.c == "SUCCESS" and (.name | test($req)))] | length) as $good
-      | (if $v == null then "none" elif $v.ok then "approve" else "changes" end) as $vd
-      | (if $bad > 0 then "red" elif $pend > 0 then "pending" elif $good < $min then "missing" else "green" end) as $ck
-      | "\(.state) \($sha) \($vd) \($ck) \($good)/\($min)"')
-    set -- $v
-    echo "#$n $(date +%H:%M) head ${2%"${2#????????}"} verdict $3 checks $4 ($5 required-green)"
-    [ "$1" != MERGED ] || return 0
-    if [ "$3" = approve ] && [ "$4" = green ]; then
-      gh pr merge "$n" "--${AWB_MERGE_METHOD:-merge}" --match-head-commit "$2" || die "merge of #$n refused"
-      append '{t:"news",time:$time,ep:$ep,text:$x,key:$k}' --arg k "pr#$n" --arg x "PR #$n merged (head ${2%"${2#????????}"})"
-      echo "#$n merged"; return 0
-    fi
-    [ "$4" != red ] || [ "$3" != approve ] || die "#$n: approved but checks are red"
-    [ "$_watch" = 1 ] || return 1
-    sleep "${AWB_MERGE_POLL:-60}"
-  done
-  die "#$n not mergeable after ${AWB_MERGE_POLLS:-240} polls"
-}
-
 # board beside the current tmux pane (the conversation), for chat-driven use
 board() {
   init_dir; [ -f "$EV" ] || : > "$EV"
   if [ -z "${TMUX_PANE:-}" ]; then
-    echo "not in tmux; watch it from another terminal: AWB_DIR=$AWB_DIR $PROG watch"; return 0
+    echo "not in tmux; watch it from another terminal: AWB_DIR=$AWB_DIR $PROG view"; return 0
   fi
   printf '%s\n' "$TMUX_PANE" > "$AWB_DIR/work-pane"      # awb tui/run split from here
   # one board per .awb: a board already open anywhere on this server is reused, not repeated
   # (workers that each ran awb board once left five 7-column boards squeezed between them)
   _b=$(tmux list-panes -a -F '#{pane_id} #{session_name}:#{window_index}.#{pane_index} #{pane_start_command}' 2>/dev/null \
-       | grep -F "AWB_DIR=$(q "$AWB_DIR") " | grep ' watch' | head -n 1 | cut -d' ' -f2)
+       | grep -F "AWB_DIR=$(q "$AWB_DIR") " | grep -E ' (view|watch)' | head -n 1 | cut -d' ' -f2)
   if [ -n "$_b" ]; then echo "board: $AWB_DIR already open in pane $_b"; return 0; fi
-  tmux split-window -h -d -l 45% -t "$TMUX_PANE" "AWB_DIR=$(q "$AWB_DIR") $(q "$BIN") watch"
+  tmux split-window -h -d -l 45% -t "$TMUX_PANE" "AWB_DIR=$(q "$AWB_DIR") $(q "$BIN") view"
   echo "board: $AWB_DIR (right of this pane)"
 }
 
@@ -1744,56 +1419,11 @@ stage() {
   if "$@"; then step "$_n" ok; else step "$_n" fail "$(tail -1 "$CHK_LOG" | cut -c1-80)"; return 1; fi
 }
 
-# Lean 4 acceptance, run in DIR. The build is kernel-checked; ACCEPT.lean holds the
-# main agent's statements, which must typecheck against the build and use only the
-# standard axioms (#print axioms follows every dependency, so sorryAx, custom axioms
-# and native_decide in the agent's code are caught).
-# ponytail: theorems are found by regex, not by enumerating the environment
-# (`import Lean` costs ~4s per check); anything unrecognised fails closed.
-lean_sorry() {
-  ! grep -rnwE 'sorry|admit' --include='*.lean' --exclude-dir=.lake . || { echo "sorry/admit in sources"; return 1; }
-}
-lean_types() {
-  _t='^[[:space:]]*(@\[[^]]*\][[:space:]]*)*((private|protected|nonrec)[[:space:]]+)*theorem[[:space:]]+'
-  grep -qwE 'example|namespace|section|lemma' "$1" && { echo "ACCEPT: use top-level named theorems only"; return 1; }
-  _names=$(grep -E "$_t" "$1" | sed -E "s/$_t([^[:space:](:{]+).*/\4/")
-  [ -n "$_names" ] || { echo "ACCEPT.lean has no theorem"; return 1; }
-  [ "$(grep -cwE 'theorem' "$1")" = "$(printf '%s\n' "$_names" | wc -l | tr -d ' ')" ] \
-    || { echo "ACCEPT: unrecognised theorem syntax"; return 1; }
-  { cat "$1"; echo; printf '#print axioms %s\n' $_names; } > .awb-accept.lean
-  _rc=0; lake env lean .awb-accept.lean > .awb-accept.out 2>&1 || _rc=$?
-  rm -f .awb-accept.lean; cat .awb-accept.out
-  [ "$_rc" = 0 ] || { echo "acceptance statements do not typecheck"; return 1; }
-  ! grep -q "declaration uses 'sorry'" .awb-accept.out || { echo "sorry in ACCEPT"; return 1; }
-}
-lean_axioms() {
-  _bad=$(sed -n 's/.*depends on axioms: \[\(.*\)\].*/\1/p' .awb-accept.out | tr ',' '\n' \
-         | tr -d ' ' | grep -vxE 'propext|Classical\.choice|Quot\.sound' | sort -u | tr '\n' ' ')
-  rm -f .awb-accept.out
-  [ -z "$_bad" ] || { echo "non-standard axioms: $_bad"; return 1; }
-  echo "axioms ok"
-}
-lean_accept() (
-  dir=$1; acc=${2:-}
-  [ -z "$acc" ] || acc=$(cd "$(dirname "$acc")" && pwd)/$(basename "$acc")
-  PATH=$HOME/.elan/bin:$PATH
-  cd "$dir" || exit 1
-  stage build lake build || exit 1
-  stage sorry lean_sorry || exit 1
-  [ -n "$acc" ] || exit 0
-  stage types lean_types "$acc" || exit 1
-  stage axioms lean_axioms || exit 1
-)
-
 # acceptance gate: the check the main agent chose decides done, not the agent's claim
 check() {
-  [ $# -ge 3 ] || die "usage: $PROG check ID -- CMD... | $PROG check ID --lean DIR [ACCEPT.lean]"
-  id=$1; shift; need_agent "$id"
-  case $1 in
-    --lean) what="lean ${3:+$(basename "$3")}"; set -- lean_accept "$2" "${3:-}" ;;
-    --) shift; what=$*; set -- stage cmd "$@" ;;
-    *) die "usage: $PROG check ID -- CMD... | $PROG check ID --lean DIR [ACCEPT.lean]" ;;
-  esac
+  [ $# -ge 3 ] && [ "$2" = -- ] || die "usage: $PROG check ID -- CMD...  (a Lean 4 gate: -- model/accept.sh DIR [ACCEPT.lean])"
+  id=$1; shift 2; need_agent "$id"
+  what=$*; set -- stage cmd "$@"
   init_dir
   lock "gate-$id"     # one check or pr per agent at a time (model/tla/AwbCheck.tla)
   ms=$(open_ms "$id")
@@ -1857,20 +1487,13 @@ One unit of work, the task. You talk to one Claude (the main agent); it keeps th
   $PROG reply ID KEY [RESULT]       the reply "[awb ID#KEY] ..." closes the task, with its result
   $PROG idle ID                     on an idle notice: prints an ask once, then marks the task blocked
   $PROG fail ID REASON              the worker exited: its open task is lost; tui restarts it, send again
-  $PROG task ID STATE [TEXT] [PARENT] [OWNER] [--probe CMD]
+  $PROG task ID STATE [TEXT] [PARENT] [OWNER]
                                     plan the tree: STATE todo|wip|review|blocked|done|drop|ask
-                                    (ask = a decision for the owner); re-issue to update;
-                                    --probe: the state comes from CMD (docs/probe.md)
+                                    (ask = a decision for the owner); re-issue to update
   $PROG block ID REASON / unblock ID  the worker waits on something (#N: a PR or an issue) / not any more
   $PROG check ID -- CMD...          acceptance: CMD exit 0 verifies the worker's work (⊢), else ✗
-  $PROG check ID --lean DIR [ACCEPT.lean]
-                                    Lean 4: lake build, no sorry, ACCEPT.lean theorems typecheck
-                                    with standard axioms only
+                                    (Lean 4: -- model/accept.sh DIR [ACCEPT.lean])
   $PROG pr ID [gh args...] -- CMD...  run the acceptance here, then push and open a PR on a pass
-                                    (-- --lean DIR [ACCEPT.lean] for a Lean gate)
-  $PROG merge PR [--watch]          merge only when the newest verdict on the current head approves
-                                    and required checks ran green (AWB_APPROVE_RE, AWB_REQUIRE_CHECKS,
-                                    AWB_MIN_CHECKS); --watch polls until then (AWB_MERGE_POLL/POLLS)
   $PROG metric [--at EPOCH] [--step N] [--by EPOCH] [--ref] NAME VALUE TARGET [NOTE]
                                     a reading of the goal's number; --by: deadline; --ref: a
                                     baseline series drawn by step beside it
@@ -1886,12 +1509,10 @@ Coordination and reading:
   $PROG peers                       every agent: ID PANE SESSION STATUS [#KEY] [silent MINm]
   $PROG tell ID MESSAGE             type into the agent's pane (claude, codex, ...) and press Enter
   $PROG nudge [--once]              remind silent agents (an open board does it; AWB_NUDGE=0 off)
-  $PROG hold RES OWNER [NOTE] / release RES [OWNER] / holder RES
-                                    one holder per shared resource (a GPU, a host)
-  $PROG snapshot | render | watch   the board as JSON / drawn once / live (AWB_VIEW=brief|full)
+  $PROG hold [RES OWNER [NOTE]] / release RES [OWNER]
+                                    one holder per shared resource (a GPU, a host); no args: list
+  $PROG view [--once | --json]      the board live / drawn once / as JSON
   $PROG replay [STEP]               anomalies over the log's history, then the core metrics
-  $PROG audit                       protocol violations (Lean monitor)
-  $PROG probe run [--once] | pr N | log PATH REGEX   task probes (docs/probe.md)
   $PROG down | reset                end this board's session | clear the log (keeps a .bak)
   $PROG skill | version | selftest
   AWB_STALE=SECS nudge after (600); AWB_SILENT=SECS silence is an anomaly after (3600).
@@ -1920,7 +1541,7 @@ selftest() {
   # with the Lean model built, the board takes status from it, not from the jq fold
   lm=$t/lean; mkdir -p "$lm"; printf '#!/bin/sh\n[ "$1" = fold ] && echo "l1 failed false 1 0 0"\nexit 0\n' > "$lm/model"
   chmod +x "$lm/model"; AWB_DIR=$lm "$BIN" start l1 lagent
-  AWB_DIR=$lm AWB_MODEL=$lm/model "$BIN" snapshot | jq -e '.need | any(.kind == "fail" and .id == "l1")' >/dev/null \
+  AWB_DIR=$lm AWB_MODEL=$lm/model "$BIN" view --json | jq -e '.need | any(.kind == "fail" and .id == "l1")' >/dev/null \
     || die "selftest: the board did not take the status of the proven fold"
   # a typo is an error, never an event the fold drops or a title (own log)
   ud=$t/usage; ub() { AWB_DIR=$ud "$BIN" "$@"; }
@@ -1946,14 +1567,14 @@ selftest() {
   "$BIN" task l0 wip open r
   "$BIN" task l0 wip "" r
   "$BIN" task l1 done "" r
-  out=$(AWB_VIEW=full "$BIN" render)
-  brief=$("$BIN" render)
-  printf '%s' "$brief" | grep -Fq "■ root" || die "selftest: brief missing the task root"
-  for s in "SHIP THE WORKBENCH" "✓ wire event log" "▸ render board" \
-           "▲ waiting on review" "2 agents" "✓0" "◔1" "▲1" "◆ backend" "◆ frontend" "■ root" "├─ ✓ leaf" "└─ ◔ open" "1/2 任务"; do
-    printf '%s' "$out" | grep -Fq -- "$s" || die "selftest: missing '$s'"
+  brief=$("$BIN" view --once | sed 's/\x1b\[[0-9;]*m//g')
+  [ "$("$BIN" render | sed 's/\x1b\[[0-9;]*m//g')" = "$brief" ] && "$BIN" snapshot | jq -e .now >/dev/null || die "selftest: the old names render/snapshot stopped working"
+  for s in "SHIP THE WORKBENCH" "■ root" "✓ leaf" "◔ open" "1/2"; do
+    printf '%s' "$brief" | grep -Fq -- "$s" || die "selftest: brief missing '$s'"
   done
-  printf '%s' "$out" | grep -Eq '1s| [0-9]:[0-9][0-9]' || die "selftest: no durations"
+  "$BIN" view --json | jq -e '[.agents[] | [.id, .status, .text, .dn]]
+    == [["a2","blocked","等 waiting on review",0], ["a1","running","render board",1]]' >/dev/null \
+    || die "selftest: agents in the snapshot: $("$BIN" view --json | jq -c '[.agents[] | [.id, .status, .text, .dn]]')"
 
   # the brief view answers: how far and moving (metric trend, ETA, last hour), what needs
   # you (above the agents), what each agent does now, what is folded away. Own log, so
@@ -1974,7 +1595,7 @@ selftest() {
   ! bb metric --at yesterday tps 1 40 2>/dev/null || die "selftest: metric --at accepted a non-epoch"
   # what the brief view shows is asserted on the snapshot it is drawn from; the drawing
   # itself is pinned once, by the fixture test after this block
-  bs=$(bb snapshot)
+  bs=$(bb view --json)
   bj() { printf '%s' "$bs" | jq -e "$1" >/dev/null || die "selftest: snapshot: $2"; }
   bj '.title == "GOAL-TITLE" and .about == ["what-it-is line"]' "title is the goal line, about is the rest"
   bj '.headline == "需要你 1 件 · tps 24 小时在涨 · 异常 1"' "headline is a judgement: $(printf '%s' "$bs" | jq -c .headline)"
@@ -1985,24 +1606,24 @@ selftest() {
   bj '.tasks_old == 1 and ([.tasks[].text] | index("ancient root") | not)' "an old finished root folds away"
   bj '.metric.v0 == 5 and .metric.eta != null and .hour.done > 0 and .day.done > 0' "metric trend and movement"
   # agents appear only where they need you or are off: no per-agent rows in the drawn view
-  b=$(bb render | sed 's/\x1b\[[0-9;]*m//g')
+  b=$(bb view --once | sed 's/\x1b\[[0-9;]*m//g')
   for s in "tuning kernel" "○ 空闲" "agent  ◔"; do
     ! printf '%s' "$b" | grep -Fq -- "$s" || die "selftest: brief shows '$s'"; done
-  bb snapshot | jq -e '.metric.value == 25 and ([.metric.history[].value] == [5, 10, 20, 25])
+  bb view --json | jq -e '.metric.value == 25 and ([.metric.history[].value] == [5, 10, 20, 25])
     and ([.metric.history[].x] == [100, null, null, null])' >/dev/null || die "selftest: metric --at/--step history"
   # readings all in one second give no time-to-target estimate
   bd2=$t/brief2; mkdir -p "$bd2"
   for v in 1 2 3; do AWB_DIR=$bd2 "$BIN" metric he $v 30; done
-  AWB_DIR=$bd2 "$BIN" snapshot | jq -e '.metric.eta == null' >/dev/null || die "selftest: an estimate from readings in one second"
+  AWB_DIR=$bd2 "$BIN" view --json | jq -e '.metric.eta == null' >/dev/null || die "selftest: an estimate from readings in one second"
   # a reference series (metric --ref), even written after the metric, is never the metric nor
   # in its trend; it is drawn by step beside it, one point per step (a re-sent step replaces)
   rf=$t/ref; mkdir -p "$rf"; rb() { AWB_DIR=$rf "$BIN" metric "$@"; }
   rb --step 2000 "he 0926" 6 30
   i=1; while [ $i -le 3 ]; do rb --at $((bn - 100 + i)) --step $((i * 2000)) "base 0923" $((i * 3)) 30; i=$((i + 1)); done
   rb --ref --step 4000 "base 0923" 7 30
-  AWB_DIR=$rf "$BIN" snapshot | jq -e '.metric.name == "he 0926" and .day.metric == null and .metric.since == null
+  AWB_DIR=$rf "$BIN" view --json | jq -e '.metric.name == "he 0926" and .day.metric == null and .metric.since == null
     and .refs == [{name:"base 0923", target:30, history:[{x:2000, value:3}, {x:4000, value:7}, {x:6000, value:9}]}]' >/dev/null \
-    || die "selftest: a reference series leaked into the metric: $(AWB_DIR=$rf "$BIN" snapshot | jq -c '{m:.metric.name, d:.day.metric, refs}')"
+    || die "selftest: a reference series leaked into the metric: $(AWB_DIR=$rf "$BIN" view --json | jq -c '{m:.metric.name, d:.day.metric, refs}')"
   # replay: the board as of each step, from the log alone. An agent silent for two hours is
   # one silent episode; a board AWB_NOW renders never reads the live registry or panes.
   rd=$t/replay; mkdir -p "$rd"; r0=$((bn - 20000))
@@ -2029,7 +1650,7 @@ selftest() {
     || die "selftest: replay core metrics on sent tasks: $kp"
   printf '%s\n' "$kp" | grep -Fq "需要你 1 次：已解决 1" || die "selftest: replay core metrics on 需要你: $kp"
   printf '%s\n' "$kp" | grep -Fq "下属重启 1 次" || die "selftest: replay core metrics on restarts: $kp"
-  AWB_DIR=$rd AWB_NOW=$((r0 + 600)) "$BIN" snapshot | jq -e '.clock != "" and (.agents | length) == 2' >/dev/null \
+  AWB_DIR=$rd AWB_NOW=$((r0 + 600)) "$BIN" view --json | jq -e '.clock != "" and (.agents | length) == 2' >/dev/null \
     || die "selftest: AWB_NOW did not render the board as of that time"
   # a task dispatched with awb send shows under 下一步 until its reply closes it
   sd=$t/sent; mkdir -p "$sd"; sn() { AWB_DIR=$sd "$BIN" "$@"; }
@@ -2039,49 +1660,49 @@ selftest() {
   sn peers | grep -Eq "^d1 - - - #$sk\$" || die "selftest: peers does not show the open task: $(sn peers)"
   [ "$(AWB_DIR=$sd AWB_STALE=0 "$BIN" peers)" = "d1 - - - #$sk silent 0m" ] \
     || die "selftest: peers does not show a silent agent: $(AWB_DIR=$sd AWB_STALE=0 "$BIN" peers)"
-  sn snapshot | jq -e '[.next[].text] == ["reviewer：review the manual"]' >/dev/null || die "selftest: a dispatched task is not under 下一步"
+  sn view --json | jq -e '[.next[].text] == ["reviewer：review the manual"]' >/dev/null || die "selftest: a dispatched task is not under 下一步"
   sn reply d1 "$sk" "3 findings" >/dev/null
-  sn snapshot | jq -e '.next == [] and ([.tasks[] | select(.text == "review the manual" and .d == 1)] | length == 1)' >/dev/null \
-    || die "selftest: a replied task is not a done node of the task tree: $(sn snapshot | jq -c '.tasks')"
+  sn view --json | jq -e '.next == [] and ([.tasks[] | select(.text == "review the manual" and .d == 1)] | length == 1)' >/dev/null \
+    || die "selftest: a replied task is not a done node of the task tree: $(sn view --json | jq -c '.tasks')"
   # a worker that exited (fail) and was started again takes a new task: the old one is closed
   sn send d1 "second" >/dev/null; sn fail d1 "exited"; sn start d1 reviewer >/dev/null
   sn send d1 "third" >/dev/null || die "selftest: a restarted worker kept its lost task open"
-  sn snapshot | jq -e '[.next[].text] == ["reviewer：third"] and ([.tasks[].text] | index("second") | not)' >/dev/null \
+  sn view --json | jq -e '[.next[].text] == ["reviewer：third"] and ([.tasks[].text] | index("second") | not)' >/dev/null \
     || die "selftest: a lost task still on the board"
   # a task sent under a parent is a step of that line
   sn reply d1 "$(sn peers | sed -n 's/.*#\([0-9]*\).*/\1/p')" "ok" >/dev/null
   sn task line todo "main line" >/dev/null; sn send --under line d1 "step A" >/dev/null
-  sn snapshot | jq -e '[.tasks[] | select(.text == "main line") | .d, .t] == [0, 1] and [.next[].text] == ["reviewer：step A"]' >/dev/null \
-    || die "selftest: a task sent under a parent is not a step of its line: $(sn snapshot | jq -c '{tasks, next}')"
+  sn view --json | jq -e '[.tasks[] | select(.text == "main line") | .d, .t] == [0, 1] and [.next[].text] == ["reviewer：step A"]' >/dev/null \
+    || die "selftest: a task sent under a parent is not a step of its line: $(sn view --json | jq -c '{tasks, next}')"
   # news: lines with one key are one fact, the latest shows; lines without a key all show
   bd4=$t/brief4; mkdir -p "$bd4"; nb() { AWB_DIR=$bd4 "$BIN" news "$@"; }
   nb "no key"; nb --key val@15000 "feed: val 1.888"; nb "other"; nb --key val@15000 "val 1.888, grad ok"; nb --key ck "saved"
-  [ "$(AWB_DIR=$bd4 "$BIN" snapshot | jq -c '[.news[].text]')" = '["no key","other","val 1.888, grad ok","saved"]' ] \
-    || die "selftest: news with one key not shown once: $(AWB_DIR=$bd4 "$BIN" snapshot | jq -c '[.news[].text]')"
+  [ "$(AWB_DIR=$bd4 "$BIN" view --json | jq -c '[.news[].text]')" = '["no key","other","val 1.888, grad ok","saved"]' ] \
+    || die "selftest: news with one key not shown once: $(AWB_DIR=$bd4 "$BIN" view --json | jq -c '[.news[].text]')"
   # an estimate past the deadline (--by, given once) is replaced by "misses it"; a far deadline keeps it
   bd3=$t/brief3; mkdir -p "$bd3"
   AWB_DIR=$bd3 "$BIN" metric --at $((bn - 86400)) --by $((bn + 3600)) he 1 30
   AWB_DIR=$bd3 "$BIN" metric he 2 30
-  AWB_DIR=$bd3 "$BIN" snapshot | jq -e '.metric.eta == null and .metric.late' >/dev/null \
+  AWB_DIR=$bd3 "$BIN" view --json | jq -e '.metric.eta == null and .metric.late' >/dev/null \
     || die "selftest: an estimate past the deadline shown"
-  AWB_DIR=$bd3 "$BIN" snapshot | jq -e '.headline | contains("截止前达不到")' >/dev/null || die "selftest: a missed deadline not in the headline"
+  AWB_DIR=$bd3 "$BIN" view --json | jq -e '.headline | contains("截止前达不到")' >/dev/null || die "selftest: a missed deadline not in the headline"
   AWB_DIR=$bd3 "$BIN" metric --by $((bn + 86400 * 400)) he 2 30
-  AWB_DIR=$bd3 "$BIN" snapshot | jq -e '.metric.eta != null and (.metric.late | not)' >/dev/null \
+  AWB_DIR=$bd3 "$BIN" view --json | jq -e '.metric.eta != null and (.metric.late | not)' >/dev/null \
     || die "selftest: an estimate inside the deadline hidden"
   ! AWB_DIR=$bd3 "$BIN" metric --by soon he 2 30 2>/dev/null || die "selftest: metric --by accepted a non-epoch"
   # an estimate counts from the latest reading, and a reading older than AWB_METRIC_STALE gives
   # none: a day-old "30 minutes to target" once sat on the card as if it were current
   bd5=$t/brief5; mkdir -p "$bd5"; n5=$(date +%s)
   AWB_DIR=$bd5 "$BIN" metric --at $((n5 - 1200)) m 10 40; AWB_DIR=$bd5 "$BIN" metric --at $((n5 - 600)) m 20 40
-  AWB_DIR=$bd5 "$BIN" snapshot | jq -e '.metric.eta > 540 and .metric.eta < 660 and (.metric.stale | not)' >/dev/null \
-    || die "selftest: the estimate does not count from the latest reading: $(AWB_DIR=$bd5 "$BIN" snapshot | jq -c .metric.eta)"
+  AWB_DIR=$bd5 "$BIN" view --json | jq -e '.metric.eta > 540 and .metric.eta < 660 and (.metric.stale | not)' >/dev/null \
+    || die "selftest: the estimate does not count from the latest reading: $(AWB_DIR=$bd5 "$BIN" view --json | jq -c .metric.eta)"
   bd6=$t/brief6; mkdir -p "$bd6"
   AWB_DIR=$bd6 "$BIN" metric --at $((n5 - 108000)) m 10 40; AWB_DIR=$bd6 "$BIN" metric --at $((n5 - 25200)) m 20 40
-  AWB_DIR=$bd6 "$BIN" snapshot | jq -e '.metric.eta == null and .metric.stale' >/dev/null || die "selftest: an estimate from a day-old reading"
+  AWB_DIR=$bd6 "$BIN" view --json | jq -e '.metric.eta == null and .metric.stale' >/dev/null || die "selftest: an estimate from a day-old reading"
   # an open task root nobody touched for AWB_TASK_STALE says so; a fresh one does not
   printf '{"t":"task","time":"00:00:00","ep":%s,"id":"old","state":"wip","text":"old root","parent":"","owner":""}\n' $((n5 - 30000)) >> "$bd6/events.jsonl"
   AWB_DIR=$bd6 "$BIN" task new wip "new root"
-  AWB_DIR=$bd6 "$BIN" snapshot | jq -e '([.tasks[] | select(.text == "old root") | .quiet] == [30000] or ([.tasks[] | select(.text == "old root") | .quiet][0] >= 30000))
+  AWB_DIR=$bd6 "$BIN" view --json | jq -e '([.tasks[] | select(.text == "old root") | .quiet] == [30000] or ([.tasks[] | select(.text == "old root") | .quiet][0] >= 30000))
     and ([.tasks[] | select(.text == "new root") | .quiet] == [null])' >/dev/null || die "selftest: task root quiet time wrong"
   # a shared resource has one holder: another owner is refused, the holder renews, release
   # frees it; the fold never sees it, and a holder quiet for AWB_STALE is an anomaly
@@ -2089,39 +1710,15 @@ selftest() {
   hb start h1 perf1 >/dev/null; hb hold gpu h1 "bench"
   ! hb hold gpu h2 2>/dev/null || die "selftest: a held resource was taken by another owner"
   hb hold gpu h1 "renew" || die "selftest: the holder could not renew"
-  [ "$(hb holder gpu | cut -d' ' -f1)" = h1 ] || die "selftest: holder lost"
+  [ "$(hb hold | awk '$1 == "gpu" {print $2}')" = h1 ] || die "selftest: holder lost"
   ! hb release gpu h2 2>/dev/null || die "selftest: a non-holder released the resource"
   [ "$(hb _state)" = "h1 running false - 0 0" ] || die "selftest: hold events reached the fold: $(hb _state)"
-  AWB_STALE=0 hb snapshot | jq -e '.holds[0].owner == "h1" and any(.anomalies[]; .kind == "hold")' >/dev/null \
+  AWB_STALE=0 hb view --json | jq -e '.holds[0].owner == "h1" and any(.anomalies[]; .kind == "hold")' >/dev/null \
     || die "selftest: a quiet holder is not an anomaly"
-  ! hb render | grep -Fq "gpu" || die "selftest: a resource held by a working agent is on the brief view"
-  hb release gpu; ! hb holder gpu >/dev/null || die "selftest: release did not free the resource"
-  AWB_STALE=0 hb snapshot | jq -e '(.holds | length) == 0 and (any(.anomalies[]; .kind == "hold") | not)' >/dev/null \
+  ! hb view --once | grep -Fq "gpu" || die "selftest: a resource held by a working agent is on the brief view"
+  hb release gpu; [ -z "$(hb hold)" ] || die "selftest: release did not free the resource"
+  AWB_STALE=0 hb view --json | jq -e '(.holds | length) == 0 and (any(.anomalies[]; .kind == "hold") | not)' >/dev/null \
     || die "selftest: a released resource still shown"
-  # merge: only the newest verdict naming the current head counts, a conditional or retracted
-  # approve does not, and checks that never ran are not green (fake gh replays each PR state)
-  mkdir -p "$t/fgh"; printf '#!/bin/sh\ncase "$1 $2" in "pr view") cat %s/fgh/pr.json ;; "pr merge") echo "$*" >> %s/fgh/log ;; esac\n' "$t" "$t" > "$t/fgh/gh"
-  chmod +x "$t/fgh/gh"; : > "$t/fgh/log"
-  mh=891472afdeadbeef00000000000000000000beef
-  mpr() { printf '{"state":"OPEN","headRefOid":"%s","reviews":[],"comments":[%s],"statusCheckRollup":[%s]}' "$mh" "$1" "$2" > "$t/fgh/pr.json"; }
-  mc() { printf '{"createdAt":"2026-01-01T0%s:00:00Z","body":"%s"}' "$1" "$2"; }
-  mg() { printf '{"name":"gate (%s)","conclusion":"%s"},{"name":"gate (%s2)","conclusion":"%s"}' "$1" "$1" "$1" "$2"; }
-  mm() { PATH=$t/fgh:$PATH AWB_DIR=$hd AWB_REQUIRE_CHECKS='^gate' AWB_MIN_CHECKS=2 "$BIN" merge 7 >/dev/null 2>&1; }
-  ok='**APPROVE (rev, head 891472af)**'
-  mpr "$(mc 1 '**APPROVE (rev, head 891472af) with one doc fix**'),$(mc 2 'REQUEST CHANGES (rev) head 891472af')" "$(mg SUCCESS SUCCESS)"
-  ! mm || die "selftest: merge took a retracted approve"
-  mpr "$(mc 1 '**APPROVE (rev, head 891472af) with one doc fix**')" "$(mg SUCCESS SUCCESS)"
-  ! mm || die "selftest: merge took a conditional approve"
-  mpr "$(mc 1 "$ok")" '{"name":"GitGuardian","conclusion":"SUCCESS"}'
-  ! mm || die "selftest: merge took checks that never ran as green"
-  mpr "$(mc 1 "$ok")" "$(mg SUCCESS "")"
-  ! mm || die "selftest: merge did not wait for a pending check"
-  mpr "$(mc 1 '**APPROVE (rev, head 1c56633a)**')" "$(mg SUCCESS SUCCESS)"
-  ! mm || die "selftest: merge took an approve of an older head"
-  [ ! -s "$t/fgh/log" ] || die "selftest: merge called gh pr merge before it was ready"
-  mpr "$(mc 1 'REQUEST CHANGES (rev, head 891472af)'),$(mc 2 "$ok")" "$(mg SUCCESS SUCCESS)"
-  mm || die "selftest: merge refused an exact approve with green checks"
-  grep -qx "pr merge 7 --merge --match-head-commit $mh" "$t/fgh/log" || die "selftest: merge not pinned to the head: $(cat "$t/fgh/log")"
   # the drawing, pinned: a fixed snapshot gives exactly this brief view. A change of wording
   # or layout is made here once; everything else is asserted on the snapshot above.
   fx='{"goal":"G","title":"G","about":["what it is"],"headline":"需要你 1 件 · m 按当前趋势截止前达不到 · 异常 1",
@@ -2182,42 +1779,38 @@ EOF
   _ep=$(date +%s)
   for j in 1 2; do printf '{"t":"chk","ep":%s,"id":"f1","run":"r1","what":"pytest --with-a-very-long-suite-name --flag","step":"%s","state":"run","note":""}\n' $_ep "a-very-long-step-name-that-overflows-the-pane-width-$j" >> "$wd/events.jsonl"; done
   printf '{"t":"chk","ep":%s,"id":"f1","run":"r1","what":"pytest --with-a-very-long-suite-name --flag","step":"a-very-long-step-name-that-overflows-the-pane-width-2","state":"fail","note":"E assertion failure with a long reason text that also used to overflow the row"}\n' $_ep >> "$wd/events.jsonl"
-  for view in brief full; do
-    AWB_VIEW=$view AWB_COLS=60 AWB_ROWS=50 ww render | stripansi > "$t/w-$view"
-    mx=$(wmax < "$t/w-$view"); [ "$mx" -le 60 ] || die "selftest: $view view has a line wider than 60 ($mx)"
-  done
+  AWB_COLS=60 AWB_ROWS=50 ww view --once | stripansi > "$t/w60"
+  mx=$(wmax < "$t/w60"); [ "$mx" -le 60 ] || die "selftest: a line wider than 60 ($mx)"
   # in a narrow pane the metric verdict (ETA) survives while start point and sparkline drop
   wn=$t/narrow; mkdir -p "$wn"; nnow=$(date +%s)
   AWB_DIR=$wn "$BIN" goal G >/dev/null
   AWB_DIR=$wn "$BIN" metric --at $((nnow - 1800)) acc 0.5 1 >/dev/null
   AWB_DIR=$wn "$BIN" metric --by $((nnow + 86400)) acc 0.55 1 >/dev/null
-  AWB_DIR=$wn AWB_COLS=60 "$BIN" render | stripansi > "$t/n60"
+  AWB_DIR=$wn AWB_COLS=60 "$BIN" view --once | stripansi > "$t/n60"
   grep -Fq "按均速约" "$t/n60" || die "selftest: the metric ETA is lost at 60 columns"
   ! grep -Fq "起 0.5" "$t/n60" || die "selftest: 60 columns kept the start point instead of the ETA"
   mx=$(wmax < "$t/n60"); [ "$mx" -le 60 ] || die "selftest: metric line overflows at 60 columns ($mx)"
-  AWB_DIR=$wn AWB_COLS=120 "$BIN" render | stripansi | grep -Fq "起 0.5" || die "selftest: the start point is missing at 120 columns"
-  # a short pane shows how many needs/anomalies are hidden, and the full view shows needs too
+  AWB_DIR=$wn AWB_COLS=120 "$BIN" view --once | stripansi | grep -Fq "起 0.5" || die "selftest: the start point is missing at 120 columns"
+  # a short pane shows how many needs/anomalies are hidden
   wh=$t/short; mkdir -p "$wh"; i=1
   while [ $i -le 8 ]; do AWB_DIR=$wh "$BIN" start "f$i" "f$i" >/dev/null; AWB_DIR=$wh "$BIN" now "f$i" "m$i" >/dev/null
     AWB_DIR=$wh "$BIN" fail "f$i" "reason $i" >/dev/null; i=$((i + 1)); done
-  AWB_DIR=$wh AWB_COLS=60 AWB_ROWS=12 "$BIN" render | stripansi > "$t/sh12"
+  AWB_DIR=$wh AWB_COLS=60 AWB_ROWS=12 "$BIN" view --once | stripansi > "$t/sh12"
   grep -Fq "需要你（8）" "$t/sh12" && grep -Eq "还有 [0-9]+ 件" "$t/sh12" && grep -Fq "✗ f1 " "$t/sh12" \
     || die "selftest: a 12-row pane hides needs without a count: $(cat "$t/sh12")"
   [ "$(wc -l < "$t/sh12" | tr -d ' ')" -le 12 ] || die "selftest: 12-row render exceeds the pane height"
-  AWB_DIR=$wh AWB_VIEW=full AWB_COLS=60 AWB_ROWS=24 "$BIN" render | stripansi | grep -Fq "需要你（8）" \
-    || die "selftest: the full view shows no needs-you section"
   # an empty board shows no stale epoch time and no GOAL placeholder
   we=$t/empty; mkdir -p "$we"
-  AWB_DIR=$we "$BIN" render | stripansi > "$t/empty.out"
+  AWB_DIR=$we "$BIN" view --once | stripansi > "$t/empty.out"
   ! grep -Fq "更新于" "$t/empty.out" || die "selftest: empty board shows an epoch-0 stale time"
   ! grep -Fq "GOAL" "$t/empty.out" || die "selftest: empty board shows the GOAL placeholder"
-  AWB_DIR=$we "$BIN" snapshot | jq -e '.quiet == 0 and .title == ""' >/dev/null || die "selftest: empty snapshot quiet/title"
+  AWB_DIR=$we "$BIN" view --json | jq -e '.quiet == 0 and .title == ""' >/dev/null || die "selftest: empty snapshot quiet/title"
   # awb view takes COLS ROWS positionally (the brief view never goes below 12 rows); an
   # empty non-tty stdin with an unreachable pane falls back to 80 columns instead of that width
-  AWB_DIR=$wh "$BIN" snapshot 2>/dev/null | env -u TMUX -u TMUX_PANE "$BIN" _view 50 13 | stripansi > "$t/v50"
+  AWB_DIR=$wh "$BIN" view --json 2>/dev/null | env -u TMUX -u TMUX_PANE "$BIN" _view 50 13 | stripansi > "$t/v50"
   [ "$(wc -l < "$t/v50" | tr -d ' ')" -eq 13 ] || die "selftest: awb view ignored ROWS"
   mx=$(wmax < "$t/v50"); [ "$mx" -le 50 ] || die "selftest: awb view ignored COLS ($mx > 50)"
-  AWB_DIR=$wh "$BIN" snapshot 2>/dev/null | env -u AWB_COLS -u AWB_ROWS TMUX=/nonexistent,0,0 TMUX_PANE=%1 "$BIN" _view 2>/dev/null | stripansi > "$t/vfb"
+  AWB_DIR=$wh "$BIN" view --json 2>/dev/null | env -u AWB_COLS -u AWB_ROWS TMUX=/nonexistent,0,0 TMUX_PANE=%1 "$BIN" _view 2>/dev/null | stripansi > "$t/vfb"
   [ "$(wmax < "$t/vfb")" -gt 10 ] && [ "$(wmax < "$t/vfb")" -le 80 ] \
     || die "selftest: awb view with an unreachable pane did not fall back to 80 columns"
 
@@ -2225,45 +1818,38 @@ EOF
   # 1. ages in anomalies use the ago form, never an hms clock
   ag=$t/ages; mkdir -p "$ag"; nnow=$(date +%s)
   printf '{"t":"start","id":"a1","name":"a1","ep":%s}\n{"t":"now","id":"a1","text":"x","ep":%s}\n' $((nnow-12000)) $((nnow-12000)) >> "$ag/events.jsonl"
-  AWB_DIR=$ag "$BIN" snapshot | jq -e '.anomalies | length > 0
+  AWB_DIR=$ag "$BIN" view --json | jq -e '.anomalies | length > 0
     and all(.text | test("[0-9]+小时") and (test("[0-9]+:[0-9][0-9]:[0-9][0-9]") | not))' >/dev/null \
-    || die "selftest: anomaly age is not in ago form: $(AWB_DIR=$ag "$BIN" snapshot | jq -c '.anomalies[].text')"
+    || die "selftest: anomaly age is not in ago form: $(AWB_DIR=$ag "$BIN" view --json | jq -c '.anomalies[].text')"
   ! grep -Eq '\) / 10\) 天|floor\) 小时|floor\) 分钟' "$(dirname "$BIN")/awb-lark" \
     || die "selftest: awb-lark ago keeps a space before the unit"
   # 6. a single running step shows its time once (the row total already shows it)
   c1=$t/onecheck; mkdir -p "$c1"; cp0=$(date +%s)
   printf '{"t":"start","id":"c1","name":"c1","ep":%s}\n{"t":"now","id":"c1","text":"m","ep":%s}\n' "$cp0" "$cp0" >> "$c1/events.jsonl"
   printf '{"t":"chk","ep":%s,"id":"c1","run":"r1","what":"w","step":"only-step","state":"run","note":""}\n' "$cp0" >> "$c1/events.jsonl"
-  for v in brief full; do
-    line=$(AWB_DIR=$c1 AWB_VIEW=$v AWB_COLS=120 "$BIN" render | stripansi | grep 'only-step')
-    n=$(printf '%s\n' "$line" | grep -oE '([0-9]+:[0-9][0-9](:[0-9][0-9])?)|[0-9]+s' | wc -l | tr -d ' ')
-    [ "$n" = "1" ] || die "selftest: the single running step shows its timer $n times in $v"
-  done
-  # 2. full-view total progress excludes old fully-done roots, matching brief
+  line=$(AWB_DIR=$c1 AWB_COLS=120 "$BIN" view --once | stripansi | grep 'only-step')
+  n=$(printf '%s\n' "$line" | grep -oE '([0-9]+:[0-9][0-9](:[0-9][0-9])?)|[0-9]+s' | wc -l | tr -d ' ')
+  [ "$n" = "1" ] || die "selftest: the single running step shows its timer $n times"
+  # 2. total progress excludes old fully-done roots
   p2=$t/prog; mkdir -p "$p2"; pn=$(date +%s)
   AWB_DIR=$p2 "$BIN" start g1 g1 >/dev/null; AWB_DIR=$p2 "$BIN" now g1 work >/dev/null
   i=1; while [ $i -le 10 ]; do printf '{"t":"task","ep":%s,"id":"p%s","state":"done","text":"t%s","parent":"","owner":""}\n' $((pn-7200)) "$i" "$i" >> "$p2/events.jsonl"; i=$((i+1)); done
   printf '{"t":"task","ep":%s,"id":"po","state":"wip","text":"open","parent":"","owner":""}\n' "$pn" >> "$p2/events.jsonl"
-  AWB_DIR=$p2 AWB_VIEW=full AWB_COLS=120 "$BIN" render | stripansi | grep -Fq '总进度' \
-    && AWB_DIR=$p2 AWB_VIEW=full AWB_COLS=120 "$BIN" render | stripansi | grep -Eq '0/1 任务' \
-    || die "selftest: full total progress counts old fully-done roots"
+  AWB_DIR=$p2 "$BIN" view --json | jq -e '.progress == {d:0, t:1} and .tasks_old == 10' >/dev/null \
+    || die "selftest: total progress counts old fully-done roots"
   # 3. wrap breaks Latin text at a space, not inside a word
   printf '%s' "ab cd" | jq -Rn -c "$WDEF"'[input | wrap(5)[]]' | grep -Fxq '["ab cd"]' \
     || die "selftest: wrap broke a word that fit"
   printf '%s' "abcdef ghijkl" | jq -Rn -c "$WDEF"'[input | wrap(7)[]]' | jq -e '. == ["abcdef","ghijkl"]' >/dev/null \
     || die "selftest: wrap split a Latin word mid-token: $(printf '%s' 'abcdef ghijkl' | jq -Rn -c "$WDEF"'[input | wrap(7)[]]')"
-  # 4. the full-view box head shows the goal title, not the GOAL placeholder
-  AWB_DIR=$p2 "$BIN" goal "TITLE-XYZ" >/dev/null
-  AWB_DIR=$p2 AWB_VIEW=full AWB_COLS=120 "$BIN" render | stripansi | sed -n '1p' | grep -Fq "TITLE-XYZ" \
-    || die "selftest: the full view box head does not show the goal title"
   # 5. a metric delta whose first reading is under 24h old names the real span
   m5=$t/span; mkdir -p "$m5"; mn=$(date +%s)
   AWB_DIR=$m5 "$BIN" goal G >/dev/null
   AWB_DIR=$m5 "$BIN" metric --at $((mn - 39600)) m 1 10 >/dev/null
   AWB_DIR=$m5 "$BIN" metric m 2 10 >/dev/null
-  AWB_DIR=$m5 "$BIN" snapshot | jq -e '.day.mspan >= 36000 and .day.mspan <= 40000' >/dev/null \
+  AWB_DIR=$m5 "$BIN" view --json | jq -e '.day.mspan >= 36000 and .day.mspan <= 40000' >/dev/null \
     || die "selftest: the sub-24h metric span is not recorded"
-  AWB_DIR=$m5 AWB_COLS=120 "$BIN" render | stripansi | grep -Fq "+1/11小时" \
+  AWB_DIR=$m5 AWB_COLS=120 "$BIN" view --once | stripansi | grep -Fq "+1/11小时" \
     || die "selftest: the footer does not name the metric delta span"
   AWB_DIR=$m5 AWB="$BIN" "$(dirname "$BIN")/awb-lark" sync --dry-run \
     | jq -e '[.body.elements[]|select(.tag=="column_set")|..|.content? // empty]|any(test("\\+1/11小时"))' >/dev/null \
@@ -2271,20 +1857,20 @@ EOF
 
   # single metric indicator under GOAL, render-only (the "#" id keeps it out
   # of the proven fold; `awb _state` below proves no agent is created).
-  ! "$BIN" render | grep -Fq '▕' || die "selftest: metric bar shown with no metric event"
+  ! "$BIN" view --once | grep -Fq '▕' || die "selftest: metric bar shown with no metric event"
   "$BIN" metric "tps" 32 40 "V100 target"
-  m=$("$BIN" render)
+  m=$("$BIN" view --once)
   printf '%s' "$m" | grep -Fq 'tps' || die "selftest: metric name not rendered"
   printf '%s' "$m" | grep -Fq '32 / 40' || die "selftest: metric value/target not rendered"
   printf '%s' "$m" | grep -Fq 'V100 target' || die "selftest: metric note not rendered"
   printf '%s' "$m" | grep -Fq '80%' || die "selftest: metric percent wrong"
   # latest metric wins
   "$BIN" metric "qps" 5 10 second-note
-  "$BIN" render | grep -Fq 'qps' || die "selftest: newer metric not shown"
-  ! "$BIN" render | grep -Fq 'V100 target' || die "selftest: stale metric still rendered"
+  "$BIN" view --once | grep -Fq 'qps' || die "selftest: newer metric not shown"
+  ! "$BIN" view --once | grep -Fq 'V100 target' || die "selftest: stale metric still rendered"
   # clamp to 100% and never below 0
-  "$BIN" metric over 41 40 x; "$BIN" render | grep -Fq '100%' || die "selftest: metric not clamped at 100"
-  "$BIN" metric under 3 0 x; "$BIN" render | grep -Fq ' 3 / 0' || die "selftest: zero-target metric mishandled"
+  "$BIN" metric over 41 40 x; "$BIN" view --once | grep -Fq '100%' || die "selftest: metric not clamped at 100"
+  "$BIN" metric under 3 0 x; "$BIN" view --once | grep -Fq ' 3 / 0' || die "selftest: zero-target metric mishandled"
   # value/target must be finite numbers, not tokens jq can't tonumber
   ! "$BIN" metric bad abc 10 2>/dev/null || die "selftest: non-numeric metric value accepted"
   ! "$BIN" metric bad 1.2.3 10 2>/dev/null || die "selftest: '1.2.3' metric value accepted"
@@ -2295,29 +1881,27 @@ EOF
   # and blank the board; now matches Lean parseLine's `_ => none`). A metric has
   # no id and must neither create an agent nor stop a later event applying.
   printf '%s\n' '{"t":"zzz","ep":900000}' >> "$EV"
-  "$BIN" render | grep -Fq "SHIP THE WORKBENCH" || die "selftest: unknown no-id event blanked the board"
+  "$BIN" view --once | grep -Fq "SHIP THE WORKBENCH" || die "selftest: unknown no-id event blanked the board"
   _ids=$("$BIN" _state | awk '{print $1}' | sort -u | tr '\n' ' ')
   [ "$_ids" = "a1 a2 " ] || die "selftest: unknown event leaked an agent into the fold (got: $_ids)"
   "$BIN" now a1 "post-unknown-still-works"
-  AWB_VIEW=full "$BIN" render | grep -Fq "post-unknown-still-works" || die "selftest: events after an unknown no-id event dropped"
+  "$BIN" view --json | jq -e 'any(.agents[]; .id == "a1" and .text == "post-unknown-still-works")' >/dev/null \
+    || die "selftest: events after an unknown no-id event dropped"
   # verified vs self-reported milestones: a1 has one done, none verified yet
-  "$BIN" snapshot | jq -e '.verified == {v:0, n:1}' >/dev/null || die "selftest: milestone verified/self-reported count wrong"
-  printf '%s' "$out" | grep -F "✓ wire event log" | grep -Fq "自报" || die "selftest: unverified done not marked 自报"
+  "$BIN" view --json | jq -e '.verified == {v:0, n:1}' >/dev/null || die "selftest: milestone verified/self-reported count wrong"
 
   "$BIN" now a1 "gated"
   ! "$BIN" check a1 -- false >/dev/null || die "selftest: failing check accepted"
-  AWB_VIEW=full "$BIN" render | grep -Fq "✗1" || die "selftest: rejected check not failed"
+  "$BIN" _state | grep -q '^a1 failed true ' || die "selftest: rejected check not failed"
   "$BIN" check a1 -- true >/dev/null || die "selftest: passing check rejected"
-  AWB_VIEW=full "$BIN" render | grep -Fq "⊢ gated" || die "selftest: verified milestone not marked"
-  ! AWB_VIEW=full "$BIN" render | grep -F "⊢ gated" | grep -Fq "自报" || die "selftest: verified milestone wrongly marked 自报"
+  "$BIN" view --json | jq -e '.verified == {v:1, n:2}' >/dev/null || die "selftest: verified milestone not counted"
   ! "$BIN" pr a2 2>/dev/null || die "selftest: pr opened without an acceptance command"
   # a pass forged in the log does not open a PR: pr runs the acceptance itself
   printf '{"t":"chk","ep":%s,"id":"a2","run":"forged","what":"true","step":"cmd","state":"ok","note":""}\n' "$(date +%s)" >> "$EV"
   ! "$BIN" pr a2 -- false >/dev/null 2>&1 || die "selftest: pr trusted a check pass from the log"
   "$BIN" start v1 late; "$BIN" now v1 "shipped"; "$BIN" done v1; "$BIN" check v1 -- true >/dev/null
-  out=$(AWB_VIEW=full "$BIN" render)
-  printf '%s' "$out" | grep -Fq "⊢ shipped" || die "selftest: late check did not verify last milestone"
-  ! printf '%s' "$out" | grep -Fq "⊢ milestone" || die "selftest: late check added a phantom milestone"
+  "$BIN" view --json | jq -e '.agents[] | select(.id == "v1") | [.dn, .dv] == [1, 1]' >/dev/null \
+    || die "selftest: a late check did not verify the last milestone, or added one"
   # bash 3.2 swallows a following non-ASCII byte into an unbraced variable name: brace them
   ! LC_ALL=C grep -nE '[$][A-Za-z_][A-Za-z0-9_]*[^ -~]' "$BIN" >&2 || die "selftest: unbraced \$var before non-ASCII text"
   # dispatch/report loop (model/tla/AwbLoop.tla)
@@ -2328,27 +1912,28 @@ EOF
   ! "$BIN" reply w9 000 "wrong" 2>/dev/null || die "selftest: reply with a wrong key closed a task"
   "$BIN" idle w9 | grep -q "请汇报" || die "selftest: first idle did not ask"
   "$BIN" reply w9 "$k" "12 files" >/dev/null
-  AWB_VIEW=full "$BIN" render | grep -q "✓ 12 files" || die "selftest: keyed reply did not close the task"
+  "$BIN" view --json | jq -e 'any(.tasks[]; .text == "count files" and .d == 1)' >/dev/null \
+    || die "selftest: keyed reply did not close the task"
   m=$("$BIN" send w9 "held one"); "$BIN" idle w9 >/dev/null; "$BIN" idle w9 | grep -q "^blocked" \
     || die "selftest: second silent idle did not block"
   # races found by model/tla (real concurrent processes)
   "$BIN" start s1 stale; "$BIN" now s1 "m1"
   "$BIN" check s1 -- sleep 1 >/dev/null 2>&1 & sleep 0.4; "$BIN" now s1 "m2"; wait
-  AWB_VIEW=full "$BIN" render | grep -q "✗ stale" || die "selftest: check verified a milestone started during it"
+  "$BIN" _state | grep -q '^s1 failed true ' || die "selftest: check verified a milestone started during it"
   "$BIN" start p1 pair; "$BIN" now p1 "x"
   "$BIN" check p1 -- sleep 1 >/dev/null & "$BIN" check p1 -- sleep 1 >/dev/null & wait
   runs=$(jq -r 'select(.t == "chk" and .id == "p1") | .run' "$EV" | uniq | wc -l | tr -d ' ')
   [ "$runs" = 2 ] || die "selftest: concurrent checks interleaved ($runs run segments)"
   # regressions found by model/AwbModel.lean
   "$BIN" start g1 gatecase; "$BIN" check g1 -- false >/dev/null || true; "$BIN" finish g1
-  AWB_VIEW=full "$BIN" render | grep -q "✗ gatecase" || die "selftest: done overrode a rejected check"
+  "$BIN" _state | grep -q '^g1 failed true ' || die "selftest: done overrode a rejected check"
   "$BIN" start r1 rerun; "$BIN" finish r1; "$BIN" start r1 rerun
-  AWB_VIEW=full "$BIN" render | grep -q "◔ rerun" || die "selftest: re-start kept done"
+  "$BIN" _state | grep -q '^r1 running ' || die "selftest: re-start kept done"
   ! "$BIN" status r1 done 2>/dev/null || die "selftest: the removed status command still runs"
 
   if command -v tmux >/dev/null; then
     boardpane=$(tmux -L "$S" new-session -d -s awb -n board -x 200 -y 120 -P -F '#{pane_id}' \
-      "AWB_VIEW=full AWB_DIR=$(q "$t") $(q "$BIN") watch")
+      "AWB_DIR=$(q "$t") $(q "$BIN") view")
     work=$(tmux -L "$S" split-window -v -t "$boardpane" -d -p 60 -P -F '#{pane_id}' "$SHELL")
     sleep 1
     cap=$(tmux -L "$S" capture-pane -p -t "$boardpane")
@@ -2357,12 +1942,8 @@ EOF
     printf '%s\n' "$work" > "$t/work-pane"
     tmux -L "$S" send-keys -t "$work" "export AWB_DIR=$(q "$t")" Enter
     tmux -L "$S" send-keys -t "$work" "$(q "$BIN") run z1 demo -- sleep 2" Enter
-    # poll the live board, capped at 10s per expectation
-    seen() { i=0; while [ $i -lt 20 ]; do
-      tmux -L "$S" capture-pane -p -t "$boardpane" | grep -Fq -- "$1" && return 0
-      sleep 0.5; i=$((i + 1)); done; return 1; }
-    seen "demo" || die "selftest: spawned agent not shown"
-    seen "✓1" || die "selftest: exit 0 not marked done"
+    i=0; until "$BIN" _state | grep -q '^z1 done '; do
+      i=$((i + 1)); [ $i -lt 20 ] || die "selftest: a run that exited 0 not marked done"; sleep 0.5; done
     # the pane swaps `sleep 2` for its shell: type once the shell is in the foreground
     i=0; until AWB_TMUX_SOCKET=$(tmux -L "$S" display-message -p '#{socket_path}') shell_pane "$(agent_pane z1)"; do
       i=$((i + 1)); [ $i -lt 20 ] || die "selftest: z1 never reached its shell"; sleep 0.2; done
@@ -2483,7 +2064,7 @@ FT
     RPID=$$ reg busy
     ht peers | grep -Eq "^z1 $zp - not-claude$" || die "selftest: another server's session with the same pane id matched"
     reg waiting "permission prompt"
-    ht render | grep -Fq "待批准：permission prompt" || die "selftest: permission dialog not on the board"
+    ht view --once | grep -Fq "待批准：permission prompt" || die "selftest: permission dialog not on the board"
     ht peers | grep -Eq "^z1 $zp zz-1 waiting" || die "selftest: permission dialog not in peers"
     ! ht tell z1 "echo typed-into-dialog" 2>/dev/null || die "selftest: tell typed into a permission dialog"
     # a dialog reported after the paste stops the Enter
@@ -2493,36 +2074,36 @@ FT
     ! tmux -L "$S" capture-pane -p -t "$zp" | grep -qx "mid-tell-enter" || die "selftest: tell pressed Enter into a dialog opened mid-tell"
     tmux -L "$S" send-keys -t "$zp" C-u
     reg idle
-    ! ht render | grep -Fq "待批准" || die "selftest: idle session shown as waiting for approval"
+    ! ht view --once | grep -Fq "待批准" || die "selftest: idle session shown as waiting for approval"
     ! ht peers | grep -q ' waiting' || die "selftest: idle session listed as waiting"
     reg busy        # z1 reported done
-    ht render | grep -Fq "自报完成，会话在忙" || die "selftest: done agent with a busy session not flagged"
+    ht view --once | grep -Fq "自报完成，会话在忙" || die "selftest: done agent with a busy session not flagged"
     reg idle
-    ! ht render | grep -Fq "会话在忙" || die "selftest: done agent with an idle session flagged"
+    ! ht view --once | grep -Fq "会话在忙" || die "selftest: done agent with an idle session flagged"
     "$BIN" now z1 "still going"
     reg idle "" 4000
-    ht snapshot | jq -e '.anomalies | any(.text | contains("会话空闲"))' >/dev/null || die "selftest: a running agent's idle session not in anomalies"
+    ht view --json | jq -e '.anomalies | any(.text | contains("会话空闲"))' >/dev/null || die "selftest: a running agent's idle session not in anomalies"
     "$BIN" done z1
-    ! ht snapshot | jq -e '.anomalies | any(.text | contains("会话空闲"))' >/dev/null || die "selftest: an idle worker with no milestone flagged"
+    ! ht view --json | jq -e '.anomalies | any(.text | contains("会话空闲"))' >/dev/null || die "selftest: an idle worker with no milestone flagged"
     "$BIN" now z1 "still going"; reg idle "" 4000
-    ht render | grep -Fq "自报进行，会话空闲" || die "selftest: running agent idle past AWB_SILENT not flagged"
+    ht view --once | grep -Fq "自报进行，会话空闲" || die "selftest: running agent idle past AWB_SILENT not flagged"
     # anomalies: one line per agent, and silence counts only for an agent with no session
     sleep 1.1
-    [ "$(AWB_SILENT=1 ht snapshot | jq '[.anomalies[] | select(.text | startswith("demo "))] | length')" = 1 ] \
+    [ "$(AWB_SILENT=1 ht view --json | jq '[.anomalies[] | select(.text | startswith("demo "))] | length')" = 1 ] \
       || die "selftest: a silent agent whose session disagrees has more than one anomaly"
     reg busy
-    ! AWB_SILENT=1 ht snapshot | jq -e '.anomalies[] | select(.text | startswith("demo "))' >/dev/null \
+    ! AWB_SILENT=1 ht view --json | jq -e '.anomalies[] | select(.text | startswith("demo "))' >/dev/null \
       || die "selftest: a silent agent with a busy session listed as an anomaly"
-    HOME=$t/nohome AWB_SILENT=1 "$BIN" snapshot | jq -e '.anomalies[] | select(.kind == "silent" and (.text | startswith("demo ")))' >/dev/null \
+    HOME=$t/nohome AWB_SILENT=1 "$BIN" view --json | jq -e '.anomalies[] | select(.kind == "silent" and (.text | startswith("demo ")))' >/dev/null \
       || die "selftest: a silent agent with no session not listed"
     reg idle "" 10
-    ! ht render | grep -Fq "会话空闲" || die "selftest: running agent idle 10s flagged"
+    ! ht view --once | grep -Fq "会话空闲" || die "selftest: running agent idle 10s flagged"
     # a task sent to a session idle since before it, and still idle: not delivered
     reg idle "" 400; zm=$("$BIN" send z1 "undelivered" 2>/dev/null); zk=$(printf '%s' "$zm" | sed -n '1s/^\[awb z1#\([0-9]*\)\].*/\1/p')
-    AWB_UNDELIVERED=0 ht snapshot | jq -e '.anomalies | any(.text | contains("消息可能没发出"))' >/dev/null \
+    AWB_UNDELIVERED=0 ht view --json | jq -e '.anomalies | any(.text | contains("消息可能没发出"))' >/dev/null \
       || die "selftest: a sent task the idle worker never started is not flagged"
     reg busy
-    ! AWB_UNDELIVERED=0 ht snapshot | jq -e '.anomalies | any(.text | contains("消息可能没发出"))' >/dev/null \
+    ! AWB_UNDELIVERED=0 ht view --json | jq -e '.anomalies | any(.text | contains("消息可能没发出"))' >/dev/null \
       || die "selftest: a started task flagged as undelivered"
     "$BIN" reply z1 "$zk" >/dev/null; "$BIN" now z1 "still going"; reg idle "" 10
     # a session stopped with a tool call printed as text is told to re-issue it, once per
@@ -2534,12 +2115,12 @@ FT
     ht nudge --once >/dev/null 2>&1
     [ "$(grep -F '"why":"stuck"' "$EV" | grep -cF '"id":"z1"')" = 1 ] || die "selftest: a stuck session was not told to re-issue"
     sleep 0.6; tmux -L "$S" capture-pane -p -t "$zp" | grep -Fq "被打印成了文本" || die "selftest: the stuck reminder was not typed"
-    ht snapshot | jq -e '.agents[] | select(.id == "z1") | .flag | contains("工具调用没执行")' >/dev/null \
+    ht view --json | jq -e '.agents[] | select(.id == "z1") | .flag | contains("工具调用没执行")' >/dev/null \
       || die "selftest: a stuck session is not flagged"
     ht nudge --once >/dev/null 2>&1
     [ "$(grep -F '"why":"stuck"' "$EV" | grep -cF '"id":"z1"')" = 1 ] || die "selftest: the stuck reminder is not throttled"
     reg busy
-    ! ht snapshot | jq -e '.agents[] | select(.id == "z1") | .flag | contains("工具调用没执行")' >/dev/null \
+    ! ht view --json | jq -e '.agents[] | select(.id == "z1") | .flag | contains("工具调用没执行")' >/dev/null \
       || die "selftest: a working session still flagged stuck"
     tmux -L "$S" send-keys -t "$zp" C-u; tmux -L "$S" send-keys -t "$zp" clear Enter
     reg idle "" 10
@@ -2562,7 +2143,7 @@ FT
     AWB_STALE=1 AWB_NUDGE_EVERY=0 ht nudge --once >/dev/null 2>&1
     rm -f "$t/lock-nudge"
     [ "$(grep -F '"t":"nudge"' "$EV" | grep -F '"id":"z1"' | grep -vcF '"why"')" = 0 ] || die "selftest: a nudge round ran while another held the lock"
-    HOME=$t/home AWB_STALE=1 AWB_NUDGE_EVERY=0 AWB_NUDGE=1 AWB_NUDGE_POLL=1 AWB_INTERVAL=0.2 "$BIN" watch >/dev/null 2>&1 &
+    HOME=$t/home AWB_STALE=1 AWB_NUDGE_EVERY=0 AWB_NUDGE=1 AWB_NUDGE_POLL=1 AWB_INTERVAL=0.2 "$BIN" view >/dev/null 2>&1 &
     wp=$!; i=0
     until grep -F '"t":"nudge"' "$EV" | grep -F '"id":"z1"' | grep -qvF '"why"'; do
       i=$((i + 1)); [ $i -lt 40 ] || { kill $wp; die "selftest: an open board did not nudge a silent agent"; }; sleep 0.25; done
@@ -2601,71 +2182,15 @@ FT
   "$BIN" start zf frozen; "$BIN" now zf "idle"
   "$BIN" start zfb blk; "$BIN" now zfb "wait"; "$BIN" block zfb "remote job"
   printf 'zf 1 %s\nzfb 1 %s\n' "$(($(date +%s) - 1000))" "$(($(date +%s) - 1000))" > "$t/diffs"
-  fr=$("$BIN" render)
+  fr=$("$BIN" view --once)
   printf '%s' "$fr" | grep -Fq "frozen 无改动 " || die "selftest: stale fingerprint not shown frozen"
   ! printf '%s' "$fr" | grep -Fq "blk 无改动" || die "selftest: blocked agent marked frozen"
   printf 'zf 1 %s\nzfb 1 %s\n' "$(date +%s)" "$(date +%s)" > "$t/diffs"
-  ! "$BIN" render | grep -Fq "无改动 " || die "selftest: fresh fingerprint shown frozen"
-  # probes (docs/probe.md; model/Probe.lean, model/tla/AwbProbe.tla)
-  pt=$t/probe; mkdir -p "$pt"
-  pb() { AWB_DIR=$pt "$BIN" "$@"; }
-  pev() { printf '{"t":"probe","time":"x","ep":%s,"id":"%s","ep0":%s,"rc":%s,"st":"%s","text":"%s"}\n' "$@" >> "$pt/events.jsonl"; }
-  pb task p0 todo probes
-  pb task pa wip pa p0 "" --probe 'echo "done merged 1234abcd"'
-  pb task pb wip pb p0 "" --probe 'echo "wip 3/10 30%"'
-  pb task pc wip pc p0 "" --probe 'echo "blocked CI red: lint"'
-  pb task pd wip pd p0 "" --probe 'echo garbage'
-  pb task pe done pe p0 "" --probe 'echo "done x"; exit 3'
-  pb task pf wip pf p0 "" --probe "echo 'done early'; sleep 30 & echo \$! > $(q "$pt/child"); wait"
-  AWB_PROBE_TIMEOUT=1 pb probe run --once
-  po=$(AWB_VIEW=full pb render)
-  pl() { printf '%s\n' "$po" | grep -F -- "$1 · "; }
-  pl pa | grep -Fq "✓ pa · merged 1234abcd" || die "selftest: probe done not shown done"
-  pl pb | grep -Fq "◔ pb · 3/10 30%" || die "selftest: probe wip not shown wip"
-  pl pc | grep -Fq "▲ pc · CI red: lint" || die "selftest: probe blocked not shown blocked"
-  pl pd | grep -Fq "? pd · 未读到" || die "selftest: unparseable probe output not shown unknown"
-  pl pe | grep -Fq "? pe · 未读到" || die "selftest: probe with rc != 0 not shown unknown"
-  pl pf | grep -Fq "? pf · 未读到" || die "selftest: timed-out probe not shown unknown"
-  c=$(cat "$pt/child"); case $(ps -o stat= -p "$c" 2>/dev/null || true) in ""|Z*) ;;
-    *) kill "$c"; die "selftest: timed-out probe left its child running" ;; esac
-  pl pa | grep -Eq "1234abcd · [0-9]+s前" || die "selftest: probe reading age not shown"
-  pn=$(date +%s)
-  pb task ps wip ps p0 "" --probe 'exit 1'
-  pev "$pn" ps "$pn" 0 wip new; pev "$pn" ps $((pn - 100)) 0 done old
-  AWB_VIEW=full pb render | grep -F "ps · " | grep -Fq "◔ ps · new" || die "selftest: older probe reading overrode a newer one"
-  pb task pq wip pq p0 "" --probe 'exit 1'
-  pev $((pn - 1000)) pq $((pn - 1000)) 0 wip old
-  AWB_VIEW=full pb render | grep -F "pq · " | grep -Fq "? pq · 读不到" || die "selftest: expired probe reading still shown"
-  pb task pw review pw p0 waiter --probe 'exit 1'
-  pev "$pn" pw "$pn" 0 review "CI pending 1/2"
-  printf '{"t":"start","time":"x","ep":%s,"id":"%s","name":"%s"}\n' $((pn - 2000)) waiter waiter \
-    $((pn - 2000)) idler idler >> "$pt/events.jsonl"
-  ps_=$(AWB_SILENT=600 pb snapshot | jq -r '.anomalies[] | select(.kind == "silent") | .text')
-  printf '%s' "$ps_" | grep -Fq idler || die "selftest: silent agent missing from anomalies"
-  ! printf '%s' "$ps_" | grep -Fq waiter || die "selftest: owner of a waiting probed task listed silent"
-  # built-in probes against stub gh/git
-  sb=$pt/bin; mkdir -p "$sb"
-  printf '#!/bin/sh\ncat "$STUB_GH"\n' > "$sb/gh"; printf '#!/bin/sh\nprintf "%%s\\trefs/pull/7/head\\n" "$STUB_REF"\n' > "$sb/git"
-  chmod +x "$sb/gh" "$sb/git"
-  printf '{"state":"OPEN","headRefOid":"aaa","mergeCommit":null,"statusCheckRollup":[%s,%s]}' \
-    '{"name":"lint","status":"COMPLETED","conclusion":"FAILURE"}' '{"name":"test","status":"COMPLETED","conclusion":"SUCCESS"}' > "$pt/gh"
-  [ "$(PATH=$sb:$PATH STUB_GH=$pt/gh STUB_REF=aaa "$BIN" probe pr 7)" = "blocked CI red: lint" ] \
-    || die "selftest: probe pr did not report the red check"
-  ! PATH=$sb:$PATH STUB_GH=$pt/gh STUB_REF=bbb "$BIN" probe pr 7 >/dev/null 2>&1 \
-    || die "selftest: probe pr accepted an API head that differs from the remote ref"
-  printf '{"state":"MERGED","headRefOid":"aaa","mergeCommit":{"oid":"1234567890"},"statusCheckRollup":[]}' > "$pt/gh"
-  [ "$(PATH=$sb:$PATH STUB_GH=$pt/gh STUB_REF=aaa "$BIN" probe pr 7)" = "done merged 12345678" ] \
-    || die "selftest: probe pr did not report the merge"
-  printf 'step 1/10\nnoise\nstep 4/10\n' > "$pt/log"
-  [ "$("$BIN" probe log "$pt/log" 'step ([0-9]+)/([0-9]+)')" = "wip 4/10 40%" ] || die "selftest: probe log n/total wrong"
-  echo 'step 10/10' >> "$pt/log"
-  [ "$("$BIN" probe log "$pt/log" 'step ([0-9]+)/([0-9]+)')" = "done 10/10" ] || die "selftest: probe log did not finish"
-  ! "$BIN" probe log "$pt/log" 'nomatch' >/dev/null 2>&1 || die "selftest: probe log without a match exited 0"
-  printf 'step 2/10\n' > "$pt/log2"; touch -t 202001010000 "$pt/log2"
-  "$BIN" probe log "$pt/log2" 'step ([0-9]+)/([0-9]+)' | grep -q "^blocked log silent" || die "selftest: silent log not blocked"
+  ! "$BIN" view --once | grep -Fq "无改动 " || die "selftest: fresh fingerprint shown frozen"
   "$BIN" skill | grep -q "awb check" || die "selftest: skill manual not found"
   if m=$(model_bin); then
-    "$BIN" audit | grep -q "^g1 done-while-check-rejected" || die "selftest: audit missed done after rejection"
+    "$BIN" view --json | jq -e 'any(.violations[]; .id == "g1" and .kind == "done-while-check-rejected")' >/dev/null \
+      || die "selftest: the board missed a done after a rejection (Lean audit)"
     # fixed differential case: unknown events with NO id (and unknown t with an
     # id that never started) interleaved with real ones must be ignored by both
     # folds -- this pins jq's `($e.id|type)!="string" or .agents[id]==null` arm
@@ -2690,7 +2215,7 @@ FT
       # every 4th log: the brief view's sections (awb snapshot) match Brief.sec, which is
       # proven to show every agent; each agent must appear in exactly one section
       if [ $((n % 4)) = 0 ]; then
-        a=$(AWB_DIR=$t/diff "$BIN" snapshot 2>"$t/diff/err" | jq -r '[(.agents[] | "\(.id) work"), (.idle[] | "\(.id) idle"),
+        a=$(AWB_DIR=$t/diff "$BIN" view --json 2>"$t/diff/err" | jq -r '[(.agents[] | "\(.id) work"), (.idle[] | "\(.id) idle"),
               (.need[] | select(.kind == "fail") | "\(.id) need")] | sort[]')
         b=$("$m" brief < "$t/diff/events.jsonl")
         [ "$a" = "$b" ] || { printf 'jq:\n%s\nlean:\n%s\n' "$a" "$b" >&2; die "selftest: brief sections != Lean Brief.sec (awbmodel gen $n 80)"; }
@@ -2749,13 +2274,13 @@ CHK
     tmux -S "$t/sock" new-session -d -s decoy -x 80 -y 24 "sleep 60"
     ep=$(tmux -L "${S}e" new-session -d -x 150 -y 60 -P -F '#{pane_id}' "sleep 60")
     es=$(tmux -L "${S}e" display-message -p '#{socket_path}')
-    rows=$(TMUX="$es,0,0" TMUX_PANE=$ep AWB_COLS= AWB_ROWS= AWB_VIEW=full "$BIN" render | wc -l | tr -d ' ')
+    rows=$(TMUX="$es,0,0" TMUX_PANE=$ep AWB_COLS= AWB_ROWS= dims | cut -d' ' -f2)
     tmux -S "$t/sock" kill-server 2>/dev/null; tmux -L "${S}e" kill-server 2>/dev/null
     [ "$rows" -gt 24 ] || die "selftest: board sized from the awb socket's pane, not its own ($rows rows)"
     # a board taller than its pane scrolls: G shows the last task and the hint, g j j moves 2 lines
     sb=$t/scroll; mkdir -p "$sb"
     i=1; while [ $i -le 30 ]; do AWB_DIR=$sb "$BIN" task "s$i" wip "scroll row $i" >/dev/null; i=$((i + 1)); done
-    tmux -L "${S}s" new-session -d -x 100 -y 12 "AWB_DIR=$sb AWB_COLS= AWB_ROWS= TMUX= '$BIN' watch"
+    tmux -L "${S}s" new-session -d -x 100 -y 12 "AWB_DIR=$sb AWB_COLS= AWB_ROWS= TMUX= '$BIN' view"
     cap() { sleep 1.5; tmux -L "${S}s" capture-pane -p; }
     top=$(cap); tmux -L "${S}s" send-keys G; end=$(cap); tmux -L "${S}s" send-keys g j j; two=$(cap)
     tmux -L "${S}s" send-keys q; sleep 1; alive=$(tmux -L "${S}s" ls 2>/dev/null || true)
@@ -2784,7 +2309,7 @@ CHK
     bsock=${bk% *}; bpane=${bk#* }
     TMUX=$bsock TMUX_PANE=$bpane AWB_DIR=$sb "$BIN" up >/dev/null
     TMUX=$bsock TMUX_PANE=$bpane AWB_DIR=$sb "$BIN" up | grep -q "already open" || die "selftest: a second awb up did not reuse the open board"
-    nb=$(tmux -L "${S}b" list-panes -a -F '#{pane_start_command}' | grep -c ' watch' || true)
+    nb=$(tmux -L "${S}b" list-panes -a -F '#{pane_start_command}' | grep -c ' view' || true)
     tmux -L "${S}b" kill-server 2>/dev/null || true
     [ "$nb" = 1 ] || die "selftest: awb up opened $nb boards for one .awb"
   fi
@@ -2875,13 +2400,13 @@ FAKE
     grep -q 'idempotency-key awb-' "$t/lark.log.first" || die "selftest: the topic was created without an idempotency key"
     # a board never linked (no lark.json) does not post itself, even with the group set
     nl=$t/unlinked; mkdir -p "$nl"; AWB_DIR=$nl "$BIN" goal "scratch" >/dev/null; : > "$t/lark.log"
-    AWB_DIR=$nl XDG_CONFIG_HOME=$t/xdg PATH=$fb:$PATH AWB_LARK_EVERY=1 AWB_INTERVAL=0.2 "$BIN" watch >/dev/null 2>&1 &
+    AWB_DIR=$nl XDG_CONFIG_HOME=$t/xdg PATH=$fb:$PATH AWB_LARK_EVERY=1 AWB_INTERVAL=0.2 "$BIN" view >/dev/null 2>&1 &
     wp=$!; sleep 2.5; kill $wp; wait $wp 2>/dev/null || true
     [ ! -s "$t/lark.log" ] && [ ! -e "$nl/lark.json" ] || die "selftest: an unlinked board posted itself to the Lark group"
     # the refresh itself: a running board (watch) patches the card on its own, again and
     # again, and each patch carries the board's latest state
     : > "$t/lark.log"
-    AWB_DIR=$lb XDG_CONFIG_HOME=$t/xdg PATH=$fb:$PATH AWB_LARK_EVERY=1 AWB_INTERVAL=0.2 "$BIN" watch >/dev/null 2>&1 &
+    AWB_DIR=$lb XDG_CONFIG_HOME=$t/xdg PATH=$fb:$PATH AWB_LARK_EVERY=1 AWB_INTERVAL=0.2 "$BIN" view >/dev/null 2>&1 &
     wp=$!
     i=0; until [ "$(grep -c 'messages patch' "$t/lark.log")" -ge 2 ]; do
       i=$((i + 1)); [ $i -lt 40 ] || { kill $wp; die "selftest: the board did not refresh its Lark card"; }; sleep 0.25; done
@@ -2926,20 +2451,12 @@ case "$cmd" in
       --arg id "$1" --arg name "${2:-$1}" --arg kind "${3:-agent}" --arg pane "" \
       --arg group "${4:-default}"
     ;;
-  task)     [ $# -ge 2 ] || die "usage: $PROG task ID STATE [TEXT] [PARENT] [OWNER] [--probe CMD]"
+  task)     [ $# -ge 2 ] || die "usage: $PROG task ID STATE [TEXT] [PARENT] [OWNER]"
             case $2 in todo|wip|review|blocked|done|drop|ask) ;; *) die "state: todo|wip|review|blocked|done|drop|ask" ;; esac
-            pcmd=; pdir=
-            if [ $# -ge 4 ] && eval "[ \"\${$(($# - 1))}\" = --probe ]"; then
-              eval "pcmd=\${$#}"; pdir=$PWD; _k=$(($# - 2)); _a=; _i=0
-              for _x; do _i=$((_i + 1)); [ $_i -le $_k ] && _a="$_a $(q "$_x")"; done
-              eval "set -- $_a"
-            fi
             [ -z "${4:-}" ] || { init_dir; [ -s "$EV" ] && grep -F "\"id\":\"$4\"" "$EV" | grep -qF '"t":"task"'; } \
               || die "no task $4 to be the parent of $1 (create it first: $PROG task $4 STATE TEXT)"
-            append '{t:"task",time:$time,ep:$ep,id:$id,state:$st,text:$text,parent:$par,owner:$own,probe:$pc,pdir:$pd}' \
-              --arg id "$1" --arg st "$2" --arg text "${3:-}" --arg par "${4:-}" --arg own "${5:-}" \
-              --arg pc "$pcmd" --arg pd "$pdir" ;;
-  probe)    probe "$@" ;;
+            append '{t:"task",time:$time,ep:$ep,id:$id,state:$st,text:$text,parent:$par,owner:$own}' \
+              --arg id "$1" --arg st "$2" --arg text "${3:-}" --arg par "${4:-}" --arg own "${5:-}" ;;
   nudge)    init_dir; if [ "${1:-}" = "--once" ]; then nudge_round
             else while :; do nudge_round; sleep "${AWB_NUDGE_POLL:-60}"; done; fi ;;
   news)     _nk=; if [ "${1:-}" = --key ]; then _nk=${2:-}; shift 2 || die "--key needs a key"; fi
@@ -3005,27 +2522,28 @@ case "$cmd" in
   reset)    init_dir   # the log is the only record: keep a copy, then clear in place (watch keeps its file)
             _b=$EV.$(date +%s).bak; [ -s "$EV" ] && { cp "$EV" "$_b"; echo "cleared; the old log is $_b"; }
             : > "$EV" ;;
-  render)   init_dir; render ;;
   replay)   replay "$@" ;;
-  _view)    # a snapshot on stdin, drawn as the brief view: awb view [COLS ROWS]. Probed, a width
+  _view)    # a snapshot on stdin, drawn as the board: awb _view [COLS ROWS]. Probed, a width
             # under 40 is a pane of another server or a worker's sliver, not where this output goes
             printf '%s %s' "${1:-}" "${2:-}" | grep -Eq '^[0-9]+ [0-9]+$' || { set -- $(dims); [ "${1:-0}" -ge 40 ] || set -- 80 "${2:-24}"; }
             brief_view "$1" "$2" ;;
-  snapshot) init_dir; ( AWB_VIEW=snapshot AWB_COLS=100 AWB_ROWS=200; export AWB_VIEW AWB_COLS AWB_ROWS; render ) ;;
-  watch)    init_dir; watch ;;
+  view|watch|render|snapshot)   # the board live / drawn once / as JSON; old names kept
+            case "$cmd ${1:-}" in
+              "view --once"|render*) init_dir; render ;;
+              "view --json"|snapshot*) snapshot ;;
+              "view "|watch*) init_dir; watch ;;
+              *) die "usage: $PROG view [--once | --json]" ;;
+            esac ;;
   _enter)   _enter ;;
   _leave)   _leave "${1:-0}" ;;
   check)    check "$@" ;;
   pr)       pr "$@" ;;
-  merge)    merge "$@" ;;
   hold)     hold "$@" ;;
   release)  release "$@" ;;
-  holder)   [ $# -ge 1 ] || die "usage: $PROG holder RES"; holder "$1" ;;
   send)     send "$@" ;;
   reply)    reply "$@" ;;
   idle)     idle "$@" ;;
   _state)   state ;;   # the jq fold per agent, for the differential test against the Lean model
-  audit)    audit ;;
   version|--version|-V) echo "$PROG $VERSION" ;;
   skill)    skill ;;
   tell)     tell "$@" ;;

@@ -3,7 +3,7 @@ defaultTargets = ["AwbModel", "awbmodel"]
 
 [[lean_lib]]
 name = "AwbModel"
-roots = ["AwbModel", "Audit", "Brief", "Probe"]
+roots = ["AwbModel", "Audit", "Brief"]
 
 [[lean_exe]]
 name = "awbmodel"
