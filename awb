@@ -268,7 +268,7 @@ JQ_RENDER=$JQ_FOLD$JQ_DEFS'
       # left the main agent (SendMessage is its step, outside awb)
       elif $x.status == "idle" and (.value.key // null) != null and $x.since <= (.value.keyEp // 0)
            and ($nowep - (.value.keyEp // $nowep)) >= $undeliv then
-        .value.sess = "任务 #" + .value.key + " 派出 " + (($nowep - .value.keyEp) | sdur) + " 仍没开始：消息可能没发出"
+        .value.sess = "任务 #" + .value.key + " 派出 " + (($nowep - .value.keyEp) | ago) + "仍没开始：消息可能没发出"
       # only an agent that claims work (a milestone or a sent task open): a worker idle
       # between tasks, or started and waiting for its first, is not a contradiction
       elif $x.status == "idle" and .value.status == "running" and .value.current != null and ($nowep - $x.since) >= $silent then
@@ -362,17 +362,19 @@ JQ_RENDER=$JQ_FOLD$JQ_DEFS'
    else ($Gf.title | clip($inner - 6)) as $tt
      | "╭─ " + $tt + " " + ("─" * ([$inner - 5 - ($tt | dwidth), 2] | max)) end) as $top
 | (if $s.goal == "" then [] else [$Gf.about[] | wrap($inner - 4)[]] end) as $goal_lines
-# total progress counts the same roots as the brief view: a fully-done root untouched for an
-# hour is folded away and excluded (the full footer used to keep it, so the two totals differed)
+# the live roots of the task tree, for both views: a fully-done root untouched for an hour is
+# folded away (counted in tasks_old) and left out of the total progress
 | ([ kids($s.tasks; $s.torder; "")[] as $root
      | leaves($s.tasks; $s.torder; $root) as $lv | prog($s.tasks; $lv) as $rp
      | ([$root, $lv[]] | map($tep[.] // 0) | max) as $last
-     | select($rp.d < $rp.t or ($nowep - $last) < 3600) | $root ]) as $froots
+     | {id:$root, old:($rp.t > 0 and $rp.d == $rp.t and ($nowep - $last) >= 3600)} ]) as $roots
+| ([$roots[] | select(.old | not) | .id]) as $lroots
+| ([$roots[] | select(.old)] | length) as $nold
 | ("╰─ " +
     (if $n == 0 then "no agents yet:  " + $prog + " run id name -- claude"
      else ([$s.agents[] | .done | length] | add // 0) as $md
        | ([$s.agents[] | select(live)] | length) as $mo
-       | prog($s.tasks; [$froots[] | leaves($s.tasks; $s.torder; .)[]]) as $tp
+       | prog($s.tasks; [$lroots[] | leaves($s.tasks; $s.torder; .)[]]) as $tp
        | (if $tp.t > 0 then "总进度 " + bar($tp.d; $tp.t; 20) + " \($tp.d)/\($tp.t) 任务 · " else "" end)
          + "里程碑 \($md)/\($md + $mo) · "
          + "\($n) agents ◔\($c.running // 0) ▲\($c.blocked // 0) ✓\($c.done // 0) ✗\($c.failed // 0) ■\($c.dead // 0)"
@@ -489,12 +491,6 @@ else
   # the view is cut at the pane height. The same data, as JSON, is the snapshot view
   # (awb snapshot) that awb-lark turns into a card.
   ([$inner, 100] | min) as $bw
-  | ([ kids($s.tasks; $s.torder; "")[] as $root
-       | leaves($s.tasks; $s.torder; $root) as $lv | prog($s.tasks; $lv) as $rp
-       | ([$root, $lv[]] | map($tep[.] // 0) | max) as $last
-       | {id:$root, old:($rp.t > 0 and $rp.d == $rp.t and ($nowep - $last) >= 3600)} ]) as $roots
-  | ([$roots[] | select(.old | not) | .id]) as $lroots
-  | ([$roots[] | select(.old)] | length) as $nold
   | prog($s.tasks; [$lroots[] | leaves($s.tasks; $s.torder; .)[]]) as $tp
   | ($nowep - 3600) as $h1
   | ([$s.agents[].done[]? | .text // ""]) as $mdone
