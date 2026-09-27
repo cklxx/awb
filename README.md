@@ -60,11 +60,14 @@ minutes), against 4 tasks sent with `awb send`.
 - Agents report with the same `awb` CLI. The main agent changes content by appending
   events and changes presentation by editing `awb` itself.
 - The main agent's messaging is also observed, without its help: each board round reads the
-  new lines of every live Claude session's transcript (`~/.claude/projects/*/SESSION.jsonl`,
-  read-only) and records a SendMessage to, or a peer message from, one of this board's agents
-  as a `msg` event: time, direction, agent, the observing session and the `[awb ID#KEY]` key,
-  never the text. A reply with an open task's key closes the task as `awb reply` would. The
-  transcript format is Claude Code's own and unversioned; `AWB_OBSERVE=0` turns this off.
+  new lines of the Claude transcripts of this board's agents only
+  (`~/.claude/projects/*/SESSION.jsonl`, read-only). A message an agent received from a session
+  that is not on the board is "out" (queued, delivered mid-turn or at idle: counted once), its
+  own SendMessage to such a session is "in". Each is a `msg` event: time, direction, agent,
+  the other session, the `[awb ID#KEY]` key and a message id, never the text. A new transcript
+  is read from its last 24 hours. A reply with an open task's key closes the task as
+  `awb reply` would. The transcript format is Claude Code's own and unversioned;
+  `AWB_OBSERVE=0` turns this off.
 - An agent's own `done` is a claim. `awb check` runs a check the main agent chose; only a
   passing check marks the milestone verified (`⊢`), and a rejected check blocks `done`
   until a later check passes.
