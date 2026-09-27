@@ -5,7 +5,7 @@
 # agent process output.
 set -eu
 
-VERSION=0.0.8
+VERSION=0.0.9
 PROG=$(basename "$0")
 AWB_DIR=${AWB_DIR:-$PWD/.awb}
 # awb exports its tmux socket into the panes it opens, with the board it belongs to
