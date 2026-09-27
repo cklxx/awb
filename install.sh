@@ -18,11 +18,11 @@ else
   done
   rm -f "$skill/SKILL.md"; curl -fsSL "$url/SKILL.md" -o "$skill/SKILL.md"
 fi
-# optional: the compiled Lean model enables `awb audit` and the differential selftest
+# optional: the compiled Lean model enables the board's audit and the differential selftest
 if [ -f "$here/model/lakefile.toml" ]; then
   lake=$(command -v lake || echo "$HOME/.elan/bin/lake")
-  if [ -x "$lake" ]; then (cd "$here/model" && "$lake" build -q) && echo "built Lean model: awb audit enabled"
-  else echo "no Lean (elan): awb audit disabled"; fi
+  if [ -x "$lake" ]; then (cd "$here/model" && "$lake" build -q) && echo "built Lean model: board audit enabled"
+  else echo "no Lean (elan): board audit disabled"; fi
 fi
 # optional: with lark-cli (bot identity), each board mirrors into its own topic of one
 # Lark topic group. AWB_LARK_CHAT=oc_xxx sets it; otherwise ask when a terminal is attached.

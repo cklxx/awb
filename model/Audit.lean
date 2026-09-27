@@ -5,7 +5,7 @@ Audit of one agent's event trace against the acceptance protocol.
 
 * `violAt pre o` states the rules for one event `o` given everything before it.
 * `Clean tr`: no event of `tr` breaks a rule relative to its own prefix (the spec).
-* `audit` is the one-pass monitor `awb audit` runs; `audit_iff_clean` proves it
+* `audit` is the one-pass monitor the board runs (`awbmodel audit`); `audit_iff_clean` proves it
   reports nothing exactly when the trace is `Clean`.
 -/
 

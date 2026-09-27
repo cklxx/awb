@@ -31,7 +31,7 @@ setup() {
   echo "awb boards will post to $1"
 }
 
-# the card, from `awb snapshot` (the same data as the board's brief view)
+# the card, from `awb view --json` (the same data as the board's brief view)
 card() {
   jq -c --arg board "$1" --arg path "$2" '
   def clip($n): if length > $n then .[:$n - 1] + "…" else . end;
@@ -48,7 +48,7 @@ card() {
     columns:[{tag:"column", width:"weighted", weight:1, padding:"8px 10px", elements:[{tag:"markdown", content:$md}]}]};
   . as $s
   | ($s.need | map(select(.kind == "fail")) | length) as $nfail
-  | {"done":"✓","wip":"◔","review":"◑","blocked":"▲","todo":"○","unknown":"?"} as $TI
+  | {"done":"✓","wip":"◔","review":"◑","blocked":"▲","todo":"○"} as $TI
   | {schema:"2.0",
      config:{update_multi:true, width_mode:"fill", summary:{content:$s.headline}},
      header:{
@@ -146,7 +146,7 @@ sync() {
     rm -rf "$lk"; ln -s "$$" "$lk" 2>/dev/null || return 0
   fi
   trap 'rm -f "$AWB_DIR/lock-lark"' EXIT INT TERM
-  snap=$("$AWB" snapshot)
+  snap=$("$AWB" view --json)
   # topic title: the project directory for ./.awb, else the board directory's own name
   proj=$(basename "$AWB_DIR"); [ "$proj" != .awb ] || proj=$(basename "$(dirname "$AWB_DIR")")
   body=$(printf '%s' "$snap" | card "$proj" "$AWB_DIR")

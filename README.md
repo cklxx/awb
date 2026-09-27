@@ -8,19 +8,13 @@ an acceptance gate that decides when a milestone counts as done.
 The name is also the logo: `a` and `b` are the two lenses of a pair of glasses and `w` is
 the `ω` mouth, as in (・ω・). It watches your agents.
 
-![awb board](docs/board.png)
-
-The board above (`AWB_VIEW=full`, demo data) shows the task tree, the acceptance runs with
-each step, and per-group agents with their milestones; `⊢` marks a milestone that passed
-`awb check`; the full view tags an unverified finished milestone with a dim `自报`.
-
-The brief view (default) is for the person who owns the goal. A line belongs on it only if
+The board is for the person who owns the goal. A line belongs on it only if
 it is a decision that person has to make, or a change in how far the goal is; each fact
 appears once. Coordination between agents (who holds a resource, who waits for whom) shows
 only when it breaks, as a 需要你 or 异常 line. Every addition to the view is held to this.
 
-Both the brief view and the Lark card are drawn from `awb snapshot` and nothing else
-(`awb snapshot | awb _view` draws the same board), in one layout, most important first,
+The board and the Lark card are both drawn from the snapshot, `awb view --json`, and nothing
+else (`awb view --json | awb _view` draws the same board), in one layout, most important first,
 since the view is cut at the pane height:
 
 1. Title: the goal's first line. Its other lines say what the goal is (definition, scope).
@@ -48,7 +42,8 @@ On team-board's log (1847 events): 29 sent, 10 replies (median 9 minutes), 11 cl
 `finish`, 5 lost.
 7. News (the last 3; lines with one `--key` are one fact, the latest shows), the task tree
    without the steps already under 下一步 (folded on the card), acceptance runs. Agents show
-   only in 需要你 and 异常; `AWB_VIEW=full` lists every agent.
+   only in 需要你 and 异常; `awb peers` lists every agent, and the snapshot has each one's
+   current work.
 
 ## Model
 
@@ -141,18 +136,16 @@ awb metric tps 32 40 "V100 target"      # brief: one value/target bar under GOAL
 
 # acceptance
 awb check a1 -- pytest -q ~/accept/test_a1.py       # any command, exit 0 = accepted
-awb check a1 --lean proj ~/accept/ACCEPT.lean       # Lean 4: build, no sorry, theorems typecheck
+awb check a1 -- model/accept.sh proj ACCEPT.lean    # Lean 4: build, no sorry, theorems typecheck
                                                     # with standard axioms only
 awb pr a1 -- pytest -q ~/accept/test_a1.py          # runs the acceptance, then opens the PR
-awb merge 42 --watch                                # merge once the newest verdict on the head approves
-                                                    # and the required checks ran green
-awb hold gpu0 a1 "bench"; awb release gpu0          # one holder per shared resource
-awb render                                          # one-shot render, works outside tmux
+awb hold gpu0 a1 "bench"; awb release gpu0          # one holder per shared resource; awb hold lists
+awb view --once                                     # the board drawn once, works outside tmux
 awb reset                                           # clear all events
 awb down                                            # kill the session
 ```
 
-Board knobs: `AWB_VIEW=brief|full` (default brief), `AWB_STALE=SECS` lists agents silent
+Board knobs: `AWB_STALE=SECS` lists agents silent
 that long are nudged (default 600), `AWB_INTERVAL` refresh seconds (default 1), `AWB_METRIC_STALE=SECS` shows the latest reading's
 age and drops the time-to-target estimate once that reading is older (default 21600; the
 estimate itself counts from the latest reading), `AWB_TASK_STALE=SECS` tags an open task root
@@ -202,7 +195,7 @@ the group.
 - A linked board syncs by itself once a minute while `awb up` runs
   (`AWB_LARK_EVERY`); `awb-lark sync` does it by hand, `--dry-run` prints the card JSON.
 - The mapping is `$AWB_DIR/lark.json` (chat, root message), so it follows the
-  board. The card is built from `awb snapshot`, the same data as the brief view.
+  board. The card is built from `awb view --json`, the same data as the board.
 
 ## Notify agents
 
@@ -259,22 +252,6 @@ non-git directories are skipped.
   `ID PANE` per line (an optional third column overrides the working directory used for
   change detection); it overrides panes from start events.
 
-## Probes
-
-A task can read its state from an artifact instead of a self-report (design and proofs:
-[docs/probe.md](docs/probe.md)):
-
-```sh
-awb task t7 wip "merge #671" "" "" --probe 'awb probe pr 671'
-awb task t1 wip "train" "" de --probe 'awb probe log runs/x.log "step ([0-9]+)/([0-9]+)"'
-awb probe run                                         # loop: run due probes, log readings
-```
-
-A probe prints `STATE text` and exits 0; anything else is a failed read and the task shows
-`?` (unknown). A reading shows its age and expires after `AWB_PROBE_FRESH` seconds (default
-600); `done` and `drop` do not expire. An owner of a probed task that is fresh `wip` or
-`review` is not listed as stale.
-
 ## Contributing and releases
 
 Changes land by PR. Fix on a branch, then gate and open the PR with awb itself:
@@ -298,15 +275,13 @@ proven model:
 |---|---|---|
 | status fold (events → agent state) | proven: duration frozen iff ended, no `done` while a check is rejected, only known states, non-negative durations | `model/AwbModel.lean` |
 | jq fold in `awb` = Lean fold | differential test on random logs (`awb selftest`, 200 logs; 1000 run clean) | `awb _state` vs `awbmodel fold` |
-| brief view / Lark card (events → sections) | proven: every agent is in one snapshot section, an agent with a rejected check is never idle, and one that stopped after a rejected check is always drawn under 需要你; the jq snapshot is differentially tested against it (every 4th random log) | `model/Brief.lean` vs `awb snapshot` |
+| board / Lark card (events → sections) | proven: every agent is in one snapshot section, an agent with a rejected check is never idle, and one that stopped after a rejected check is always drawn under 需要你; the jq snapshot is differentially tested against it (every 4th random log) | `model/Brief.lean` vs `awb view --json` |
 | protocol audit | proven: the one-pass monitor reports nothing iff every event obeys the rules given its prefix (`audit_iff_clean`); corollary: every PR in a clean log followed a passing check | `model/Audit.lean` |
-| deliverables | `awb check` (tests, or Lean with kernel-checked theorems and standard axioms only) | `awb check` |
-| merge | `awb pr ID -- CMD` runs the acceptance itself and opens the PR only on that pass (a pass read from the log could be forged, check events and all), refuses with audit violations, and logs the PR for the audit; `awb merge` merges only on an approve of the current head (newest verdict wins, whole-line match) with the required checks green, pinned by `--match-head-commit` | `awb pr`, `awb merge` |
+| deliverables | `awb check ID -- CMD` (tests; for Lean, `model/accept.sh`: kernel-checked theorems, standard axioms only) | `awb check` |
+| PR | `awb pr ID -- CMD` runs the acceptance itself and opens the PR only on that pass (a pass read from the log could be forged, check events and all), refuses with audit violations, and logs the PR for the audit | `awb pr` |
 | dispatch/report loop (main ↔ worker) | TLA+ with liveness: no false done, every task ends replied or blocked, also when the worker's session holds messages or the worker crashes and is restarted (7,110 states). `AwbLoopStage.cfg` and `AwbLoopRestart.cfg` reproduce the 0.0.8 bugs: a worker's own stage report closed its task, a restarted worker's lost task stayed open. Until 0.0.9 `AwbLoopFixed.cfg` stopped on a TLC error (a tuple compared with a string) and never checked its liveness | `model/tla/AwbLoop.tla` |
 | tell vs a permission dialog | TLA+: a dialog the registry reported before a keystroke is never typed into (registry re-read before the paste and every Enter); `AwbWaitRace.cfg` shows the window no check closes | `model/tla/AwbWait.tla` |
 | Lark sync (ticks, manual syncs, crashes vs one topic) | TLA+: one topic per board and the card never goes back to an older state; `AwbLarkOld*.cfg` reproduce two topics and a regressed card from breaking the lock by age | `model/tla/AwbLark.tla` |
-| probe fold (readings → task state) | proven: the accepted reading is the newest parsed one, a failed read changes nothing, `done` shows only from a done reading, expired readings show unknown; jq = Lean by the same differential test | `model/Probe.lean` |
-| probe timing (late, failed, foreign readings) | TLA+: `AwbProbeOld.cfg` shows false done, stale values, older-over-newer and waiting-as-stale; `AwbProbeFixed.cfg` passes with liveness | `model/tla/AwbProbe.tla` |
 | concurrency (check, pr, tell vs the agent) | TLA+, model-checked with TLC: `*Old.cfg` reproduces the races of 0.0.5, `*Fixed.cfg` passes | `model/tla/` |
 
 Races TLC found in 0.0.5, now fixed and covered by selftest: a check that passed after the
@@ -322,15 +297,15 @@ now forgets the lock. `model/tla/tlc.sh` runs TLC on every config (`TLA2TOOLS` =
 
 Audit rules, per agent: a verified milestone must follow a passing check (forged `verified`
 events are caught), a PR must follow a passing check, and `done` must not be claimed while a
-check is rejected. Violations show on the board under 审计违规 and via `awb audit`.
+check is rejected. Violations show on the board under 审计违规.
 
 `model/Main.lean` compiles the proven fold and monitor into `awbmodel`, which `awb` finds at
 `model/.lake/build/bin/awbmodel` (or `AWB_MODEL`); `./install.sh` in a clone builds it when
-Lean is installed. Without it, `awb audit` is unavailable and selftest skips the
-differential test. Proofs are checked with:
+Lean is installed. Without it, the board has no audit and selftest skips the differential
+test. Proofs are checked with:
 
 ```sh
-awb check model --lean model model/Accept.lean
+awb check model -- model/accept.sh model model/Accept.lean
 ```
 
 Where the log could be written by an agent, the gate does not read it: `awb pr` runs the
