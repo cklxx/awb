@@ -1429,7 +1429,8 @@ silent_min() {
 # every agent, one line: ID PANE SESSION STATUS [#KEY] [silent MINm]. SESSION is the Claude
 # session a main Claude agent messages with SendMessage(to: SESSION), - if none; STATUS is
 # busy|idle|waiting|shell, not-claude, gone, or - for an agent without a pane; #KEY its open
-# task (awb send); silent when running with no report for AWB_STALE seconds. It answers, in
+# task (awb send); silent when running with no report for AWB_STALE seconds and no Claude
+# session (a live session reports itself, the board's rule too). It answers, in
 # one command, what the main agent needs after a restart (it replaced stale and pending).
 peers() {
   init_dir
@@ -1443,7 +1444,8 @@ peers() {
       else l=$(printf '%s' "$_s" | jq -r --arg i "$id" --arg p "$pane" \
                '.[$i] | if . then "\($i) \($p) \(.name) \(.status)" else "\($i) \($p) - not-claude" end'); fi
       k=$(printf '%s\n' "$_k" | awk -v i="$id" '$1 == i {print $2}'); [ -z "$k" ] || l="$l #$k"
-      m=$(printf '%s\n' "$_q" | awk -v i="$id" '$1 == i {print $2}'); [ -z "$m" ] || l="$l silent ${m}m"
+      m=$(printf '%s\n' "$_q" | awk -v i="$id" '$1 == i {print $2}')
+      [ -z "$m" ] || [ "$(printf '%s' "$l" | cut -d' ' -f3)" != - ] || l="$l silent ${m}m"
       echo "$l"
     done
 }
@@ -2221,6 +2223,8 @@ FT
       i=$((i + 1)); [ $i -lt 40 ] || { kill $wp; die "selftest: an open board did not nudge a silent agent"; }; sleep 0.25; done
     kill $wp; wait $wp 2>/dev/null || true
     tmux -L "$S" send-keys -t "$zp" C-u; tmux -L "$S" send-keys -t "$zp" clear Enter
+    "$BIN" now z1 "quiet"
+    ! AWB_STALE=0 ht peers | grep '^z1 ' | grep -q silent || die "selftest: an agent with a Claude session listed silent"
     "$BIN" finish z1
     [ "$(ht peers | grep '^z1 ')" = "z1 $zp zz-1 idle" ] || die "selftest: peers lost the session"
     # a pane given as session:window.pane in .awb/panes resolves to the same session
