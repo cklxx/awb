@@ -200,12 +200,20 @@ def live: .current != null and (.status == "running" or .status == "blocked");
 def lpad($n):
   . as $s | (" " * ($n - (($s|length) | if . < 0 then 0 elif . > $n then $n else . end))) + $s;
 def wrap($n):
+  # CJK (no spaces) wraps per character; when the current line has a space, an overflow wraps at
+  # its last space so a Latin word is not split across lines
   if length == 0 then [""]
   else (reduce (explode[]) as $c ({lines:[[]], w:0};
           cw($c) as $cw
-          | if .w + $cw > $n then .lines += [[$c]] | .w = $cw
-            else .lines[-1] += [$c] | .w += $cw end)
-        | [.lines[] | implode])
+          | if .w + $cw <= $n then .lines[-1] += [$c] | .w += $cw
+            elif ([ range(.lines[-1] | length) as $i | select(.lines[-1][$i] == " ") | $i ] | last) != null then
+                ([ range(.lines[-1] | length) as $i | select(.lines[-1][$i] == " ") | $i ] | last) as $sp
+                | (.lines[-1][$sp + 1:] + [$c]) as $next
+                | .lines[-1] = .lines[-1][:$sp]
+                | .lines += [$next]
+                | .w = ($next | map(cw(.)) | add // 0)
+            else .lines += [[$c]] | .w = $cw end)
+        | [.lines[] | implode | rtrimstr(" ")])
   end;
 '
 
@@ -260,7 +268,7 @@ JQ_RENDER=$JQ_FOLD$JQ_DEFS'
       # left the main agent (SendMessage is its step, outside awb)
       elif $x.status == "idle" and (.value.key // null) != null and $x.since <= (.value.keyEp // 0)
            and ($nowep - (.value.keyEp // $nowep)) >= $undeliv then
-        .value.sess = "任务 #" + .value.key + " 派出 " + (($nowep - .value.keyEp) | sdur) + " 仍没开始：消息可能没发出"
+        .value.sess = "任务 #" + .value.key + " 派出 " + (($nowep - .value.keyEp) | ago) + "仍没开始：消息可能没发出"
       # only an agent that claims work (a milestone or a sent task open): a worker idle
       # between tasks, or started and waiting for its first, is not a contradiction
       elif $x.status == "idle" and .value.status == "running" and .value.current != null and ($nowep - $x.since) >= $silent then
@@ -336,23 +344,37 @@ JQ_RENDER=$JQ_FOLD$JQ_DEFS'
      ([ $s.tasks[] | select(.probe != null and (.state | IN("wip","review"))) | .owner ] as $pw
       | $act[] | if .flag != "" then {kind:"flag", text:"\(.name) \(.flag)"}
                elif .status == "running" and .silent and .live == null and ((.id | IN($pw[])) | not)
-               then {kind:"silent", text:"\(.name) \(.idle | sdur) 没有更新"} else empty end),
+               then {kind:"silent", text:"\(.name) \(.idle | ago)没有更新"} else empty end),
      # a held resource whose holder has not worked for AWB_STALE: the rest queue behind it
      ($holds[] | . as $hd | ($s.agents[$hd.owner] // null) as $a | ($sess[$hd.owner] // null) as $x
       | (if $x != null then (if $x.status == "busy" then 0 else $nowep - $x.since end)
          elif $a != null then $nowep - $a.lastEp else 0 end) as $q
       | select($q >= ($stale | tonumber))
-      | {kind:"hold", text:"\($hd.res) 被 \(($a.name) // $hd.owner) 占着 \(($nowep - $hd.since) | sdur)，它 \($q | sdur) 没在干活"}),
+      | {kind:"hold", text:"\($hd.res) 被 \(($a.name) // $hd.owner) 占着 \((($nowep - $hd.since) | ago))，它 \($q | ago)没在干活"}),
      (if $quiet >= $silent and $nrun > 0
       then {kind:"board", text:"看板 \($quiet | ago)没有新事件，主控可能停了"} else empty end) ]) as $anom
 | (if $s.goal == "" then "(no goal yet:  " + $prog + " goal \"ship it\")" else $s.goal end) as $goal
-| (($goal | gsub("\r";"") | split("\n") | map(wrap($inner - 4)) | add)) as $goal_lines
-| ("╭─ GOAL " + ("─" * ($inner - 8))) as $top
+# the box head shows the goal title, like the brief view (it used to be a GOAL placeholder);
+# the remaining goal lines stay inside the box
+| (($s.goal | gsub("\r";"") | split("\n")) as $gl
+   | {title:($gl[0] // ""), about:($gl[1:] | map(select(. != "")))}) as $Gf
+| (if $Gf.title == "" then "╭" + ("─" * ($inner - 2)) + "╮"
+   else ($Gf.title | clip($inner - 6)) as $tt
+     | "╭─ " + $tt + " " + ("─" * ([$inner - 5 - ($tt | dwidth), 2] | max)) end) as $top
+| (if $s.goal == "" then [] else [$Gf.about[] | wrap($inner - 4)[]] end) as $goal_lines
+# the live roots of the task tree, for both views: a fully-done root untouched for an hour is
+# folded away (counted in tasks_old) and left out of the total progress
+| ([ kids($s.tasks; $s.torder; "")[] as $root
+     | leaves($s.tasks; $s.torder; $root) as $lv | prog($s.tasks; $lv) as $rp
+     | ([$root, $lv[]] | map($tep[.] // 0) | max) as $last
+     | {id:$root, old:($rp.t > 0 and $rp.d == $rp.t and ($nowep - $last) >= 3600)} ]) as $roots
+| ([$roots[] | select(.old | not) | .id]) as $lroots
+| ([$roots[] | select(.old)] | length) as $nold
 | ("╰─ " +
     (if $n == 0 then "no agents yet:  " + $prog + " run id name -- claude"
      else ([$s.agents[] | .done | length] | add // 0) as $md
        | ([$s.agents[] | select(live)] | length) as $mo
-       | prog($s.tasks; leaves($s.tasks; $s.torder; "")) as $tp
+       | prog($s.tasks; [$lroots[] | leaves($s.tasks; $s.torder; .)[]]) as $tp
        | (if $tp.t > 0 then "总进度 " + bar($tp.d; $tp.t; 20) + " \($tp.d)/\($tp.t) 任务 · " else "" end)
          + "里程碑 \($md)/\($md + $mo) · "
          + "\($n) agents ◔\($c.running // 0) ▲\($c.blocked // 0) ✓\($c.done // 0) ✗\($c.failed // 0) ■\($c.dead // 0)"
@@ -365,7 +387,9 @@ JQ_RENDER=$JQ_FOLD$JQ_DEFS'
           else ["⊢",$g] end) as $ov
        | ([$ss[] | (.ep1 // $nowep) - .ep0] | add // 0) as $el
        | ([ $ss[] | ({"ok":"✓","fail":"✗","run":"◔"}[.state] // "·") as $i
-            | .s + " " + $i + (if .state == "run" then " " + (($nowep - .ep0) | sdur) else "" end) ]
+            # a single running step already shows its time as the row total; only multi-step
+            # checks time each running step in the chain
+            | .s + " " + $i + (if .state == "run" and ($ss | length) > 1 then " " + (($nowep - .ep0) | sdur) else "" end) ]
           | join(" → ")) as $chain
        | ([$ss[] | select(.state == "fail") | .note] | first // "") as $why
        | "  " + $ov[1] + $ov[0] + $rs + " " + ((($s.agents[.id].name) // .id) | clip(10) | pad(10)) + " "
@@ -425,7 +449,7 @@ JQ_RENDER=$JQ_FOLD$JQ_DEFS'
       | ($nowep - $a.lastEp) as $idle
       | ((($a.done|length) | tostring) + " ✓") as $cnt
       | ((if $idle >= 600 and ($a.status == "running" or $a.status == "blocked")
-            then "  " + ($idle | sdur) + " 无更新" else "" end)) as $stale
+            then "  " + ($idle | ago) + " 无更新" else "" end)) as $stale
       | (($br + $st[0] + " " + ($a.name | clip(12) | pad(12)) + " " + $st[2] + "  " + $cnt + $stale)
          | clip($inner - 9) | pad($inner - 9)) as $hd
       | ([ (if ($a.done | length) > 3 then {k:"more", n:(($a.done|length) - 3)} else empty end) ]
@@ -467,12 +491,6 @@ else
   # the view is cut at the pane height. The same data, as JSON, is the snapshot view
   # (awb snapshot) that awb-lark turns into a card.
   ([$inner, 100] | min) as $bw
-  | ([ kids($s.tasks; $s.torder; "")[] as $root
-       | leaves($s.tasks; $s.torder; $root) as $lv | prog($s.tasks; $lv) as $rp
-       | ([$root, $lv[]] | map($tep[.] // 0) | max) as $last
-       | {id:$root, old:($rp.t > 0 and $rp.d == $rp.t and ($nowep - $last) >= 3600)} ]) as $roots
-  | ([$roots[] | select(.old | not) | .id]) as $lroots
-  | ([$roots[] | select(.old)] | length) as $nold
   | prog($s.tasks; [$lroots[] | leaves($s.tasks; $s.torder; .)[]]) as $tp
   | ($nowep - 3600) as $h1
   | ([$s.agents[].done[]? | .text // ""]) as $mdone
@@ -525,7 +543,11 @@ else
      verified:([$day[] | select(.t == "done" and .verified == true)] | length),
      metric:(if $M == null or ($M.history | length) < 2 or $M.value == null then null
              else (([$M.history[] | select(.ep < $d1)] | last | .value) // $M.history[0].value) as $vd
-               | ($M.value - $vd) end)} as $D
+               | ($M.value - $vd) end),
+     # when the first reading is newer than 24h ago the delta spans less than a day; name the
+     # real span (the footer/lark tile otherwise imply a full 24-hour window)
+     mspan:(if $M == null or ($M.history | length) < 2 then null
+            else ($nowep - ([$M.history[].ep] | min)) as $sp | (if $sp < 86400 then $sp else null end) end)} as $D
   # the next open steps of the main line: open children of the live roots, and a root handed to
   # a worker (awb send without --under); work in flight (wip) first, with its owner
   | ([ $trees[] | if (.kids | length) == 0 then (select(.owner != "") | {id, text, state, owner, prog:null}) else .kids[] end
@@ -547,9 +569,10 @@ else
         elif $M.value >= $M.target then "\($M.name) 已达标"
         elif $M.late then "\($M.name) 按当前趋势截止前达不到"
         elif $D.metric == null then empty
-        elif $D.metric > 0 then "\($M.name) 24 小时在涨"
-        elif $D.metric < 0 then "\($M.name) 24 小时在降"
-        else "\($M.name) 24 小时没变" end),
+        else (if $D.mspan != null then "近 \($D.mspan | ago)" else "24 小时" end) as $win
+          | if $D.metric > 0 then "\($M.name) \($win)在涨"
+            elif $D.metric < 0 then "\($M.name) \($win)在降"
+            else "\($M.name) \($win)没变" end end),
        (if ($anom | length) > 0 then "异常 \($anom | length)" else empty end) ] | join(" · ")) as $headline
   | [ {goal:$s.goal, title:$G.title, about:$G.about, headline:$headline, quiet:$quiet,
        now:$nowep, clock:$now, progress:$tp, hour:{done:finished($raw; $h1)}, day:$D,
@@ -610,7 +633,8 @@ JQ_BRIEF=$JQ_DEFS'
     elif $S.running > 0 then $y + "近 1 小时无新完成" + $rs
     else $dm + "近 1 小时无变化" + $rs end)
    + $dm + " · 24 小时 完成 +\($D.done)"
-   + (if $D.metric != null then " \($M.name) " + (if $D.metric >= 0 then "+" else "" end) + ($D.metric * 100 | round / 100 | tostring) else "" end)
+   + (if $D.metric != null then " \($M.name) " + (if $D.metric >= 0 then "+" else "" end) + ($D.metric * 100 | round / 100 | tostring)
+        + (if $D.mspan != null then "/" + ($D.mspan | ago) else "" end) else "" end)
    + " · 已核 \($S.verified.v)/\($S.verified.n)" + $rs) as $move0
 | (($move0 | gsub("\u001b\\[[0-9;]*m"; "") | dwidth) as $mw
    | if $mw <= ($bw - 3) then $move0 else ($move0 | gsub("\u001b\\[[0-9;]*m"; "") | clip($bw - 3)) end) as $move
@@ -644,7 +668,7 @@ JQ_BRIEF=$JQ_DEFS'
       + [ $cks[] | .steps as $ss
           | (if .fail then ["✗",$r] elif any($ss[]; .state == "run") then ["◔",$cy] else ["⊢",$g] end) as $ov
           | ([ $ss[] | ({"ok":"✓","fail":"✗","run":"◔"}[.state] // "·") as $i
-               | .s + " " + $i + (if .state == "run" then " " + (.el | sdur) else "" end) ]
+               | .s + " " + $i + (if .state == "run" and ($ss | length) > 1 then " " + (.el | sdur) else "" end) ]
              | join(" → ")) as $chain
           | ([$ss[] | select(.state == "fail") | .note] | first // "") as $why
           | ("  " + $ov[1] + $ov[0] + $rs + " " + (.name | clip(10) | pad(10)) + " "
@@ -2178,6 +2202,54 @@ EOF
   AWB_DIR=$wh "$BIN" snapshot 2>/dev/null | env -u AWB_COLS -u AWB_ROWS TMUX=/nonexistent,0,0 TMUX_PANE=%1 "$BIN" _view 2>/dev/null | stripansi > "$t/vfb"
   [ "$(wmax < "$t/vfb")" -gt 10 ] && [ "$(wmax < "$t/vfb")" -le 80 ] \
     || die "selftest: awb view with an unreachable pane did not fall back to 80 columns"
+
+  # follow-up fixes (rest-w3)
+  # 1. ages in anomalies use the ago form, never an hms clock
+  ag=$t/ages; mkdir -p "$ag"; nnow=$(date +%s)
+  printf '{"t":"start","id":"a1","name":"a1","ep":%s}\n{"t":"now","id":"a1","text":"x","ep":%s}\n' $((nnow-12000)) $((nnow-12000)) >> "$ag/events.jsonl"
+  AWB_DIR=$ag "$BIN" snapshot | jq -e '.anomalies | length > 0
+    and all(.text | test("[0-9]+小时") and (test("[0-9]+:[0-9][0-9]:[0-9][0-9]") | not))' >/dev/null \
+    || die "selftest: anomaly age is not in ago form: $(AWB_DIR=$ag "$BIN" snapshot | jq -c '.anomalies[].text')"
+  ! grep -Eq '\) / 10\) 天|floor\) 小时|floor\) 分钟' "$(dirname "$BIN")/awb-lark" \
+    || die "selftest: awb-lark ago keeps a space before the unit"
+  # 6. a single running step shows its time once (the row total already shows it)
+  c1=$t/onecheck; mkdir -p "$c1"; cp0=$(date +%s)
+  printf '{"t":"start","id":"c1","name":"c1","ep":%s}\n{"t":"now","id":"c1","text":"m","ep":%s}\n' "$cp0" "$cp0" >> "$c1/events.jsonl"
+  printf '{"t":"chk","ep":%s,"id":"c1","run":"r1","what":"w","step":"only-step","state":"run","note":""}\n' "$cp0" >> "$c1/events.jsonl"
+  for v in brief full; do
+    line=$(AWB_DIR=$c1 AWB_VIEW=$v AWB_COLS=120 "$BIN" render | stripansi | grep 'only-step')
+    n=$(printf '%s\n' "$line" | grep -oE '([0-9]+:[0-9][0-9](:[0-9][0-9])?)|[0-9]+s' | wc -l | tr -d ' ')
+    [ "$n" = "1" ] || die "selftest: the single running step shows its timer $n times in $v"
+  done
+  # 2. full-view total progress excludes old fully-done roots, matching brief
+  p2=$t/prog; mkdir -p "$p2"; pn=$(date +%s)
+  AWB_DIR=$p2 "$BIN" start g1 g1 >/dev/null; AWB_DIR=$p2 "$BIN" now g1 work >/dev/null
+  i=1; while [ $i -le 10 ]; do printf '{"t":"task","ep":%s,"id":"p%s","state":"done","text":"t%s","parent":"","owner":""}\n' $((pn-7200)) "$i" "$i" >> "$p2/events.jsonl"; i=$((i+1)); done
+  printf '{"t":"task","ep":%s,"id":"po","state":"wip","text":"open","parent":"","owner":""}\n' "$pn" >> "$p2/events.jsonl"
+  AWB_DIR=$p2 AWB_VIEW=full AWB_COLS=120 "$BIN" render | stripansi | grep -Fq '总进度' \
+    && AWB_DIR=$p2 AWB_VIEW=full AWB_COLS=120 "$BIN" render | stripansi | grep -Eq '0/1 任务' \
+    || die "selftest: full total progress counts old fully-done roots"
+  # 3. wrap breaks Latin text at a space, not inside a word
+  printf '%s' "ab cd" | jq -Rn -c "$WDEF"'[input | wrap(5)[]]' | grep -Fxq '["ab cd"]' \
+    || die "selftest: wrap broke a word that fit"
+  printf '%s' "abcdef ghijkl" | jq -Rn -c "$WDEF"'[input | wrap(7)[]]' | jq -e '. == ["abcdef","ghijkl"]' >/dev/null \
+    || die "selftest: wrap split a Latin word mid-token: $(printf '%s' 'abcdef ghijkl' | jq -Rn -c "$WDEF"'[input | wrap(7)[]]')"
+  # 4. the full-view box head shows the goal title, not the GOAL placeholder
+  AWB_DIR=$p2 "$BIN" goal "TITLE-XYZ" >/dev/null
+  AWB_DIR=$p2 AWB_VIEW=full AWB_COLS=120 "$BIN" render | stripansi | sed -n '1p' | grep -Fq "TITLE-XYZ" \
+    || die "selftest: the full view box head does not show the goal title"
+  # 5. a metric delta whose first reading is under 24h old names the real span
+  m5=$t/span; mkdir -p "$m5"; mn=$(date +%s)
+  AWB_DIR=$m5 "$BIN" goal G >/dev/null
+  AWB_DIR=$m5 "$BIN" metric --at $((mn - 39600)) m 1 10 >/dev/null
+  AWB_DIR=$m5 "$BIN" metric m 2 10 >/dev/null
+  AWB_DIR=$m5 "$BIN" snapshot | jq -e '.day.mspan >= 36000 and .day.mspan <= 40000' >/dev/null \
+    || die "selftest: the sub-24h metric span is not recorded"
+  AWB_DIR=$m5 AWB_COLS=120 "$BIN" render | stripansi | grep -Fq "+1/11小时" \
+    || die "selftest: the footer does not name the metric delta span"
+  AWB_DIR=$m5 AWB="$BIN" "$(dirname "$BIN")/awb-lark" sync --dry-run \
+    | jq -e '[.body.elements[]|select(.tag=="column_set")|..|.content? // empty]|any(test("\\+1/11小时"))' >/dev/null \
+    || die "selftest: the card does not name the metric delta span"
 
   # single metric indicator under GOAL, render-only (the "#" id keeps it out
   # of the proven fold; `awb _state` below proves no agent is created).

@@ -35,8 +35,8 @@ setup() {
 card() {
   jq -c --arg board "$1" --arg path "$2" '
   def clip($n): if length > $n then .[:$n - 1] + "…" else . end;
-  def ago: if . >= 86400 then "\((. / 8640 | floor) / 10) 天" elif . >= 3600 then "\(. / 3600 | floor) 小时"
-    else "\(. / 60 | floor) 分钟" end;
+  def ago: if . >= 86400 then "\((. / 8640 | floor) / 10)天" elif . >= 3600 then "\(. / 3600 | floor)小时"
+    else "\(. / 60 | floor)分钟" end;
   def hms: if . < 3600 then "\(. / 60 | floor) 分" else "\(. / 3600 | floor) 时 \((. % 3600) / 60 | floor) 分" end;
   def grey: "<font color=\"grey\">" + . + "</font>";
   def tile($label; $value; $sub):
@@ -82,7 +82,8 @@ card() {
               else [tile("任务"; "\($s.progress.d) / \($s.progress.t)"; "")] end)
              + [tile("24 小时"; "完成 +\($s.day.done)";
                      "已核 \($s.day.verified)"
-                     + (if $s.day.metric then " · \($s.metric.name) \(if $s.day.metric >= 0 then "+" else "" end)\($s.day.metric * 100 | round / 100)" else "" end))])}]
+                     + (if $s.day.metric then " · \($s.metric.name) \(if $s.day.metric >= 0 then "+" else "" end)\($s.day.metric * 100 | round / 100)"
+                           + (if $s.day.mspan then "/" + ($s.day.mspan | ago) else "" end) else "" end))])}]
        # the chart: the metric, and by step each reference series (metric --ref) beside it; a
        # reference makes one reading enough. Two readings at the same t (a manual current
        # reading on top of an hourly probe) collapse to the newest, so the line shows one point
