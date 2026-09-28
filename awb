@@ -5,7 +5,7 @@
 # agent process output.
 set -eu
 
-VERSION=0.0.11
+VERSION=0.0.12
 PROG=$(basename "$0")
 AWB_SET=${AWB_DIR:+1}   # empty: the board is ./.awb by default, which must already exist
 AWB_DIR=${AWB_DIR:-$PWD/.awb}
