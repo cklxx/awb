@@ -130,6 +130,9 @@ replay, down/reset). Details worth knowing:
 
 - `awb check ID -- CMD`: exit 0 verifies the worker's latest work (`⊢`); else ✗ with the reason,
   the log in `.awb/check-ID.log`, and the worker is told (`AWB_NOTIFY=0` turns that off).
+  A pipe, `tail` or `ssh` can lose the real exit status: add `--expect REGEX` (jq regex) and a
+  line of the output must match too, e.g. `--expect '^=+ [0-9]+ passed in'` for pytest
+  (a summary with "failed" does not match). `awb pr ID --expect REGEX ... -- CMD` passes it on.
 - `awb merge PR`: only on an approve of the current head (a review, or a comment whose first
   line names the head sha and matches `AWB_APPROVE_RE`) with `AWB_MIN_CHECKS` checks named by
   `AWB_REQUIRE_CHECKS` green.

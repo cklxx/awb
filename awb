@@ -108,7 +108,8 @@ reduce (. // [])[] as $e (
       else lose($e.id) | .agents[$e.id].key = $e.key | .agents[$e.id].keyEp = ($e.ep // 0)
         | (if .tasks[$e.key] == null then .torder += [$e.key] else . end)
         # a planned task sent as it is (awb send ID TASKID) keeps its text and parent
-        | .tasks[$e.key] = ((.tasks[$e.key] // {text:($e.text // ""), parent:""})
+        | .tasks[$e.key] = (((.tasks[$e.key] | select(. != null and (.state | IN("done","drop") | not)))
+                               // {text:($e.text // ""), parent:""})
             + {id:$e.key, state:"wip", owner:$e.id} + (if ($e.parent // "") == "" then {} else {parent:$e.parent} end))
       end
   elif $e.t == "done" then
@@ -1251,7 +1252,11 @@ send() {
     | .tasks[$t] // empty | select(.state | IN("done","drop") | not) | .text' || true)
   if [ -n "$_pt" ]; then
     k=$1; shift; [ $# -gt 0 ] || set -- "$_pt"
-  else k=$(date +%s | tail -c 5)$(printf %02d $(( $$ % 100 ))); fi
+  else
+    # a fresh key names no task or key on the board yet (time and pid digits can repeat)
+    _b=$(date +%s | tail -c 5)$(printf %02d $(( $$ % 100 ))); k=$_b; _i=0
+    while grep -qE "\"(id|key)\":\"$k\"" "$EV" 2>/dev/null && [ $_i -lt 100 ]; do _i=$((_i + 1)); k=$_b$_i; done
+  fi
   append '{t:"now",time:$time,ep:$ep,id:$id,text:$x,key:$k} + (if $p == "" then {} else {parent:$p} end)' \
     --arg id "$id" --arg x "$*" --arg k "$k" --arg p "$_par"
   printf '[awb %s#%s] %s\n做完后回复一行：以 [awb %s#%s] 开头，写结果（做不了也照此格式说明原因）。\n' "$id" "$k" "$*" "$id" "$k"
@@ -1282,18 +1287,20 @@ idle() {
 # open a PR for an agent's work from the current git checkout, only when the agent's
 # latest `awb check` passed; the body lists its milestones and that check's steps
 pr() {
-  _u="usage: $PROG pr ID [gh pr create args...] -- CMD..."
+  _u="usage: $PROG pr ID [--expect REGEX] [gh pr create args...] -- CMD..."
   [ $# -ge 1 ] || die "$_u"
   id=$1; shift; need_agent "$id"
-  _gh=; _acc=
+  _gh=; _acc=; _pexp=
   while [ $# -gt 0 ]; do
     if [ "$1" = -- ]; then shift; _acc=1; break; fi
+    if [ "$1" = --expect ] && [ $# -ge 2 ]; then _pexp=$2; shift 2; continue; fi
     _gh="$_gh $(q "$1")"; shift
   done
   [ -n "$_acc" ] && [ $# -ge 1 ] || die "$_u (the acceptance runs here, then the PR)"
   # the acceptance runs in this process: a passing check read from the log could have been
   # written there by the agent, check events and all
-  "$BIN" check "$id" -- "$@" || die "acceptance failed: no PR"
+  if [ -n "$_pexp" ]; then "$BIN" check "$id" --expect "$_pexp" -- "$@" || die "acceptance failed: no PR"
+  else "$BIN" check "$id" -- "$@" || die "acceptance failed: no PR"; fi
   eval "set -- $_gh"
   lock "gate-$id"     # no check of this agent can interleave between the gate and the PR
   info=$({ [ -s "$EV" ] && cat "$EV" || true; } | jq -R -s --arg id "$id" '
@@ -1610,8 +1617,12 @@ stage() {
 
 # acceptance gate: the check the main agent chose decides done, not the agent's claim
 check() {
-  [ $# -ge 3 ] && [ "$2" = -- ] || die "usage: $PROG check ID -- CMD...  (a Lean 4 gate: -- model/accept.sh DIR [ACCEPT.lean])"
-  id=$1; shift 2; need_agent "$id"
+  _u="usage: $PROG check ID [--expect REGEX] -- CMD...  (a Lean 4 gate: -- model/accept.sh DIR [ACCEPT.lean])"
+  [ $# -ge 1 ] || die "$_u"
+  id=$1; shift; _exp=
+  if [ "${1:-}" = --expect ]; then [ $# -ge 2 ] || die "$_u"; _exp=$2; shift 2; fi
+  [ $# -ge 2 ] && [ "$1" = -- ] || die "$_u"
+  shift; need_agent "$id"
   what=$*; set -- stage cmd "$@"
   init_dir
   lock "gate-$id"     # one check or pr per agent at a time (model/tla/AwbCheck.tla)
@@ -1619,6 +1630,13 @@ check() {
   CHK_ID=$id CHK_RUN=$(date +%s)$$ CHK_WHAT=$what CHK_LOG=$AWB_DIR/check-$id.log
   export CHK_ID CHK_RUN CHK_WHAT CHK_LOG
   rc=0; "$@" >"$CHK_LOG" 2>&1 || rc=$?
+  # exit 0 alone is weak: a pipe, tail or remote shell can drop the real status (Meshy: zsh on
+  # the far side had no PIPESTATUS, and "3 failed, 4 passed" exited 0). With --expect a line
+  # of the output must match too; a bad regex rejects
+  if [ "$rc" = 0 ] && [ -n "$_exp" ] \
+     && ! jq -Rne --arg re "$_exp" 'any(inputs; test($re))' <"$CHK_LOG" >/dev/null 2>&1; then
+    rc=98; echo "expect: no output line matches $_exp" >> "$CHK_LOG"
+  fi
   # a pass verifies the milestone it started on; if the agent moved on meanwhile, it is stale
   if [ "$rc" = 0 ] && [ "$(open_ms "$id")" != "$ms" ]; then
     rc=97; echo "stale: milestone changed during the check (was: ${ms#* }); re-run the check" >> "$CHK_LOG"
@@ -1682,6 +1700,7 @@ One unit of work, the task. You talk to one Claude (the main agent); it keeps th
                                     (ask = a decision for the owner); re-issue to update
   $PROG block ID REASON / unblock ID  the worker waits on something (#N: a PR or an issue) / not any more
   $PROG check ID -- CMD...          acceptance: CMD exit 0 verifies the worker's work (⊢), else ✗
+  $PROG check ID --expect RE -- CMD  also a line of the output must match RE (jq regex)
                                     (Lean 4: -- model/accept.sh DIR [ACCEPT.lean])
   $PROG pr ID [gh args...] -- CMD...  run the acceptance here, then push and open a PR on a pass
   $PROG merge PR [--watch]          merge only when the newest verdict on the current head approves
@@ -1878,6 +1897,10 @@ selftest() {
       and ([.. | objects | select(.text? == "s2")] | length) == 0' >/dev/null \
     || die "selftest: a planned task sent by its id is not that task: $(sn view --json | jq -c '{tasks, next}')"
   sn reply d1 s2 "done B" >/dev/null || die "selftest: the reply to a planned task was refused"
+  # a sent task whose key repeats a dropped one is a new task, not the dropped one revived
+  printf '{"t":"task","ep":1,"id":"k9","state":"drop","text":"old lost","parent":"","owner":"d1"}\n{"t":"now","ep":2,"id":"d1","text":"fresh","key":"k9"}\n' >> "$sd/events.jsonl"
+  sn view --json | jq -e '[.. | objects | select(.text? == "old lost")] == [] and [.next[].text] == ["reviewer：fresh"]' >/dev/null \
+    || die "selftest: a repeated key revived a dropped task: $(sn view --json | jq -c '{tasks, next}')"
   # news: lines with one key are one fact, the latest shows; lines without a key all show
   bd4=$t/brief4; mkdir -p "$bd4"; nb() { AWB_DIR=$bd4 "$BIN" news "$@"; }
   nb "no key"; nb --key val@15000 "feed: val 1.888"; nb "other"; nb --key val@15000 "val 1.888, grad ok"; nb --key ck "saved"
@@ -2127,7 +2150,12 @@ EOF
   "$BIN" now a1 "gated"
   ! "$BIN" check a1 -- false >/dev/null || die "selftest: failing check accepted"
   "$BIN" _state | grep -q '^a1 failed true ' || die "selftest: rejected check not failed"
-  "$BIN" check a1 -- true >/dev/null || die "selftest: passing check rejected"
+  # --expect: exit 0 whose output does not match is rejected, with the reason in the log
+  ! "$BIN" check a1 --expect '^[0-9]+ passed' -- sh -c 'echo "== 3 failed, 4 passed =="' >/dev/null \
+    || die "selftest: a check whose output missed --expect accepted"
+  tail -1 "$AWB_DIR/check-a1.log" | grep -Fq 'expect: no output line matches' || die "selftest: --expect miss not in the log"
+  ! "$BIN" check a1 --expect '(' -- true >/dev/null || die "selftest: a bad --expect regex accepted"
+  "$BIN" check a1 --expect '^[0-9]+ passed' -- sh -c 'echo "7 passed"' >/dev/null || die "selftest: passing check rejected"
   "$BIN" view --json | jq -e '.verified == {v:1, n:2}' >/dev/null || die "selftest: verified milestone not counted"
   ! "$BIN" pr a2 2>/dev/null || die "selftest: pr opened without an acceptance command"
   # a pass forged in the log does not open a PR: pr runs the acceptance itself
