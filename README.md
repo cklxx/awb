@@ -121,6 +121,8 @@ done, and a task lost; the keyed protocol passes both "done only for done work" 
 task ends done or blocked", with a worker that crashes and is restarted. The skill (`awb skill`) spells out this protocol.
 `tui` waits for the worker to register with Claude before typing anything; it never answers
 the folder-trust prompt, it asks you to. Several boards: one `.awb` per project, or `AWB_DIR`.
+Without `AWB_DIR` a command needs `./.awb` (only `awb up` makes one); every write says on
+stderr which board it went to.
 
 ## Use
 
@@ -140,7 +142,8 @@ awb reply w1 <key> "handlers merged"         # its reply closes it with the resu
 awb block w1 "等 #42"; awb unblock w1        # waiting on a PR or issue / not any more
 awb fail  w1 "exited"                        # its open task is lost; restart and send again
 
-# agents in a pane report themselves (never while a sent task is open)
+# agents in a pane report themselves (now/done never while a sent task is open;
+# finish ends the agent and closes such a task with no result)
 awb now a1 "event log"; awb done a1; awb finish a1 "shipped"
 
 # progress feed

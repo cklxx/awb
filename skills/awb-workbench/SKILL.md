@@ -72,6 +72,8 @@ stopped with a tool call printed as text (`AWB_STUCK_RE`) to re-issue it.
 
 Several boards: one `.awb` per project directory, or `AWB_DIR`. A worker's pane inherits its
 board's `AWB_DIR`; a worker that experiments with awb sets its own `AWB_DIR` on every command.
+Without `AWB_DIR` a command needs `./.awb` (only `awb up` makes one), and every write prints
+`awb: recorded in <board>` on stderr: check it names the board you meant.
 
 If `awb-lark` is set up (`awb-lark where` prints the group), a board the user wants in the
 Lark topic group is linked once with `awb-lark sync` in its directory; from then on it syncs
