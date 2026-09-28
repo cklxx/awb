@@ -65,8 +65,9 @@ minutes), against 4 tasks sent with `awb send`.
   that is not on the board is "out" (queued, delivered mid-turn or at idle: counted once), its
   own SendMessage to such a session is "in". Each is a `msg` event: time, direction, agent,
   the other session, the `[awb ID#KEY]` key and a message id, never the text. A new transcript
-  is read from its last 24 hours. A reply with an open task's key closes the task as
-  `awb reply` would. The transcript format is Claude Code's own and unversioned;
+  is read from its last 24 hours. A reply with an open task's key does not close the task,
+  since a progress report carries the key too; when the agent's session then sits idle for
+  `AWB_REPLY_IDLE`, the board shows an anomaly until the main agent runs `awb reply`. The transcript format is Claude Code's own and unversioned;
   `AWB_OBSERVE=0` turns this off.
 - An agent's own `done` is a claim. `awb check` runs a check the main agent chose; only a
   passing check marks the milestone verified (`⊢`), and a rejected check blocks `done`
@@ -138,6 +139,7 @@ awb tui -g main w1 helper                # resident interactive claude TUI; comm
 awb task api todo "build API"                # STATE todo|wip|review|blocked|done|drop|ask
 awb task auth todo "auth" api                # [TEXT] [PARENT] [OWNER]; re-issue to update
 awb send --under api w1 "write the handlers" # a task for w1 under api; prints the message
+awb send w2 auth                             # the planned task auth, sent as it is (key: auth)
 awb reply w1 <key> "handlers merged"         # its reply closes it with the result
 awb block w1 "等 #42"; awb unblock w1        # waiting on a PR or issue / not any more
 awb fail  w1 "exited"                        # its open task is lost; restart and send again

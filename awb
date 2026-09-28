@@ -107,7 +107,9 @@ reduce (. // [])[] as $e (
     | if ($e.key // "") == "" then .
       else lose($e.id) | .agents[$e.id].key = $e.key | .agents[$e.id].keyEp = ($e.ep // 0)
         | (if .tasks[$e.key] == null then .torder += [$e.key] else . end)
-        | .tasks[$e.key] = {id:$e.key, state:"wip", text:($e.text // ""), parent:($e.parent // ""), owner:$e.id}
+        # a planned task sent as it is (awb send ID TASKID) keeps its text and parent
+        | .tasks[$e.key] = ((.tasks[$e.key] // {text:($e.text // ""), parent:""})
+            + {id:$e.key, state:"wip", owner:$e.id} + (if ($e.parent // "") == "" then {} else {parent:$e.parent} end))
       end
   elif $e.t == "done" then
     (.agents[$e.id]) as $a | ($e.ep // $a.lastEp) as $ep
@@ -346,6 +348,13 @@ JQ_SNAP=$JQ_FOLD$JQ_DEFS'
       | select($x != null and $x.status == "idle" and (($s.agents[$k.id].sess // "") == "")
                and $nowep - ([$k.wait, $x.since] | max) >= $replyidle and $nowep - $k.wait < 86400)
       | {kind:"noreply", text:"\($k.name) 空闲 \(($nowep - $x.since) | ago)，主控 \(($nowep - $k.wait) | ago)前的消息还没回"}),
+     # an observed reply with the key of the open task, then an idle session: done, or a progress
+     # report; only the main agent tells which, so the task stays open until awb reply
+     ($s.agents[] | select(.key != null) | . as $a | ($sess[$a.id] // null) as $x
+      | ([$raw[] | select(type == "object" and .t == "msg" and .dir == "in" and .id == $a.id
+                          and .key == $a.key and (.ep // 0) >= ($a.keyEp // 0)) | .ep // 0] | max) as $r
+      | select($r != null and $x != null and $x.status == "idle" and $nowep - ([$r, $x.since] | max) >= $replyidle)
+      | {kind:"replied", text:"\($a.name) 回复了 #\($a.key)（\(($nowep - $r) | ago)前）后空闲；做完了就 awb reply \($a.id) \($a.key)"}),
      (if $quiet >= $silent and $nrun > 0
       then {kind:"board", text:"看板 \($quiet | ago)没有新事件，主控可能停了"} else empty end),
      # a caller (a script, often with stderr thrown away) ran a command awb does not have: in the
@@ -813,7 +822,7 @@ nudge_round() {
 # a peer message an agent received from a session that is not one of this board's agents is
 # "out" (the main agent to it), its own SendMessage to such a session is "in" (its reply). Only
 # metadata is kept: time, direction, agent, the other session, the [awb ID#KEY] key and the
-# message id; a reply with an open task's key closes it, as awb reply would. Each transcript is
+# message id; a reply with an open task's key does not close it (awb reply does). Each transcript is
 # read from where the last round stopped ($AWB_DIR/obs: "OFFSET PATH"); a new or rewound one
 # from the last 24 hours of its last 50 MB. A message id already on the board is not recorded
 # again. AWB_OBSERVE=0 turns it off.
@@ -844,7 +853,7 @@ observe_once() {
     head -c "$n" "$_c" | jq -Rc --argjson ag "$_ag" --argjson reg "$_reg" --arg id "$id" --argjson since "$_since" '
       fromjson? | select(type == "object") | (.timestamp // "") as $ts
       | ($ts | sub("\\.[0-9]+Z$"; "Z") | fromdate? // empty) as $ep | select($ep >= $since)
-      | def key: (capture("^\\[awb [^#\\]]+#(?<k>[0-9]+)\\]").k // "");
+      | def key: (capture("^\\[awb [^#\\]]+#(?<k>[^\\]]+)\\]").k // "");
         def name($p): first($reg[] | select(.pid == $p) | .name) // "";
         def ev($d; $n; $k; $m): select($ag[$n] == null)
           | {t:"msg", time:($ep | strflocaltime("%H:%M:%S")), ep:$ep, id:$id, dir:$d, via:$n, mid:$m}
@@ -877,11 +886,9 @@ observe_once() {
           | map({key:., value:true}) | from_entries')" \
       '[.[] | select(.mid == "" or ($seen[.mid] | not))] | (map(select(.mid == "")) + (map(select(.mid != "")) | unique_by(.mid)))
        | sort_by(.ep)[]' "$_new" > "$_new.u"
+    # a keyed reply is only recorded: a progress report carries the key too (Meshy, 2026-09-28:
+    # "[awb env#K] 进度：…安装中" closed the task), so the main agent closes it with awb reply
     cat "$_new.u" >> "$EV"
-    jq -r 'select(.dir == "in" and (.key // "") != "") | "\(.id) \(.key)"' "$_new.u" | while read -r id k; do
-      [ "$(open_key "$id")" != "$k" ] \
-        || append '{t:"done",time:$time,ep:$ep,id:$id,text:null,key:$k,observed:true}' --arg id "$id" --arg k "$k"
-    done
   fi
   rm -f "$_new" "$_new.u"; unlock obs
 }
@@ -1235,10 +1242,15 @@ self_report() {
 }
 send() {
   _par=; if [ "${1:-}" = --under ]; then _par=${2:-}; shift 2 || die "--under needs a task id"; fi
-  [ $# -ge 2 ] || die "usage: $PROG send [--under PARENT] ID TASK   (prints the message to SendMessage)"
+  [ $# -ge 2 ] || die "usage: $PROG send [--under PARENT] ID TASK|TASKID [TEXT]   (prints the message to SendMessage)"
   id=$1; shift; need_agent "$id"
   k=$(open_key "$id"); [ -z "$k" ] || die "$id already has open task #$k; wait for its reply (or: $PROG idle $id)"
-  k=$(date +%s | tail -c 5)$(printf %02d $(( $$ % 100 )))
+  # a planned task (awb task T1 todo ...) not yet done or sent is sent as it is: its id is the key
+  _pt=$(events_json | jq -r --arg t "$1" "$JQ_FOLD"' fold | select(all(.agents[]; .key != $t))
+    | .tasks[$t] // empty | select(.state | IN("done","drop") | not) | .text' || true)
+  if [ -n "$_pt" ]; then
+    k=$1; shift; [ $# -gt 0 ] || set -- "$_pt"
+  else k=$(date +%s | tail -c 5)$(printf %02d $(( $$ % 100 ))); fi
   append '{t:"now",time:$time,ep:$ep,id:$id,text:$x,key:$k} + (if $p == "" then {} else {parent:$p} end)' \
     --arg id "$id" --arg x "$*" --arg k "$k" --arg p "$_par"
   printf '[awb %s#%s] %s\n做完后回复一行：以 [awb %s#%s] 开头，写结果（做不了也照此格式说明原因）。\n' "$id" "$k" "$*" "$id" "$k"
@@ -1660,6 +1672,7 @@ One unit of work, the task. You talk to one Claude (the main agent); it keeps th
   $PROG send [--under PARENT] ID TASK
                                     a task for worker ID, a node of the task tree; prints the
                                     message: SendMessage(to: <session>, message: it, notify_when_idle: true)
+  $PROG send ID TASKID [TEXT]       the planned task TASKID, sent as it is (its id is the key)
   $PROG reply ID KEY [RESULT]       the reply "[awb ID#KEY] ..." closes the task, with its result
   $PROG idle ID                     on an idle notice: prints an ask once, then marks the task blocked
   $PROG fail ID REASON              the worker exited: its open task is lost; tui restarts it, send again
@@ -1856,6 +1869,14 @@ selftest() {
   sn task line todo "main line" >/dev/null; sn send --under line d1 "step A" >/dev/null
   sn view --json | jq -e '[.tasks[] | select(.text == "main line") | .d, .t] == [0, 1] and [.next[].text] == ["reviewer：step A"]' >/dev/null \
     || die "selftest: a task sent under a parent is not a step of its line: $(sn view --json | jq -c '{tasks, next}')"
+  # a planned task sent by its id is that task: its id is the key, its text and parent stay
+  sn reply d1 "$(sn peers | sed -n 's/.*#\([0-9]*\).*/\1/p')" "ok" >/dev/null
+  sn task s2 todo "step B" line >/dev/null
+  [ "$(sn send d1 s2 2>/dev/null | head -1)" = "[awb d1#s2] step B" ] || die "selftest: a planned task was not sent by its id"
+  sn view --json | jq -e '[.next[].text] == ["reviewer：step B"] and (.tasks[] | select(.id == "line") | .t) == 2
+      and ([.. | objects | select(.text? == "s2")] | length) == 0' >/dev/null \
+    || die "selftest: a planned task sent by its id is not that task: $(sn view --json | jq -c '{tasks, next}')"
+  sn reply d1 s2 "done B" >/dev/null || die "selftest: the reply to a planned task was refused"
   # news: lines with one key are one fact, the latest shows; lines without a key all show
   bd4=$t/brief4; mkdir -p "$bd4"; nb() { AWB_DIR=$bd4 "$BIN" news "$@"; }
   nb "no key"; nb --key val@15000 "feed: val 1.888"; nb "other"; nb --key val@15000 "val 1.888, grad ok"; nb --key ck "saved"
@@ -2408,7 +2429,8 @@ FT
     ht _observe
     [ "$(jq -sc '[.[] | select(.t == "msg") | .id + " " + .dir]' "$EV")" = '["z1 out","z1 out","z1 in","z1 out","z1 in"]' ] \
       || die "selftest: observed messages: $(jq -sc '[.[] | select(.t == "msg") | .id + " " + .dir]' "$EV")"
-    [ -z "$(open_key z1)" ] || die "selftest: an observed keyed reply did not close the task"
+    # a keyed reply may be a progress report: it is recorded and the task stays open
+    [ "$(open_key z1)" = "$ok_" ] || die "selftest: an observed keyed reply closed the task"
     echo >> "$tr_"; ht _observe; ht _observe
     [ "$(grep -F '"t":"msg"' "$EV" | grep -cF '"dir":"out"')" = 4 ] || die "selftest: a line finished later was read not once"
     rm "$t/obs"; ht _observe
@@ -2423,15 +2445,20 @@ FT
     SID=s-zz reg idle "" 700
     ht view --json | jq -e 'any(.anomalies[]; .kind == "noreply") and (.talk[] | select(.id == "z1") | .to_agent == 5 and .from_agent == 2)' >/dev/null \
       || die "selftest: no-reply not on the board: $(ht view --json | jq -c '{a:.anomalies, t:.talk}')"
-    SID=s-zz reg busy; ! ht view --json | jq -e 'any(.anomalies[]; .kind == "noreply")' >/dev/null || die "selftest: a busy session flagged as not replying"
+    SID=s-zz reg busy; ! ht view --json | jq -e 'any(.anomalies[]; .kind == "noreply" or .kind == "replied")' >/dev/null || die "selftest: a busy session flagged as not replying"
     # an open board observes with its nudges off too (AWB_NUDGE=0 is the selftest's setting)
-    SID=s-zz reg idle; out_ "$(date +%s)" main-x "late reply" >> "$tr_"
+    SID=s-zz reg idle; out_ "$(date +%s)" main-x "[awb z1#$ok_] late reply" >> "$tr_"
     HOME=$t/home AWB_NUDGE_POLL=1 AWB_INTERVAL=0.2 "$BIN" view >/dev/null 2>&1 &
     wp=$!; i=0
     until [ "$(grep -F '"t":"msg"' "$EV" | grep -cF '"dir":"in"')" = 3 ]; do
       i=$((i + 1)); [ $i -lt 40 ] || { kill $wp; die "selftest: a board with AWB_NUDGE=0 did not observe"; }; sleep 0.25; done
     kill $wp; wait $wp 2>/dev/null || true
     ht view --json | jq -e '.observe.files >= 1 and .observe.last > 0' >/dev/null || die "selftest: the last observation round not in the snapshot"
+    # a keyed reply after the send, then an idle session: shown until the main agent records it
+    AWB_REPLY_IDLE=0 ht view --json | jq -e --arg k "$ok_" 'any(.anomalies[]; .kind == "replied" and (.text | contains("awb reply z1 " + $k)))' >/dev/null \
+      || die "selftest: a keyed reply left open with the session idle is not on the board: $(AWB_REPLY_IDLE=0 ht view --json | jq -c '.anomalies')"
+    "$BIN" reply z1 "$ok_" done >/dev/null
+    ! AWB_REPLY_IDLE=0 ht view --json | jq -e 'any(.anomalies[]; .kind == "replied")' >/dev/null || die "selftest: a recorded reply still shown"
     reg idle
     rm -f "$t/home/.claude/sessions/2.json"
     # a pane given as session:window.pane in .awb/panes resolves to the same session
