@@ -784,7 +784,8 @@ freeze_once() {
     printf '%s %s %s\n' "$id" "$h" "$ep" >> "$tmp"
     age=$((now - ep))
     if [ "$age" -lt "$frz" ]; then continue; fi
-    last=$(awk -v i="$id" '$1 == i {print $2; exit}' "$nf" 2>/dev/null || true)
+    # the file gains a line per reminder: the last one counts (the first let every round remind)
+    last=$(awk -v i="$id" '$1 == i {l = $2} END {print l}' "$nf" 2>/dev/null || true)
     if [ $((now - ${last:-0})) -lt "$every" ]; then continue; fi
     mins=$((age / 60))
     # tell() dies on a dead pane; a per-agent poll must not abort the whole
@@ -2496,6 +2497,10 @@ FT
     sleep 0.6
     tmux -L "$S" capture-pane -p -t "$pl" | grep -Fq "没有代码改动" \
       || die "selftest: live frozen agent not reminded past a dead pane"
+    # the throttle reads the latest reminder: an older line must not let the next round remind
+    { echo "zl $(($(date +%s) - 5000))"; cat "$fz/fnudged"; } > "$fz/fn.x" && mv "$fz/fn.x" "$fz/fnudged"
+    AWB_DIR=$fz AWB_TMUX_SOCKET=$fsock AWB_FROZEN=0 "$BIN" nudge --once
+    [ "$(grep -c '^zl ' "$fz/fnudged")" = 2 ] || die "selftest: a frozen agent reminded again within AWB_NUDGE_EVERY: $(cat "$fz/fnudged")"
   fi
   "$BIN" start zf frozen; "$BIN" now zf "idle"
   "$BIN" start zfb blk; "$BIN" now zfb "wait"; "$BIN" block zfb "remote job"
