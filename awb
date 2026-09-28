@@ -105,7 +105,7 @@ reduce (. // [])[] as $e (
     | .agents[$e.id].lastEp = ($e.ep // .agents[$e.id].lastEp)
     # awb send: the task is a node of the task tree, owned by the worker; its key is its id
     | if ($e.key // "") == "" then .
-      else lose($e.id) | .agents[$e.id].key = $e.key | .agents[$e.id].keyEp = ($e.ep // 0)
+      else lose($e.id) | .agents[$e.id] += {key:$e.key, keyEp:($e.ep // 0), sent:true}
         | (if .tasks[$e.key] == null then .torder += [$e.key] else . end)
         # a planned task sent as it is (awb send ID TASKID) keeps its text and parent
         | .tasks[$e.key] = (((.tasks[$e.key] | select(. != null and (.state | IN("done","drop") | not)))
@@ -346,6 +346,8 @@ JQ_SNAP=$JQ_FOLD$JQ_DEFS'
      # AWB_REPLY_IDLE: it finished without replying, or never started (unless a flag says so)
      ($talk[] | select(.wait != null) | . as $k | ($sess[$k.id] // null) as $x
       # many messages are notices that need no reply: one unanswered for a day is dropped
+      # a worker driven by awb send with no open task: its messages are notices, not tasks
+      | select((($s.agents[$k.id].sent // false) and $s.agents[$k.id].key == null) | not)
       | select($x != null and $x.status == "idle" and (($s.agents[$k.id].sess // "") == "")
                and $nowep - ([$k.wait, $x.since] | max) >= $replyidle and $nowep - $k.wait < 86400)
       | {kind:"noreply", text:"\($k.name) 空闲 \(($nowep - $x.since) | ago)，主控 \(($nowep - $k.wait) | ago)前的消息还没回"}),
@@ -362,7 +364,7 @@ JQ_SNAP=$JQ_FOLD$JQ_DEFS'
      # last 24 hours, one line per command
      ([$raw[] | select(type == "object" and .t == "badcmd" and (.ep // 0) >= $nowep - 86400)]
       | group_by(.cmd)[] | {kind:"badcmd",
-        text:"有调用方在用不存在的命令 awb \(.[0].cmd | tostring | .[0:24])：24 小时内 \(length) 次，最近 \(($nowep - (map(.ep // 0) | max)) | ago)前"}) ]) as $anom
+        text:"有调用方在用不存在的命令 awb \(.[0].cmd | tostring | .[0:24])\(if (.[0].sug // "") != "" then "（应为 awb \(.[0].sug)）" else "" end)：24 小时内 \(length) 次，最近 \(($nowep - (map(.ep // 0) | max)) | ago)前"}) ]) as $anom
 # the live roots of the task tree: a fully-done root untouched for an hour is
 # folded away (counted in tasks_old) and left out of the total progress
 | ([ kids($s.tasks; $s.torder; "")[] as $root
@@ -755,20 +757,27 @@ freeze_once() {
   # status straight from the (read-only) event log. A milestone `done` event is
   # NOT agent state: only `finish` emits status:"done", so the `done` event is
   # ignored here and a runner between milestones stays running (a `now` after a
-  # real finish revives, mirroring nudge_once's fold).
+  # real finish revives, mirroring nudge_once's fold). The third column is "idle" for a worker
+  # driven by awb send with no open task: it waits for the main agent, and a reminder only
+  # woke it every round (Meshy, spec: it marked itself blocked to stop them)
   statuses=$( { [ -s "$EV" ] && cat "$EV" || true; } | jq -R -s -r '
     rtrimstr("\n") | if . == "" then [] else split("\n") | map(fromjson? | select(type == "object")) end
     | reduce .[] as $e ({};
-        if $e.id == null then .
-        elif $e.t == "status" then .[$e.id] = $e.status
-        elif $e.t == "now" then (if .[$e.id] == "done" then .[$e.id] = "running" else . end)
+        if ($e.id | type) != "string" then .
+        elif $e.t == "status" then .[$e.id].s = $e.status
+          | (if $e.status == "running" or $e.status == "blocked" then . else .[$e.id].k = null end)
+        elif $e.t == "now" then (if .[$e.id].s == "done" then .[$e.id].s = "running" else . end)
+          | (if ($e.key // "") != "" then .[$e.id] += {k:$e.key, sent:true} else . end)
+        elif $e.t == "done" and ($e.key // "") != "" and .[$e.id].k == $e.key then .[$e.id].k = null
+        elif $e.t == "start" then .[$e.id].k = null
         else . end)
-    | to_entries[] | "\(.key) \(.value)"')
+    | to_entries[] | "\(.key) \(.value.s // "running") \(if .value.sent and .value.k == null then "idle" else "-" end)"')
   live=$(tm list-panes -a -F '#{pane_id}' 2>/dev/null || true)
   tmp=$(mktemp "${df}.XXXXXX")
   agent_panes | while read -r id pane; do
     [ -n "$id" ] && [ -n "$pane" ] || continue
     st=$(printf '%s\n' "$statuses" | awk -v i="$id" '$1 == i {print $2; exit}')
+    md=$(printf '%s\n' "$statuses" | awk -v i="$id" '$1 == i {print $3; exit}')
     # only a start event -> running (empty); nudge only live runners, so skip
     # every known non-running state and treat the rest as running.
     case $st in blocked|done|failed) continue ;; esac
@@ -784,7 +793,7 @@ freeze_once() {
     if [ -n "$oldh" ] && [ "$oldh" = "$h" ]; then ep=$olde; else ep=$now; fi
     printf '%s %s %s\n' "$id" "$h" "$ep" >> "$tmp"
     age=$((now - ep))
-    if [ "$age" -lt "$frz" ]; then continue; fi
+    if [ "$age" -lt "$frz" ] || [ "$md" = idle ]; then continue; fi
     # the file gains a line per reminder: the last one counts (the first let every round remind)
     last=$(awk -v i="$id" '$1 == i {l = $2} END {print l}' "$nf" 2>/dev/null || true)
     if [ $((now - ${last:-0})) -lt "$every" ]; then continue; fi
@@ -1950,6 +1959,11 @@ selftest() {
   rc=0; hb nosuchcmd 2>/dev/null || rc=$?; [ "$rc" = 2 ] || die "selftest: unknown command exited $rc, not 2"
   hb view --json | jq -e 'any(.anomalies[]; .kind == "badcmd" and (.text | contains("awb nosuchcmd") and contains("1 次")))' >/dev/null \
     || die "selftest: an unknown command is not on the board: $(hb view --json | jq -c .anomalies)"
+  # a near miss names the command meant, on stderr and on the board
+  hb holds 2>&1 | grep -Fq "did you mean: awb hold?" || die "selftest: no suggestion for a near-miss command: $(hb holds 2>&1)"
+  hb view --json | jq -e 'any(.anomalies[]; .text | contains("awb holds（应为 awb hold）"))' >/dev/null \
+    || die "selftest: the suggestion is not on the board: $(hb view --json | jq -c .anomalies)"
+  ! hb nosuchcmd 2>&1 | grep -Fq "did you mean" || die "selftest: a far miss got a suggestion"
   AWB_STALE=0 hb view --json | jq -e '(.holds | length) == 0 and (any(.anomalies[]; .kind == "hold") | not)' >/dev/null \
     || die "selftest: a released resource still shown"
   # merge: only the newest verdict naming the current head counts, a conditional or retracted
@@ -2488,6 +2502,10 @@ FT
       || die "selftest: a keyed reply left open with the session idle is not on the board: $(AWB_REPLY_IDLE=0 ht view --json | jq -c '.anomalies')"
     "$BIN" reply z1 "$ok_" done >/dev/null
     ! AWB_REPLY_IDLE=0 ht view --json | jq -e 'any(.anomalies[]; .kind == "replied")' >/dev/null || die "selftest: a recorded reply still shown"
+    # a notice to a sent worker with no open task needs no reply
+    in_ "$(date +%s)" main-x "thanks, stand by" >> "$tr_"; ht _observe
+    ! AWB_REPLY_IDLE=0 ht view --json | jq -e 'any(.anomalies[]; .kind == "noreply")' >/dev/null \
+      || die "selftest: a notice to a worker with no open task flagged as not replied"
     reg idle
     rm -f "$t/home/.claude/sessions/2.json"
     # a pane given as session:window.pane in .awb/panes resolves to the same session
@@ -2529,6 +2547,16 @@ FT
     { echo "zl $(($(date +%s) - 5000))"; cat "$fz/fnudged"; } > "$fz/fn.x" && mv "$fz/fn.x" "$fz/fnudged"
     AWB_DIR=$fz AWB_TMUX_SOCKET=$fsock AWB_FROZEN=0 "$BIN" nudge --once
     [ "$(grep -c '^zl ' "$fz/fnudged")" = 2 ] || die "selftest: a frozen agent reminded again within AWB_NUDGE_EVERY: $(cat "$fz/fnudged")"
+    # a worker driven by awb send whose task was replied waits for the main agent: fingerprinted,
+    # never reminded (Meshy: spec marked itself blocked to stop the reminders)
+    pw=$(tmux -L "$S" new-window -d -P -F '#{pane_id}' "$SHELL")
+    AWB_DIR=$fz "$BIN" start zw waiter >/dev/null
+    zk=$(AWB_DIR=$fz "$BIN" send zw "one task" 2>/dev/null | sed -n '1s/^\[awb zw#\([0-9]*\)\].*/\1/p')
+    AWB_DIR=$fz "$BIN" reply zw "$zk" "done" >/dev/null
+    printf 'zw %s %s\n' "$pw" "$gf" >> "$fz/panes"
+    AWB_DIR=$fz AWB_TMUX_SOCKET=$fsock AWB_FROZEN=0 "$BIN" nudge --once
+    grep -q '^zw ' "$fz/diffs" || die "selftest: an idle sent worker lost its fingerprint"
+    ! grep -q '^zw ' "$fz/fnudged" || die "selftest: a sent worker with no open task was reminded"
   fi
   "$BIN" start zf frozen; "$BIN" now zf "idle"
   "$BIN" start zfb blk; "$BIN" now zfb "wait"; "$BIN" block zfb "remote job"
@@ -2914,9 +2942,23 @@ case "$cmd" in
   peers)    peers ;;
   selftest) selftest ;;
   ""|-h|--help|help) usage ;;
-  *) printf '%s: unknown command: %s (commands: %s help)\n' "$PROG" "$cmd" "$PROG" >&2
+  *) # the nearest command name of this dispatch (edit distance <= 2): a guessed name
+     # (Meshy: awb holds) gets the right one, not only the list
+     _sug=$(printf '%s' "$cmd" | cut -c1-40 | { read -r w || true
+       awk '/^main\(\) \{/,0' "$BIN" | grep -oE '^  [a-z][a-z|_-]*\)' | tr -d ' )' | tr '|' '\n' \
+       | awk -v w="$w" 'function lev(a, b,  i, j, la, lb, d, c, x) { la = length(a); lb = length(b)
+           for (i = 0; i <= la; i++) d[i, 0] = i; for (j = 0; j <= lb; j++) d[0, j] = j
+           for (i = 1; i <= la; i++) for (j = 1; j <= lb; j++) { c = (substr(a, i, 1) != substr(b, j, 1))
+             x = d[i-1, j] + 1; if (d[i, j-1] + 1 < x) x = d[i, j-1] + 1; if (d[i-1, j-1] + c < x) x = d[i-1, j-1] + c
+             d[i, j] = x }
+           return d[la, lb] }
+         { v = lev(w, $0); if (b == "" || v < b) { b = v; s = $0 } }
+         END { if (b != "" && b <= 2 && b < length(w)) print s }'; } || true)
+     printf '%s: unknown command: %s%s (commands: %s help)\n' "$PROG" "$cmd" \
+       "${_sug:+; did you mean: $PROG $_sug?}" "$PROG" >&2
      # the board shows it too: a script that throws stderr away would otherwise fail unseen
-     [ ! -s "$EV" ] || append '{t:"badcmd",time:$time,ep:$ep,cmd:$c}' --arg c "$cmd"
+     [ ! -s "$EV" ] || append '{t:"badcmd",time:$time,ep:$ep,cmd:$c} + (if $s == "" then {} else {sug:$s} end)' \
+       --arg c "$cmd" --arg s "$_sug"
      exit 2 ;;
 esac
 }
