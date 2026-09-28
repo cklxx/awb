@@ -1457,7 +1457,7 @@ need_agent() {
   init_dir
   { [ -s "$EV" ] && grep -F "\"id\":\"$1\"" "$EV" | grep -qF '"t":"start"'; } \
     || { [ -s "$AWB_DIR/panes" ] && awk -v i="$1" '$1 == i {f = 1} END {exit !f}' "$AWB_DIR/panes"; } \
-    || die "unknown agent: $1 (register it first: $PROG run, $PROG tui or $PROG start)"
+    || die "unknown agent: $1 (a worker registers with $PROG run, tui or start; the main agent needs no id: $PROG task ID STATE TEXT, $PROG goal, $PROG news)"
 }
 
 # type a message into an agent's TUI (claude, codex, any): a named buffer, then Enter.
