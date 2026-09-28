@@ -155,7 +155,7 @@ awb metric tps 32 40 "V100 target"      # brief: one value/target bar under GOAL
 
 # acceptance
 awb check a1 -- pytest -q ~/accept/test_a1.py       # any command, exit 0 = accepted
-awb check a1 --expect '^=+ [0-9]+ passed in' -- ssh host 'pytest | tail -3'  # and a line must match
+awb check a1 --expect '^=* ?[0-9]+ passed in' -- ssh host 'pytest | tail -3'  # and a line must match
 awb check a1 -- model/accept.sh proj ACCEPT.lean    # Lean 4: build, no sorry, theorems typecheck
                                                     # with standard axioms only
 awb pr a1 -- pytest -q ~/accept/test_a1.py          # runs the acceptance, then opens the PR
