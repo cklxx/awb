@@ -763,7 +763,7 @@ freeze_once() {
     # every known non-running state and treat the rest as running.
     case $st in blocked|done|failed) continue ;; esac
     p=$(awk -v i="$id" 'index($0, i" ") == 1 && NF >= 3 {sub(/^[^ ]+ +[^ ]+ +/, ""); print; exit}' \
-        "$AWB_DIR/panes" 2>/dev/null)
+        "$AWB_DIR/panes" 2>/dev/null || true)
     if [ -z "$p" ]; then p=$(tm display-message -p -t "$pane" '#{pane_current_path}' 2>/dev/null || true); fi
     [ -n "$p" ] || continue
     if ! git -C "$p" rev-parse --git-dir >/dev/null 2>&1; then continue; fi
@@ -2458,6 +2458,14 @@ FT
     AWB_DIR=$fz AWB_TMUX_SOCKET=$fsock AWB_FROZEN=0 "$BIN" nudge --once
     grep -q '^zl ' "$fz/diffs" || die "selftest: milestone done agent lost from freeze scan"
     grep -q '^zd ' "$fz/diffs" || die "selftest: dead-pane agent row not written"
+    # a board with no panes file (agents started by tui/run record their pane in the start
+    # event) must still fingerprint: the missing file once killed every round
+    fn=$t/fzn; mkdir -p "$fn"
+    printf '{"t":"start","time":"00:00:00","ep":1,"id":"zn","name":"zn","kind":"agent","pane":"%s","group":"default"}\n' "$pl" > "$fn/events.jsonl"
+    tmux -L "$S" send-keys -t "$pl" "cd '$gf'" Enter; sleep 0.3
+    AWB_DIR=$fn AWB_TMUX_SOCKET=$fsock AWB_FROZEN=99999 "$BIN" nudge --once
+    grep -q '^zn ' "$fn/diffs" || die "selftest: freeze scan died on a board without a panes file"
+    [ -z "$(ls "$fn" | grep '^diffs\.')" ] || die "selftest: freeze scan left a temp file"
     sleep 0.6
     tmux -L "$S" capture-pane -p -t "$pl" | grep -Fq "没有代码改动" \
       || die "selftest: live frozen agent not reminded past a dead pane"
