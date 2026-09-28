@@ -7,6 +7,7 @@ set -eu
 
 VERSION=0.0.9
 PROG=$(basename "$0")
+AWB_SET=${AWB_DIR:+1}   # empty: the board is ./.awb by default, which must already exist
 AWB_DIR=${AWB_DIR:-$PWD/.awb}
 # awb exports its tmux socket into the panes it opens, with the board it belongs to
 # (AWB_TMUX_FOR). Under another AWB_DIR the socket is not used: a worker that experiments with
@@ -21,6 +22,11 @@ ESC=$(printf '\033')
 die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
 
 init_dir() {
+  # a command without AWB_DIR in a directory with no board once started a new board there
+  # silently, and the writes of an agent that forgot AWB_DIR went to it: only awb up makes one
+  if [ -z "$AWB_SET" ] && [ ! -d "$AWB_DIR" ] && [ "${cmd:-}" != up ]; then
+    die "no board in $PWD (.awb): set AWB_DIR to the board, or start one here with '$PROG up'"
+  fi
   mkdir -p "$AWB_DIR" || die "cannot create $AWB_DIR"
   AWB_DIR=$(cd "$AWB_DIR" && pwd)
   EV=$AWB_DIR/events.jsonl
@@ -31,6 +37,8 @@ append() {
   init_dir
   _f=$1; shift
   jq -cn --arg time "$(date +$TS_FMT)" --argjson ep "$(date +%s)" "$_f" "$@" >> "$EV"
+  # once per command, so a caller sees which board it wrote to
+  [ -n "${AWB_TOLD:-}" ] || { AWB_TOLD=1; printf '%s: recorded in %s\n' "$PROG" "$AWB_DIR" >&2; }
 }
 
 q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
@@ -218,6 +226,13 @@ JQ_SNAP=$JQ_FOLD$JQ_DEFS'
      | {res, owner:(.owner // ""), since:(.ep // 0), note:(.note // "")})) as $holds
 | ([$raw[] | select(type == "object" and .t == "nudge" and .why == "stuck" and (.id | type) == "string")]
    | group_by(.id) | map(sort_by(.ep // 0) | last | {key:.id, value:.}) | from_entries) as $stk
+# the last sign of work of each agent besides its own reports: a reply it sent (observed) or a
+# change to a task it owns. A self-reported milestone left open is not the only truth
+| ([$raw[] | select(type == "object")
+    | if .t == "msg" and .dir == "in" and has("mid") and (.id | type) == "string" then {k:.id, ep:(.ep // 0)}
+      elif .t == "task" and ((.owner // "") | type) == "string" and (.owner // "") != "" then {k:.owner, ep:(.ep // 0)}
+      else empty end]
+   | group_by(.k) | map({key:.[0].k, value:(map(.ep) | max)}) | from_entries) as $work
 | ($raw | fold)
 # with the Lean model built, the status, gate and end of every agent come from the proven fold
 # (model/AwbModel.lean, awbmodel fold); the jq fold equals it only by the differential test
@@ -250,7 +265,10 @@ JQ_SNAP=$JQ_FOLD$JQ_DEFS'
         .value.sess = "任务 #" + .value.key + " 派出 " + (($nowep - .value.keyEp) | ago) + "仍没开始：消息可能没发出"
       # only an agent that claims work (a milestone or a sent task open): a worker idle
       # between tasks, or started and waiting for its first, is not a contradiction
-      elif $x.status == "idle" and .value.status == "running" and .value.current != null and ($nowep - $x.since) >= $silent then
+      # (and none since it began: a reply or a task change since then means the milestone is
+      # stale, not the agent)
+      elif $x.status == "idle" and .value.status == "running" and .value.current != null and ($nowep - $x.since) >= $silent
+           and ($work[.key] // 0) < (.value.current.ep // 0) then
         .value.sess = "自报进行，会话空闲 " + (($nowep - $x.since) | sdur)
       else . end)
 
@@ -274,7 +292,7 @@ JQ_SNAP=$JQ_FOLD$JQ_DEFS'
 | (([ $diffs[] | {key:.id, value:.} ] | from_entries) as $df
    | [ $s.agents[] | select((.wait | not)
           and ((.status | IN("running","blocked")) or ((.sess // "") != "")))
-       | . as $a | ($nowep - $a.lastEp) as $idle
+       | . as $a | ($nowep - ([$a.lastEp, ($work[$a.id] // 0)] | max)) as $idle
        | ($df[$a.id] // null) as $d
        # silence is an anomaly after AWB_SILENT (3600 s), not AWB_STALE (600 s, the nudge):
        # on a real three-day log (awb replay) the median gap between two updates of one agent
@@ -431,7 +449,7 @@ JQ_SNAP=$JQ_FOLD$JQ_DEFS'
        now:$nowep, clock:$now, progress:$tp, hour:{done:finished($raw; $h1)}, day:$D,
        verified:{v:$mver, n:($mdone | length)}, running:$nrun, metric:$M, need:$need,
        anomalies:$anom, next:$next, holds:$holds,
-       agents:$act, idle:$idl, tasks:$trees, tasks_old:$nold, talk:$talk,
+       agents:$act, idle:$idl, tasks:$trees, tasks_old:$nold, talk:$talk, observe:$obs,
        news:$news, refs:$refs,
        checks:[$s.checks[] | {id, name:(($s.agents[.id].name) // .id), what, startEp,
          ok:(all(.steps[]; .state == "ok")), fail:any(.steps[]; .state == "fail"),
@@ -615,7 +633,10 @@ snapshot() {
                | {id:.[0], hash:.[1], ep:(.[2] | tonumber)}]' < "$AWB_DIR/diffs")
     fi
   fi
-  events_json | jq -r --arg viol "$viol" --arg lean "$lean" --argjson undeliv "${AWB_UNDELIVERED:-180}" \
+  # the last observation round (the obs file is rewritten by each) and how many transcripts it read
+  obs=null; [ ! -f "$AWB_DIR/obs" ] || [ -n "${AWB_NOW:-}" ] || \
+    obs=$(printf '{"last":%s,"files":%s}' "$(stat -f %m "$AWB_DIR/obs" 2>/dev/null || stat -c %Y "$AWB_DIR/obs")" "$(grep -c . "$AWB_DIR/obs" || true)")
+  events_json | jq -r --arg viol "$viol" --arg lean "$lean" --argjson undeliv "${AWB_UNDELIVERED:-180}" --argjson obs "$obs" \
     --arg now "$(jq -nr --argjson t "$nowep" '$t | strflocaltime("%H:%M:%S")')" --argjson nowep "$nowep" \
     --argjson live "$live" --arg stale "${AWB_STALE:-600}" --argjson replyidle "${AWB_REPLY_IDLE:-600}" \
     --argjson diffs "$diffs" --argjson frz "${AWB_FROZEN:-900}" --argjson silent "${AWB_SILENT:-3600}" \
@@ -693,7 +714,7 @@ replay() {
       ([$N[] | select(.last < $S[-1].T) | .span] as $d
        | "需要你 \($N | length) 次：已解决 \($d | length)（在板上中位 \($d | med | dur)，最长 \($d | max | dur)），回放结束时仍在 \([$N[] | select(.last == $S[-1].T)] | length)"),
       "下属重启 \($K.restart) 次，异常退出 \($K.exit) 次",
-      (if ($T | length) == 0 then empty
+      (if ($T | length) == 0 then "主控消息（从会话记录观察）：没有记录。看板开着时每分钟观察一轮（AWB_OBSERVE=0 为关）；awb view --json 的 observe 是最近一轮"
          else ([$T[].r[]]) as $d
            | "主控消息（从会话记录观察）：发出 \([$T[].o] | add)，得到回复 \($d | length)（中位 \($d | med | dur)，最长 \($d | max | dur)），结束时等回复的 agent \([$T[] | select(.w != null)] | length) 个" end)' "$_rd/series"
   rm -rf "$_rd"
@@ -1206,8 +1227,8 @@ open_keys() {
   events_json | jq -r "$JQ_FOLD"' fold | .agents[] | select(.key != null) | "\(.id) \(.key)"'
 }
 open_key() { open_keys | awk -v i="$1" '$1 == i {print $2}'; }
-# now/done/finish are for agents that report themselves (awb run); a sent task is closed by
-# its reply, which the main agent records: a worker's own stage report once closed it
+# now/done are for agents that report themselves (awb run); a sent task is closed by its
+# reply, which the main agent records: a worker's own stage report once closed it
 self_report() {
   need_agent "$1"; _k=$(open_key "$1")
   [ -z "$_k" ] || die "$1 has task #$_k from awb send; its reply closes it ($PROG reply $1 $_k RESULT)"
@@ -1657,11 +1678,12 @@ One unit of work, the task. You talk to one Claude (the main agent); it keeps th
                                     baseline series drawn by step beside it
   $PROG news [--key KEY] TEXT       one progress line; one KEY = one fact, the latest shows
 
-Workers that are not Claude sessions report themselves (not while a sent task is open):
+Workers that are not Claude sessions report themselves (now/done not while a sent task is open):
   $PROG run [-g GROUP] ID NAME -- CMD...  a command in a pane; exit 0 -> done, else failed
   $PROG start ID NAME [KIND] [GROUP]  register an agent without a pane (a subagent, a remote)
   $PROG now ID MILESTONE / done ID [TEXT] / finish ID [NOTE]
-                                    start / end a milestone / end it and the agent
+                                    start / end a milestone / end it and the agent (finish also
+                                    closes an open sent task, with no result)
 
 Coordination and reading:
   $PROG peers                       every agent: ID PANE SESSION STATUS [#KEY] [silent MINm]
@@ -1674,7 +1696,8 @@ Coordination and reading:
   $PROG down | reset                end this board's session | clear the log (keeps a .bak)
   $PROG skill | version | selftest
   AWB_STALE=SECS nudge after (600); AWB_SILENT=SECS silence is an anomaly after (3600).
-  Several boards: one .awb per project directory, or \$AWB_DIR.
+  Several boards: one .awb per project directory (made by '$PROG up'), or \$AWB_DIR. Without
+  AWB_DIR a command needs ./.awb; a write says which board it went to (stderr).
 EOF
 }
 
@@ -1808,6 +1831,7 @@ selftest() {
     || die "selftest: replay core metrics on sent tasks: $kp"
   printf '%s\n' "$kp" | grep -Fq "需要你 1 次：已解决 1" || die "selftest: replay core metrics on 需要你: $kp"
   printf '%s\n' "$kp" | grep -Fq "下属重启 1 次" || die "selftest: replay core metrics on restarts: $kp"
+  printf '%s\n' "$kp" | grep -Fq "主控消息（从会话记录观察）：没有记录" || die "selftest: replay says nothing when nothing was observed: $kp"
   AWB_DIR=$rd AWB_NOW=$((r0 + 600)) "$BIN" view --json | jq -e '.clock != "" and (.agents | length) == 2' >/dev/null \
     || die "selftest: AWB_NOW did not render the board as of that time"
   # a task dispatched with awb send shows under 下一步 until its reply closes it
@@ -2092,6 +2116,20 @@ EOF
     || die "selftest: a late check did not verify the last milestone, or added one"
   # bash 3.2 swallows a following non-ASCII byte into an unbraced variable name: brace them
   ! LC_ALL=C grep -nE '[$][A-Za-z_][A-Za-z0-9_]*[^ -~]' "$BIN" >&2 || die "selftest: unbraced \$var before non-ASCII text"
+  # silence: a change to a task the agent owns is its work too
+  sq=$t/silent2; mkdir -p "$sq"; o_=$(($(date +%s) - 7200))
+  printf '{"t":"start","id":"q1","name":"q1","ep":%s}\n{"t":"now","id":"q1","text":"x","ep":%s}\n' $o_ $o_ > "$sq/events.jsonl"
+  AWB_DIR=$sq "$BIN" view --json | jq -e 'any(.anomalies[]; .kind == "silent")' >/dev/null || die "selftest: a silent agent not flagged"
+  AWB_DIR=$sq "$BIN" task qt wip "q1 work" "" q1 2>/dev/null
+  ! AWB_DIR=$sq "$BIN" view --json | jq -e 'any(.anomalies[]; .kind == "silent")' >/dev/null || die "selftest: a task change of the agent not counted as its work"
+  # a command without AWB_DIR and no board here fails instead of starting one; a write says where
+  mkdir -p "$t/nob"
+  ! ( cd "$t/nob" && env -u AWB_DIR "$BIN" news x 2>/dev/null ) && [ ! -e "$t/nob/.awb" ] || die "selftest: a write without AWB_DIR started a board"
+  "$BIN" news "where" 2>&1 >/dev/null | grep -Fq "recorded in " || die "selftest: a write does not say which board"
+  # finish ends an agent with an open sent task, closing the task with no result
+  "$BIN" start f9 fin 2>/dev/null; "$BIN" send f9 "t9" >/dev/null 2>&1
+  o_=$("$BIN" finish f9 2>&1); printf '%s' "$o_" | grep -q "closed without a reply" && [ -z "$(open_key f9)" ] \
+    || die "selftest: finish with an open sent task: $o_"
   # dispatch/report loop (model/tla/AwbLoop.tla)
   "$BIN" start w9 worker
   m=$("$BIN" send w9 "count files"); k=$(printf '%s' "$m" | sed -n '1s/^\[awb w9#\([0-9]*\)\].*/\1/p')
@@ -2277,6 +2315,10 @@ FT
     ! ht view --json | jq -e '.anomalies | any(.text | contains("会话空闲"))' >/dev/null || die "selftest: an idle worker with no milestone flagged"
     "$BIN" now z1 "still going"; reg idle "" 4000
     ht view --once | grep -Fq "自报进行，会话空闲" || die "selftest: running agent idle past AWB_SILENT not flagged"
+    # a reply it sent since the milestone began: the milestone is stale, not the agent
+    printf '{"t":"msg","ep":%s,"id":"z1","dir":"in","via":"m","mid":"x1"}\n' "$(date +%s)" >> "$EV"
+    ! ht view --once | grep -Fq "自报进行，会话空闲" || die "selftest: a milestone flagged after the agent replied"
+    grep -vF '"mid":"x1"' "$EV" > "$EV.x"; cat "$EV.x" > "$EV"; rm -f "$EV.x"
     # anomalies: one line per agent, and silence counts only for an agent with no session
     sleep 1.1
     [ "$(AWB_SILENT=1 ht view --json | jq '[.anomalies[] | select(.text | startswith("demo "))] | length')" = 1 ] \
@@ -2389,6 +2431,7 @@ FT
     until [ "$(grep -F '"t":"msg"' "$EV" | grep -cF '"dir":"in"')" = 3 ]; do
       i=$((i + 1)); [ $i -lt 40 ] || { kill $wp; die "selftest: a board with AWB_NUDGE=0 did not observe"; }; sleep 0.25; done
     kill $wp; wait $wp 2>/dev/null || true
+    ht view --json | jq -e '.observe.files >= 1 and .observe.last > 0' >/dev/null || die "selftest: the last observation round not in the snapshot"
     reg idle
     rm -f "$t/home/.claude/sessions/2.json"
     # a pane given as session:window.pane in .awb/panes resolves to the same session
@@ -2755,7 +2798,9 @@ case "$cmd" in
             append '{t:"status",time:$time,ep:$ep,id:$id,status:"failed",reason:$r}' \
               --arg id "$1" --arg r "${2-}" ;;
   finish)   [ $# -ge 1 ] || die "usage: $PROG finish ID [NOTE]"
-            self_report "$1"
+            # ends the agent; an open sent task ends with it, with no result (was: refused)
+            need_agent "$1"; _k=$(open_key "$1")
+            [ -z "$_k" ] || echo "$PROG: $1 task #$_k closed without a reply" >&2
             append '{t:"done",time:$time,ep:$ep,id:$id,text:(if $text == "" then null else $text end)}' \
               --arg id "$1" --arg text "${2:-}"
             append '{t:"status",time:$time,ep:$ep,id:$id,status:"done",reason:""}' --arg id "$1" ;;
