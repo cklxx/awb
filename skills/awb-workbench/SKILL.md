@@ -34,13 +34,16 @@ Claude, follow this and do not ask the user to type commands:
    in one line>")` puts the task on the tree, owned by the worker, and prints the message; then
    SendMessage(to: <session name>, message: <msg>, notify_when_idle: true). Nothing reaches the
    worker until you send it. The message carries a key `[awb <id>#<key>]` (the task's id) the
-   reply must echo. One open task per worker; send the next after the reply.
+   reply must echo. A planned task is sent by its id, `awb send <id> <task-id> ["<message>"]`:
+   the key is that id and the task keeps its text and parent. One open task per worker; send
+   the next after the reply.
 4. Results:
    - A reply starting with `[awb <id>#<key>]` → `awb reply <id> <key> "<result in one line>"`:
-     the task is done, with its result. A reply with another key is stale or duplicate. The
-     board also reads the transcripts of its agents (read-only) and closes the task when the
-     keyed reply arrives, so a forgotten `awb reply` loses only the result text; it also records every
-     SendMessage to and from a board agent, keyed or not.
+     the task is done, with its result. A keyed progress report is not a result: answer it, the
+     task stays open. A reply with another key is stale or duplicate. The board also reads the
+     transcripts of its agents (read-only) and records every SendMessage to and from a board
+     agent; it never closes a task. A keyed reply followed by an idle session shows as an
+     anomaly until you run `awb reply`.
    - An idle notice → `awb idle <id>`. The first time it prints an ask; SendMessage it (again
      with notify_when_idle). The second time it marks the task blocked: tell the user, since the
      worker's session is probably holding your message for its user's approval. Never mark a
