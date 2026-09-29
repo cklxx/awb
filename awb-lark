@@ -33,17 +33,11 @@ setup() {
 
 # the card, from `awb view --json` (the same data as the board's brief view)
 card() {
-  jq -c --arg board "$1" --arg path "$2" '
+  jq -c --arg board "$1" '
   def clip($n): if length > $n then .[:$n - 1] + "…" else . end;
   def ago: if . >= 86400 then "\((. / 8640 | floor) / 10)天" elif . >= 3600 then "\(. / 3600 | floor)小时"
     else "\(. / 60 | floor)分钟" end;
-  def hms: if . < 3600 then "\(. / 60 | floor) 分" else "\(. / 3600 | floor) 时 \((. % 3600) / 60 | floor) 分" end;
   def grey: "<font color=\"grey\">" + . + "</font>";
-  def tile($label; $value; $sub):
-    {tag:"column", width:"weighted", weight:1, vertical_spacing:"4px",
-     elements:([{tag:"markdown", content:($label | grey), text_size:"notation"},
-                {tag:"markdown", content:$value, text_size:"heading-2"}]
-               + (if $sub == "" then [] else [{tag:"markdown", content:($sub | grey), text_size:"notation"}] end))};
   def box($bg; $md): {tag:"column_set", background_style:$bg,
     columns:[{tag:"column", width:"weighted", weight:1, padding:"8px 10px", elements:[{tag:"markdown", content:$md}]}]};
   . as $s
@@ -54,36 +48,34 @@ card() {
      header:{
        # the title is the goal; which board and how fresh is the subtitle
        title:{tag:"plain_text", content:(if $s.title != "" then ($s.title | clip(60)) else $board end)},
-       subtitle:{tag:"plain_text", content:("\($board) · 更新于 " + (if $s.quiet < 60 then "刚刚" else "\($s.quiet | ago)前" end))},
+       # which board, and when it last changed: a time, since the card is not re-read live
+       subtitle:{tag:"plain_text", content:("\($board) · " + (($s.now - $s.quiet) as $t
+         | if ($t | strflocaltime("%F")) == ($s.now | strflocaltime("%F")) then $t | strflocaltime("%H:%M")
+           else $t | strflocaltime("%m-%d %H:%M") end))},
        template:(if $nfail > 0 then "red" elif ($s.need | length) > 0 then "orange" else "blue" end),
        text_tag_list:((if ($s.need | length) > 0 then [{tag:"text_tag", text:{tag:"plain_text", content:"需要你 \($s.need | length)"}, color:"red"}] else [] end))},
-     body:{direction:"vertical", padding:"12px 12px 16px 12px", vertical_spacing:"12px", elements:(
-       # 1. what it is, then the one-sentence verdict (the focus)
-       ([ $s.about[] | {tag:"markdown", content:(. | clip(160) | grey), text_size:"notation"} ])
-       + [{tag:"markdown", text_size:"heading-4",
-           content:("**" + $s.headline + "**")}]
-       # 2. needs you, with how long each has waited
-       + (if ($s.need | length) > 0 then
-           [box(if $nfail > 0 then "red-50" else "orange-50" end; "**需要你**\n" + ([$s.need[] |
+     # no section names: the colour, the icon and the content say what each line is
+     body:{direction:"vertical", padding:"12px 12px 16px 12px", vertical_spacing:"10px", elements:(
+       # needs you (the header tag counts them), with how long each has waited
+       (if ($s.need | length) > 0 then
+           [box(if $nfail > 0 then "red-50" else "orange-50" end; [$s.need[] |
               (if .age then "<font color=\"grey\"> · 已 \(.age | ago)</font>" else "" end) as $ag
               | if .kind == "wait" then "▲ **\(.name)** \(.text)"
                 elif .kind == "fail" then "✗ **\(.name)** \(.text | clip(80))\($ag)"
-                else "? \(.text | clip(90))\($ag)" end] | join("\n")))]
+                else "? \(.text | clip(90))\($ag)" end] | join("\n"))]
           else [] end)
-       # 3. the goal: the metric, its trend, and the next open steps
-       + [{tag:"column_set", flex_mode:"bisect", background_style:"blue-50", horizontal_spacing:"12px",
-           columns:(
-             (if $s.metric then
-                [tile($s.metric.name | clip(20); "**\($s.metric.value)** / \($s.metric.target)";
-                      (if $s.metric.stale then "最新读数 \($s.metric.age | ago)前"
-                       elif $s.metric.eta then "按均速约 \($s.metric.eta | ago)达标（估）" elif $s.metric.late then "按当前趋势截止前达不到" else "" end)),
-                 tile("达成"; (if $s.metric.frac then "\($s.metric.frac * 100 | floor)%" else "—" end);
-                      (if $s.metric.v0 then "起 \($s.metric.v0) · \($s.metric.since | ago)前" else "" end))]
-              else [tile("任务"; "\($s.progress.d) / \($s.progress.t)"; "")] end)
-             + [tile("24 小时"; "完成 +\($s.day.done)";
-                     "已核 \($s.day.verified)"
-                     + (if $s.day.metric then " · \($s.metric.name) \(if $s.day.metric >= 0 then "+" else "" end)\($s.day.metric * 100 | round / 100)"
-                           + (if $s.day.mspan then "/" + ($s.day.mspan | ago) else "" end) else "" end))])}]
+       # the goal in one line: the metric against its target, else the task count; then the day
+       + [{tag:"markdown", text_size:"heading-4", content:(if $s.metric then
+             "**\($s.metric.name | clip(20)) \($s.metric.value)** / \($s.metric.target)"
+             + (if $s.metric.frac then " · \($s.metric.frac * 100 | floor)%" else "" end)
+             + (if $s.metric.v0 then " · 起 \($s.metric.v0)" else "" end)
+             + (if $s.metric.stale then " · 最新读数 \($s.metric.age | ago)前"
+                elif $s.metric.eta then " · 约 \($s.metric.eta | ago)达标" elif $s.metric.late then " · 截止前达不到" else "" end)
+           else "**任务 \($s.progress.d)/\($s.progress.t)**" end)},
+          {tag:"markdown", text_size:"notation", content:(
+             "24 小时完成 \($s.day.done)，已核 \($s.day.verified)"
+             + (if $s.day.metric then "，\($s.metric.name) \(if $s.day.metric >= 0 then "+" else "" end)\($s.day.metric * 100 | round / 100)"
+                   + (if $s.day.mspan then "/" + ($s.day.mspan | ago) else "" end) else "" end) | grey)}]
        # the chart: the metric, and by step each reference series (metric --ref) beside it; a
        # reference makes one reading enough. Two readings at the same t (a manual current
        # reading on top of an hourly probe) collapse to the newest, so the line shows one point
@@ -103,29 +95,29 @@ card() {
                         + (if $steps then [{orient:"bottom", type:"linear", title:{visible:true, text:"step"}}] else [] end)),
                   markLine:[{y:$s.metric.target, label:{text:"目标 \($s.metric.target)"}}]}}]
             else [] end)
+       # the open steps, by their state icon
        + (if ($s.next | length) > 0 then
-           [{tag:"markdown", content:("**下一步**\n" + ([$s.next[] | "\($TI[.state] // "•") \(.text | clip(90))"] | join("\n")))}]
+           [{tag:"markdown", content:([$s.next[] | "\($TI[.state] // "•") \(.text | clip(90))"] | join("\n"))}]
           else [] end)
-       # 4. what is off
+       # what is off
        + (if ($s.anomalies | length) > 0 then
-           [box("yellow-50"; "**异常**\n" + ([$s.anomalies[] | "! \(.text | clip(100))"] | join("\n")))]
+           [box("yellow-50"; [$s.anomalies[] | "! \(.text | clip(100))"] | join("\n"))]
           else [] end)
-       # 5. the rest, folded: news and the task tree; agents show only in 需要你 and 异常.
-       # With neither news nor tasks the panel itself is omitted (an empty folded panel showed nothing).
-       + (
-           (((if ($s.news | length) > 0 then
-                 [{tag:"markdown", content:("**最近进展**\n" + ([$s.news[-5:] | reverse[] | ("\(.time[0:5])" | grey) + "　\(.text | clip(100))"] | join("\n")))}]
-                else [] end)
+       # folded under the latest news line: the earlier news and the task tree. With neither
+       # news nor tasks the panel is omitted (an empty folded panel showed nothing)
+       + (($s.news[-5:] | reverse) as $nw
+          | ([ $nw[1:][] | {tag:"markdown", content:(("\(.time[0:5])" | grey) + "　\(.text | clip(100))")} ]
              + [ $s.tasks[] | {tag:"markdown", content:(
                  "**\(.text | clip(60))**　\(.d)/\(.t)" + (if .quiet then "　" + ("\(.quiet | ago)没更新" | grey) else "" end)
                  + (if .folded > 0 then "\n✓ 另 \(.folded) 项已完成" else "" end)
                  + ([.kids[] | "\n" + ($TI[.state] // "•") + " " + (.text | clip(70)) + (if .prog then "　\(.prog.d)/\(.prog.t)" else "" end)] | join("")))} ]
              + (if $s.tasks_old > 0 then [{tag:"markdown", content:("✓ 另有 \($s.tasks_old) 项已完成" | grey)}] else [] end)) as $pe
-           | if ($pe | length) == 0 then []
-             else [{tag:"collapsible_panel", expanded:false,
-                    header:{title:{tag:"markdown", content:("**进展与任务**　" + ("已核 \($s.verified.v)/\($s.verified.n)" | grey))}},
-                    vertical_spacing:"8px", elements:$pe}] end))
-       + [{tag:"markdown", content:("\($path)" | grey), text_size:"notation"}])}}'
+          | if ($nw | length) == 0 and ($pe | length) == 0 then []
+            else [{tag:"collapsible_panel", expanded:false,
+                   header:{title:{tag:"markdown", content:(if ($nw | length) > 0
+                     then ("\($nw[0].time[0:5])" | grey) + "　\($nw[0].text | clip(60))"
+                     else "任务 \($s.progress.d)/\($s.progress.t)" end)}},
+                   vertical_spacing:"8px", elements:$pe}] end))}}'
 }
 
 
@@ -149,7 +141,7 @@ sync() {
   snap=$("$AWB" view --json)
   # topic title: the project directory for ./.awb, else the board directory's own name
   proj=$(basename "$AWB_DIR"); [ "$proj" != .awb ] || proj=$(basename "$(dirname "$AWB_DIR")")
-  body=$(printf '%s' "$snap" | card "$proj" "$AWB_DIR")
+  body=$(printf '%s' "$snap" | card "$proj")
   [ "${1:-}" = --dry-run ] && { printf '%s\n' "$body"; return 0; }
   command -v lark-cli >/dev/null || die "lark-cli not found"
   c=$(chat)
