@@ -311,8 +311,10 @@ JQ_SNAP=$JQ_FOLD$JQ_DEFS'
           flag:([ (($stk[$a.id] // null) as $n | ($sess[$a.id] // null) as $x
                    | if $n != null and $x != null and $x.status != "busy" and $x.since <= $n.ep
                      then "工具调用没执行，提醒后仍停着 " + (($nowep - $n.ep) | sdur) else empty end),
+                  # a worker driven by awb send with no open task is waiting, not frozen (as in freeze_once)
                   (if $a.status == "running" and $d != null and ($nowep - $d.ep) >= $frz
-                    then "无改动 " + (($nowep - $d.ep) | sdur) else empty end),
+                      and ((($a.sent // false) and $a.key == null) | not)
+                    then "无改动 " + (($nowep - $d.ep) | ago) else empty end),
                   (if ($a.sess // "") != "" then "≠ " + $a.sess else empty end) ] | join(" · "))} ]
    | sort_by([(if .status == "blocked" then 0 elif .status == "running" then 1 else 2 end), -.idle])) as $act
 # what is off: a bottleneck (an issue or PR, #N, that two or more blocked agents wait
@@ -2560,9 +2562,12 @@ FT
   fi
   "$BIN" start zf frozen; "$BIN" now zf "idle"
   "$BIN" start zfb blk; "$BIN" now zfb "wait"; "$BIN" block zfb "remote job"
-  printf 'zf 1 %s\nzfb 1 %s\n' "$(($(date +%s) - 1000))" "$(($(date +%s) - 1000))" > "$t/diffs"
+  "$BIN" start zi idlew; zik=$("$BIN" send zi "one" 2>/dev/null | sed -n '1s/^\[awb zi#\([0-9]*\)\].*/\1/p')
+  "$BIN" reply zi "$zik" ok >/dev/null
+  printf 'zf 1 %s\nzfb 1 %s\nzi 1 %s\n' "$(($(date +%s) - 1000))" "$(($(date +%s) - 1000))" "$(($(date +%s) - 1000))" > "$t/diffs"
   fr=$("$BIN" view --once)
-  printf '%s' "$fr" | grep -Fq "frozen 无改动 " || die "selftest: stale fingerprint not shown frozen"
+  printf '%s' "$fr" | grep -Fq "frozen 无改动 16分钟" || die "selftest: stale fingerprint not shown frozen: $fr"
+  ! printf '%s' "$fr" | grep -Fq "idlew 无改动" || die "selftest: a sent worker with no open task marked frozen"
   ! printf '%s' "$fr" | grep -Fq "blk 无改动" || die "selftest: blocked agent marked frozen"
   printf 'zf 1 %s\nzfb 1 %s\n' "$(date +%s)" "$(date +%s)" > "$t/diffs"
   ! "$BIN" view --once | grep -Fq "无改动 " || die "selftest: fresh fingerprint shown frozen"
