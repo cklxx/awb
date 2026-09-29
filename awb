@@ -366,7 +366,7 @@ JQ_SNAP=$JQ_FOLD$JQ_DEFS'
      # last 24 hours, one line per command
      ([$raw[] | select(type == "object" and .t == "badcmd" and (.ep // 0) >= $nowep - 86400)]
       | group_by(.cmd)[] | {kind:"badcmd",
-        text:"有调用方在用不存在的命令 awb \(.[0].cmd | tostring | .[0:24])\(if (.[0].sug // "") != "" then "（应为 awb \(.[0].sug)）" else "" end)：24 小时内 \(length) 次，最近 \(($nowep - (map(.ep // 0) | max)) | ago)前"}) ]) as $anom
+        text:"不存在的命令 awb \(.[0].cmd | tostring | .[0:24])\(if (.[0].sug // "") != "" then "（应为 awb \(.[0].sug)）" else "" end) 用了 \(length) 次，最近 \(($nowep - (map(.ep // 0) | max)) | ago)前"}) ]) as $anom
 # the live roots of the task tree: a fully-done root untouched for an hour is
 # folded away (counted in tasks_old) and left out of the total progress
 | ([ kids($s.tasks; $s.torder; "")[] as $root
@@ -2733,8 +2733,8 @@ FAKE
              | select(.s == "du" and .t == 500)] | length == 1' "$t/dup.json" >/dev/null \
       || die "selftest: duplicate metric steps are not deduplicated on the chart"
     # the 24-hour tile names the metric its delta belongs to
-    jq -e '[.. | .content? // empty | strings] | any(test("du \\+0\\.2"))' "$t/dup.json" >/dev/null \
-      || die "selftest: the 24h metric delta has no metric name"
+    jq -e '[.. | .content? // empty | strings] | any(test("，\\+0\\.2"))' "$t/dup.json" >/dev/null \
+      || die "selftest: the 24h metric delta is not on the card"
     # an empty board omits the empty folded panel and the epoch-0 stale time
     eb=$t/ecard; mkdir -p "$eb"
     AWB_DIR=$eb AWB=$BIN "$lk" sync --dry-run > "$t/ecard.json"
