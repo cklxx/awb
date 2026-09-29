@@ -2125,7 +2125,7 @@ EOF
   AWB_DIR=$m5 AWB_COLS=120 "$BIN" view --once | stripansi | grep -Fq "+1/11小时" \
     || die "selftest: the footer does not name the metric delta span"
   AWB_DIR=$m5 AWB="$BIN" "$(dirname "$BIN")/awb-lark" sync --dry-run \
-    | jq -e '[.body.elements[]|select(.tag=="column_set")|..|.content? // empty]|any(test("\\+1/11小时"))' >/dev/null \
+    | jq -e '[.. | .content? // empty | strings] | any(test("\\+1/11小时"))' >/dev/null \
     || die "selftest: the card does not name the metric delta span"
 
   # single metric indicator under GOAL, render-only (the "#" id keeps it out
@@ -2733,18 +2733,18 @@ FAKE
              | select(.s == "du" and .t == 500)] | length == 1' "$t/dup.json" >/dev/null \
       || die "selftest: duplicate metric steps are not deduplicated on the chart"
     # the 24-hour tile names the metric its delta belongs to
-    jq -e '[.body.elements[] | select(.tag == "column_set") | .. | .content? // empty]
-            | any(test("du \\+0\\.2"))' "$t/dup.json" >/dev/null || die "selftest: the 24h metric delta has no metric name"
+    jq -e '[.. | .content? // empty | strings] | any(test("du \\+0\\.2"))' "$t/dup.json" >/dev/null \
+      || die "selftest: the 24h metric delta has no metric name"
     # an empty board omits the empty folded panel and the epoch-0 stale time
     eb=$t/ecard; mkdir -p "$eb"
     AWB_DIR=$eb AWB=$BIN "$lk" sync --dry-run > "$t/ecard.json"
     jq -e '([.body.elements[] | select(.tag == "collapsible_panel")] | length == 0)
-            and (.header.subtitle.content | endswith("更新于 刚刚"))' "$t/ecard.json" >/dev/null \
+            and (.header.subtitle.content | test(" · [0-9]{2}:[0-9]{2}$"))' "$t/ecard.json" >/dev/null \
       || die "selftest: an empty card has a folded panel or a stale time"
     lr sync --dry-run | jq -e '.schema == "2.0" and .header.title.content == "L"
-      and (.header.subtitle.content | startswith("lboard · 更新于"))
-      and ([.body.elements[] | select(.tag == "markdown") | .content] | any(startswith("**无需你处理")))
-      and ([.body.elements[] | select(.tag == "collapsible_panel") | .elements[].content] | any(test("first-news")))
+      and (.header.subtitle.content | test("^lboard · [0-9]{2}:[0-9]{2}$"))
+      and (.body | tojson | test("下一步|异常\\*|最近进展|进展与任务|无需你处理|需要你\\*") | not)
+      and ([.body.elements[] | select(.tag == "collapsible_panel")] | tojson | test("first-news"))
       and (tojson | test("carding") | not)' >/dev/null \
       || die "selftest: awb-lark card"
     lr sync; grep -c '+messages-send --chat-id oc_test --msg-type interactive' "$t/lark.log" | grep -qx 1 \
