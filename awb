@@ -261,7 +261,7 @@ JQ_SNAP=$JQ_FOLD$JQ_DEFS'
     | if $x == null then .
       elif $x.status == "waiting" then .value.wait = true
         | .value.sess = "待批准：" + (if $x.waiting != "" then $x.waiting else "对话框" end) + " " + (($nowep - $x.since) | sdur)
-      elif $x.status == "busy" and (.value.status | IN("done","failed")) then
+      elif ($x.status | IN("busy","shell")) and (.value.status | IN("done","failed")) then
         .value.sess = "自报" + {"done":"完成","failed":"失败"}[.value.status] + "，会话在忙"
       # a task sent to a session idle since before it, still idle: the message may never have
       # left the main agent (SendMessage is its step, outside awb)
@@ -311,7 +311,7 @@ JQ_SNAP=$JQ_FOLD$JQ_DEFS'
                 elif $a.status == "running" and $a.current then ($a.current.text // "")
                 elif ($a.done | length) > 0 then "✓ " + ($a.done[-1].text // "") else ($a.reason // "") end),
           flag:([ (($stk[$a.id] // null) as $n | ($sess[$a.id] // null) as $x
-                   | if $n != null and $x != null and $x.status != "busy" and $x.since <= $n.ep
+                   | if $n != null and $x != null and ($x.status | IN("busy","shell") | not) and $x.since <= $n.ep
                      then "工具调用没执行，提醒后仍停着 " + (($nowep - $n.ep) | sdur) else empty end),
                   # a worker driven by awb send with no open task is waiting, not frozen (as in freeze_once)
                   (if $a.status == "running" and $d != null and ($nowep - $d.ep) >= $frz
@@ -342,7 +342,8 @@ JQ_SNAP=$JQ_FOLD$JQ_DEFS'
                then {kind:"silent", text:"\(.name) \(.idle | ago)没有更新"} else empty end),
      # a held resource whose holder has not worked for AWB_STALE: the rest queue behind it
      ($holds[] | . as $hd | ($s.agents[$hd.owner] // null) as $a | ($sess[$hd.owner] // null) as $x
-      | (if $x != null then (if $x.status == "busy" then 0 else $nowep - $x.since end)
+      # shell: the session is running a command (a watcher of a remote job), which is work
+      | (if $x != null then (if $x.status | IN("busy","shell") then 0 else $nowep - $x.since end)
          elif $a != null then $nowep - $a.lastEp else 0 end) as $q
       | select($q >= ($stale | tonumber))
       | {kind:"hold", text:"\($hd.res) 被 \(($a.name) // $hd.owner) 占着 \((($nowep - $hd.since) | ago))，它 \($q | ago)没在干活"}),
@@ -973,7 +974,8 @@ hold_once() {
     | [.[] | select((.t == "hold" or .t == "release") and (.res | type) == "string")]
     | group_by(.res)[] | sort_by(.ep // 0) | last | select(.t == "hold")
     | ($sess[.owner] // null) as $x
-    | (if $x != null then (if $x.status == "busy" then 0 else $now - $x.since end)
+    # shell: the session is running a command (Meshy, rl: a watcher of its RL run, reminded all night)
+    | (if $x != null then (if $x.status | IN("busy","shell") then 0 else $now - $x.since end)
        else $now - ($last[.owner] // $now) end) as $q
     | "\(.res) \(.owner) \($q) \($now - (.ep // $now))"' |
   while read -r res own q held; do
@@ -2452,6 +2454,9 @@ FT
     "$BIN" hold gpu9 z1 "bench"
     reg busy; ht nudge --once >/dev/null 2>&1
     ! grep -F '"why":"hold"' "$EV" | grep -qF '"id":"z1"' || die "selftest: a working holder was told to release"
+    reg shell "" 900; ht nudge --once >/dev/null 2>&1
+    ! grep -F '"why":"hold"' "$EV" | grep -qF '"id":"z1"' || die "selftest: a holder running a command was told to release"
+    ! AWB_STALE=1 ht view --json | jq -e 'any(.anomalies[]; .kind == "hold")' >/dev/null || die "selftest: a holder running a command shown as not working"
     reg idle "" 900; ht nudge --once >/dev/null 2>&1
     [ "$(grep -F '"why":"hold"' "$EV" | grep -cF '"id":"z1"')" = 1 ] || die "selftest: an idle holder was not told"
     sleep 0.6; tmux -L "$S" capture-pane -p -t "$zp" | grep -Fq "别人在排队" || die "selftest: the hold reminder was not typed"
