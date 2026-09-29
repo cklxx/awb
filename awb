@@ -350,11 +350,6 @@ JQ_SNAP=$JQ_FOLD$JQ_DEFS'
       # many messages are notices that need no reply: one unanswered for a day is dropped
       # a worker driven by awb send with no open task: its messages are notices, not tasks
       | select((($s.agents[$k.id].sent // false) and $s.agents[$k.id].key == null) | not)
-      # a worker that replied with the key of its open task waits for awb reply: "replied" says so,
-      # a later message from the main agent is not a second thing to answer (aupai, jan)
-      | ($s.agents[$k.id]) as $ka
-      | select(($ka.key != null and any($raw[]; type == "object" and .t == "msg" and .dir == "in"
-                 and .id == $k.id and .key == $ka.key and (.ep // 0) >= ($ka.keyEp // 0))) | not)
       | select($x != null and $x.status == "idle" and (($s.agents[$k.id].sess // "") == "")
                and $nowep - ([$k.wait, $x.since] | max) >= $replyidle and $nowep - $k.wait < 86400)
       | {kind:"noreply", text:"\($k.name) 空闲 \(($nowep - $x.since) | ago)，主控 \(($nowep - $k.wait) | ago)前的消息还没回"}),
@@ -364,6 +359,9 @@ JQ_SNAP=$JQ_FOLD$JQ_DEFS'
       | ([$raw[] | select(type == "object" and .t == "msg" and .dir == "in" and .id == $a.id
                           and .key == $a.key and (.ep // 0) >= ($a.keyEp // 0)) | .ep // 0] | max) as $r
       | select($r != null and $x != null and $x.status == "idle" and $nowep - ([$r, $x.since] | max) >= $replyidle)
+      # the main agent wrote after that reply (asked for the final result: aupai, jan): the turn
+      # is with the worker, and noreply covers it
+      | select(any($raw[]; type == "object" and .t == "msg" and .dir == "out" and .id == $a.id and (.ep // 0) > $r) | not)
       | {kind:"replied", text:"\($a.name) 回复了 #\($a.key)（\(($nowep - $r) | ago)前）后空闲；做完了就 awb reply \($a.id) \($a.key)"}),
      (if $quiet >= $silent and $nrun > 0
       then {kind:"board", text:"看板 \($quiet | ago)没有新事件，主控可能停了"} else empty end),
@@ -2520,13 +2518,13 @@ FT
       i=$((i + 1)); [ $i -lt 40 ] || { kill $wp; die "selftest: a board with AWB_NUDGE=0 did not observe"; }; sleep 0.25; done
     kill $wp; wait $wp 2>/dev/null || true
     ht view --json | jq -e '.observe.files >= 1 and .observe.last > 0' >/dev/null || die "selftest: the last observation round not in the snapshot"
-    # a keyed reply after the send, then an idle session: shown until the main agent records it;
-    # a message from the main agent after that reply is not a second anomaly
-    in_ "$(date +%s)" main-x "got it" >> "$tr_"; ht _observe
-    ! AWB_REPLY_IDLE=0 ht view --json | jq -e 'any(.anomalies[]; .kind == "noreply")' >/dev/null \
-      || die "selftest: noreply beside replied for the same keyed reply"
+    # a keyed reply after the send, then an idle session: shown until the main agent records it
     AWB_REPLY_IDLE=0 ht view --json | jq -e --arg k "$ok_" 'any(.anomalies[]; .kind == "replied" and (.text | contains("awb reply z1 " + $k)))' >/dev/null \
       || die "selftest: a keyed reply left open with the session idle is not on the board: $(AWB_REPLY_IDLE=0 ht view --json | jq -c '.anomalies')"
+    # the main agent answers it (asks for the final result): the turn is the worker's, noreply only
+    sleep 1; in_ "$(date +%s)" main-x "is that final?" >> "$tr_"; ht _observe
+    AWB_REPLY_IDLE=0 ht view --json | jq -e '([.anomalies[] | .kind] | index("noreply")) and ([.anomalies[] | .kind] | index("replied") | not)' >/dev/null \
+      || die "selftest: after a message from the main agent, not noreply alone: $(AWB_REPLY_IDLE=0 ht view --json | jq -c '.anomalies')"
     "$BIN" reply z1 "$ok_" done >/dev/null
     ! AWB_REPLY_IDLE=0 ht view --json | jq -e 'any(.anomalies[]; .kind == "replied")' >/dev/null || die "selftest: a recorded reply still shown"
     # a notice to a sent worker with no open task needs no reply
