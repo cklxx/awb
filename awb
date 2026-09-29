@@ -350,6 +350,11 @@ JQ_SNAP=$JQ_FOLD$JQ_DEFS'
       # many messages are notices that need no reply: one unanswered for a day is dropped
       # a worker driven by awb send with no open task: its messages are notices, not tasks
       | select((($s.agents[$k.id].sent // false) and $s.agents[$k.id].key == null) | not)
+      # a worker that replied with the key of its open task waits for awb reply: "replied" says so,
+      # a later message from the main agent is not a second thing to answer (aupai, jan)
+      | ($s.agents[$k.id]) as $ka
+      | select(($ka.key != null and any($raw[]; type == "object" and .t == "msg" and .dir == "in"
+                 and .id == $k.id and .key == $ka.key and (.ep // 0) >= ($ka.keyEp // 0))) | not)
       | select($x != null and $x.status == "idle" and (($s.agents[$k.id].sess // "") == "")
                and $nowep - ([$k.wait, $x.since] | max) >= $replyidle and $nowep - $k.wait < 86400)
       | {kind:"noreply", text:"\($k.name) 空闲 \(($nowep - $x.since) | ago)，主控 \(($nowep - $k.wait) | ago)前的消息还没回"}),
@@ -1000,6 +1005,9 @@ watch() {
   # an open board also runs the nudge rounds (awb nudge), so agents are reminded wherever a
   # board is up; AWB_NUDGE=0 turns that off. The first round waits one AWB_NUDGE_POLL.
   last=; synced=0; off=0; full=; rt=0; nudged=$(date +%s)
+  # the script as this loop read it: a new install (a moved pin, a release) re-execs the board,
+  # so a running board takes it without its user restarting the pane
+  _self=$(cksum < "$BIN")
   # a board linked to a Lark topic (awb-lark sync ran once for it: lark.json) syncs it once a
   # minute, in the background. An unlinked board stays local: with only the group set, every
   # sandbox and scratch board a worker opened used to post a topic of its own to the group
@@ -1023,6 +1031,10 @@ watch() {
     fi
     if [ $(($(date +%s) - nudged)) -ge "${AWB_NUDGE_POLL:-60}" ]; then
       nudged=$(date +%s)
+      if [ "$(cksum < "$BIN" 2>/dev/null)" != "$_self" ] && sh -n "$BIN" 2>/dev/null; then
+        if [ $kb = 1 ]; then printf '\033[?1000l\033[?1006l'; stty "$_stty"; fi
+        exec "$BIN" view
+      fi
       # AWB_NUDGE=0 stops the reminders typed into agents, not the read-only observation
       if [ "${AWB_NUDGE:-1}" != 0 ]; then ( "$BIN" nudge --once >/dev/null 2>&1 & )
       else ( "$BIN" _observe >/dev/null 2>&1 & ); fi
@@ -1966,6 +1978,15 @@ selftest() {
   hb view --json | jq -e 'any(.anomalies[]; .text | contains("awb holds（应为 awb hold）"))' >/dev/null \
     || die "selftest: the suggestion is not on the board: $(hb view --json | jq -c .anomalies)"
   ! hb nosuchcmd 2>&1 | grep -Fq "did you mean" || die "selftest: a far miss got a suggestion"
+  # a running board takes a new install of its script (a moved pin) by re-executing itself
+  hr=$t/hot; mkdir -p "$hr/b"; cp "$BIN" "$hr/awb"
+  HOT_MARK=$t/hotmark AWB_DIR=$hr/b AWB_NUDGE=0 AWB_NUDGE_POLL=1 AWB_INTERVAL=0.2 "$hr/awb" view >/dev/null 2>&1 </dev/null &
+  hp=$!; sleep 0.5
+  awk 'NR == 2 {print "[ \"${1:-}\" = view ] && echo reloaded >> \"$HOT_MARK\""} 1' "$hr/awb" > "$hr/awb.new" \
+    && chmod +x "$hr/awb.new" && mv "$hr/awb.new" "$hr/awb"
+  i=0; until [ -s "$t/hotmark" ]; do
+    i=$((i + 1)); [ $i -lt 40 ] || { kill $hp; die "selftest: a running board did not take a new install of awb"; }; sleep 0.25; done
+  kill $hp; wait $hp 2>/dev/null || true
   AWB_STALE=0 hb view --json | jq -e '(.holds | length) == 0 and (any(.anomalies[]; .kind == "hold") | not)' >/dev/null \
     || die "selftest: a released resource still shown"
   # merge: only the newest verdict naming the current head counts, a conditional or retracted
@@ -2499,7 +2520,11 @@ FT
       i=$((i + 1)); [ $i -lt 40 ] || { kill $wp; die "selftest: a board with AWB_NUDGE=0 did not observe"; }; sleep 0.25; done
     kill $wp; wait $wp 2>/dev/null || true
     ht view --json | jq -e '.observe.files >= 1 and .observe.last > 0' >/dev/null || die "selftest: the last observation round not in the snapshot"
-    # a keyed reply after the send, then an idle session: shown until the main agent records it
+    # a keyed reply after the send, then an idle session: shown until the main agent records it;
+    # a message from the main agent after that reply is not a second anomaly
+    in_ "$(date +%s)" main-x "got it" >> "$tr_"; ht _observe
+    ! AWB_REPLY_IDLE=0 ht view --json | jq -e 'any(.anomalies[]; .kind == "noreply")' >/dev/null \
+      || die "selftest: noreply beside replied for the same keyed reply"
     AWB_REPLY_IDLE=0 ht view --json | jq -e --arg k "$ok_" 'any(.anomalies[]; .kind == "replied" and (.text | contains("awb reply z1 " + $k)))' >/dev/null \
       || die "selftest: a keyed reply left open with the session idle is not on the board: $(AWB_REPLY_IDLE=0 ht view --json | jq -c '.anomalies')"
     "$BIN" reply z1 "$ok_" done >/dev/null
