@@ -132,7 +132,9 @@ reduce (. // [])[] as $e (
   elif $e.t == "status" and $e.status == "done" and .agents[$e.id].gate then
     .agents[$e.id] += {status:"failed", endEp:($e.ep // 0)}
   elif $e.t == "status" then
-    (if $e.status == "done" then finish($e.id) elif $e.status == "failed" then lose($e.id) else . end)
+    # a rejected check (gate) is work to fix, not a dead worker: its sent task stays open
+    # (Meshy: both lost tasks were a failed check, and the reply to the re-check was stale)
+    (if $e.status == "done" then finish($e.id) elif $e.status == "failed" and ($e.gate != true) then lose($e.id) else . end)
     | .agents[$e.id].gate = (.agents[$e.id].gate or ($e.gate == true))
     | .agents[$e.id].status = ($e.status // "running")
     | .agents[$e.id].reason = ($e.reason // "")
@@ -704,7 +706,7 @@ replay() {
           elif .o[$e.id] == null then .
           elif $e.t == "done" and ($e.key // "") != "" then .r += [.o[$e.id] + {how:"reply", d:($e.ep - .o[$e.id].t0)}] | del(.o[$e.id])
           elif $e.t == "status" and $e.status == "done" then .r += [.o[$e.id] + {how:"finish"}] | del(.o[$e.id])
-          elif $e.t == "start" or ($e.t == "status" and $e.status == "failed") then .r += [.o[$e.id] + {how:"lost"}] | del(.o[$e.id])
+          elif $e.t == "start" or ($e.t == "status" and $e.status == "failed" and $e.gate != true) then .r += [.o[$e.id] + {how:"lost"}] | del(.o[$e.id])
           else . end)) as $K
     # messages observed from the transcript of the main agent: consecutive messages before a
     # reply are one wait, closed by the reply
@@ -770,7 +772,7 @@ freeze_once() {
     | reduce .[] as $e ({};
         if ($e.id | type) != "string" then .
         elif $e.t == "status" then .[$e.id].s = $e.status
-          | (if $e.status == "running" or $e.status == "blocked" then . else .[$e.id].k = null end)
+          | (if $e.status == "running" or $e.status == "blocked" or $e.gate == true then . else .[$e.id].k = null end)
         elif $e.t == "now" then (if .[$e.id].s == "done" then .[$e.id].s = "running" else . end)
           | (if ($e.key // "") != "" then .[$e.id] += {k:$e.key, sent:true} else . end)
         elif $e.t == "done" and ($e.key // "") != "" and .[$e.id].k == $e.key then .[$e.id].k = null
@@ -1922,6 +1924,10 @@ selftest() {
   printf '{"t":"task","ep":1,"id":"k9","state":"drop","text":"old lost","parent":"","owner":"d1"}\n{"t":"now","ep":2,"id":"d1","text":"fresh","key":"k9"}\n' >> "$sd/events.jsonl"
   sn view --json | jq -e '[.. | objects | select(.text? == "old lost")] == [] and [.next[].text] == ["reviewer：fresh"]' >/dev/null \
     || die "selftest: a repeated key revived a dropped task: $(sn view --json | jq -c '{tasks, next}')"
+  # a rejected check keeps the sent task open; the reply after the passing re-check closes it
+  AWB_NOTIFY=0 sn check d1 -- false >/dev/null 2>&1 || true
+  sn peers | grep -q '^d1 .*#k9' || die "selftest: a rejected check lost the sent task: $(sn peers)"
+  sn check d1 -- true >/dev/null && sn reply d1 k9 "fixed" >/dev/null || die "selftest: the reply after a re-check was refused"
   # news: lines with one key are one fact, the latest shows; lines without a key all show
   bd4=$t/brief4; mkdir -p "$bd4"; nb() { AWB_DIR=$bd4 "$BIN" news "$@"; }
   nb "no key"; nb --key val@15000 "feed: val 1.888"; nb "other"; nb --key val@15000 "val 1.888, grad ok"; nb --key ck "saved"
