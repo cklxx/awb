@@ -35,6 +35,7 @@ if command -v lark-cli >/dev/null; then
   [ -z "$chat" ] || "$bin/awb-lark" setup "$chat" || echo "lark: setup failed; rerun: awb-lark setup $chat"
 fi
 for c in tmux jq; do command -v "$c" >/dev/null || echo "missing: $c (required)"; done
+command -v flock >/dev/null || command -v lockf >/dev/null || echo "missing: flock or lockf (required for locking)"
 case ":$PATH:" in *":$bin:"*) ;; *) echo "add to PATH: $bin" ;; esac
 echo "installed $("$bin/awb" version) -> $bin/awb"
 echo "skill -> $skill (Claude Code); other agents: run 'awb skill'"
