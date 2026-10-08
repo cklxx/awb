@@ -1,0 +1,34 @@
+name: test
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Runtime dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y jq tmux default-jre-headless
+          curl -fsSL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -o /tmp/elan-init.sh
+          sh /tmp/elan-init.sh -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          curl -fsSL --retry 3 https://github.com/tlaplus/tlaplus/releases/latest/download/tla2tools.jar -o /tmp/tla2tools.jar
+      - name: Shell syntax
+        run: sh -n awb awb-lark install.sh model/accept.sh model/tla/tlc.sh
+      - name: Lean model and acceptance
+        run: |
+          cd model
+          lake build
+          ../model/accept.sh . Accept.lean
+      - name: Runtime selftest
+        run: ./awb selftest
+      - name: TLA models
+        env:
+          TLA2TOOLS: /tmp/tla2tools.jar
+        run: ./model/tla/tlc.sh

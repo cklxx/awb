@@ -88,7 +88,7 @@ curl -fsSL https://raw.githubusercontent.com/cklxx/awb/main/install.sh | sh
 awb selftest
 ```
 
-This installs `awb` (needs sh, tmux, jq) to `~/.local/bin` and the agent skill to
+This installs `awb` (needs sh, tmux, jq and `flock` on Linux or `lockf` on BSD/macOS) to `~/.local/bin` and the agent skill to
 `~/.claude/skills/awb-workbench`, from the latest release. Run `./install.sh` in a clone to
 symlink both instead. `AWB_BIN_DIR` and `AWB_SKILL_DIR` change the two locations. Agents without a skill mechanism (codex, ...) read the same manual
 with `awb skill`; `awb` itself points agents there.

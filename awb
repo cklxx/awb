@@ -35,10 +35,24 @@ init_dir() {
 # append '<jq filter>' [jq args...] — $time (clock) and $ep (epoch) available
 append() {
   init_dir
+  lock append
   _f=$1; shift
-  jq -cn --arg time "$(date +$TS_FMT)" --argjson ep "$(date +%s)" "$_f" "$@" >> "$EV"
+  event_boundary
+  if ! jq -cn --arg time "$(date +$TS_FMT)" --argjson ep "$(date +%s)" "$_f" "$@" >> "$EV"; then
+    unlock append; die "cannot append an event to $EV"
+  fi
+  unlock append
   # once per command, so a caller sees which board it wrote to
   [ -n "${AWB_TOLD:-}" ] || { AWB_TOLD=1; printf '%s: recorded in %s\n' "$PROG" "$AWB_DIR" >&2; }
+}
+
+# Caller holds the append lock, for both direct events and imported messages.
+event_boundary() {
+  # A killed writer may leave an incomplete last line. Keep it separate from the next event;
+  # readers already ignore malformed lines. Concurrent large events must never interleave.
+  if [ -s "$EV" ] && [ "$(tail -c 1 "$EV" | od -An -tx1 | tr -d ' ')" != 0a ]; then
+    printf '\n' >> "$EV"
+  fi
 }
 
 q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
@@ -837,13 +851,20 @@ freeze_once() {
 # rounds, and a round already running in a live process is not repeated
 nudge_round() {
   _nl=$AWB_DIR/lock-nudge
+  _nl_fd=$(lock_slot)
+  eval "exec $_nl_fd>$(q "$_nl.guard")"
+  lock_fd "$_nl_fd" 0 || { eval "exec $_nl_fd>&-"; return 0; }
   if ! ln -s "$$" "$_nl" 2>/dev/null; then
     _hp=$(readlink "$_nl" 2>/dev/null || true)
-    if [ -n "$_hp" ] && [ "$_hp" != "$$" ] && kill -0 "$_hp" 2>/dev/null; then return 0; fi
-    rm -f "$_nl"; ln -s "$$" "$_nl" 2>/dev/null || return 0
+    if [ -n "$_hp" ] && [ "$_hp" != "$$" ] && kill -0 "$_hp" 2>/dev/null; then eval "exec $_nl_fd>&-"; return 0; fi
+    rm -f "$_nl"; ln -s "$$" "$_nl" 2>/dev/null || { eval "exec $_nl_fd>&-"; return 0; }
   fi
+  LOCK_FDS="${LOCK_FDS:-} $_nl_fd"
   nudge_once
   rm -f "$_nl"
+  _kept=; for _f in ${LOCK_FDS:-}; do [ "$_f" = "$_nl_fd" ] || _kept="$_kept $_f"; done
+  LOCK_FDS=$_kept
+  eval "exec $_nl_fd>&-"
 }
 
 # the main agent's messaging, observed read-only in the Claude Code transcripts of this
@@ -909,16 +930,21 @@ observe_once() {
         else empty end end' 2>/dev/null
   done > "$_new"
   rm -f "$_new.c"
-  mv "$_nf" "$_of"
   if [ -s "$_new" ]; then
+    lock append
     jq -sc --argjson seen "$(grep -F '"t":"msg"' "$EV" | jq -Rsc '[split("\n")[] | fromjson? | .mid // empty | select(. != "")]
           | map({key:., value:true}) | from_entries')" \
       '[.[] | select(.mid == "" or ($seen[.mid] | not))] | (map(select(.mid == "")) + (map(select(.mid != "")) | unique_by(.mid)))
        | sort_by(.ep)[]' "$_new" > "$_new.u"
     # a keyed reply is only recorded: a progress report carries the key too (Meshy, 2026-09-28:
     # "[awb env#K] 进度：…安装中" closed the task), so the main agent closes it with awb reply
-    cat "$_new.u" >> "$EV"
+    event_boundary
+    cat "$_new.u" >> "$EV" || die "cannot import messages to $EV"
+    unlock append
   fi
+  # Publish offsets only after the events. A killed observer replays the old offsets;
+  # message ids remove duplicates already appended before that interruption.
+  mv "$_nf" "$_of"
   rm -f "$_new" "$_new.u"; unlock obs
 }
 
@@ -1033,7 +1059,8 @@ watch() {
       synced=$(date +%s)
       lp=$(readlink "$AWB_DIR/lock-lark" 2>/dev/null || true)
       if [ -n "$lp" ] && kill -0 "$lp" 2>/dev/null; then
-        la=$(stat -f %m "$AWB_DIR/lock-lark" 2>/dev/null || stat -c %Y "$AWB_DIR/lock-lark" 2>/dev/null || echo "$synced")
+        la=$(stat -c %Y "$AWB_DIR/lock-lark" 2>/dev/null || stat -f %m "$AWB_DIR/lock-lark" 2>/dev/null || echo "$synced")
+        case $la in ''|*[!0-9]*) la=$synced ;; esac
         if [ $((synced - la)) -ge "${AWB_LARK_STALE:-300}" ]; then
           pkill -TERM -P "$lp" 2>/dev/null || true; kill -TERM "$lp" 2>/dev/null || true
         fi
@@ -1135,7 +1162,7 @@ up() {
     -e "AWB_DIR=$AWB_DIR" -e "AWB_TMUX_SOCKET=$SOCK" -e "AWB_TMUX_FOR=$AWB_DIR" \
     "AWB_DIR=$(q "$AWB_DIR") AWB_TMUX_SOCKET=$(q "$SOCK") AWB_TMUX_FOR=$(q "$AWB_DIR") $(q "$BIN") view" >/dev/null
   board=$(tmux -S "$SOCK" list-panes -t awb:board -F '#{pane_id}' | head -1)
-  work=$(tmux -S "$SOCK" split-window -v -t "$board" -d -p 45 -P -F '#{pane_id}' \
+  work=$(tmux -S "$SOCK" split-window -v -t "$board" -d -l 45% -P -F '#{pane_id}' \
            -e "AWB_DIR=$AWB_DIR" -e "AWB_TMUX_SOCKET=$SOCK" -e "AWB_TMUX_FOR=$AWB_DIR" "$SHELL")
   printf '%s\n' "$work" > "$AWB_DIR/work-pane"
   tmux -S "$SOCK" select-pane -t "$board" -T board
@@ -1233,25 +1260,65 @@ $(q "$BIN") _enter; $tui_cmd; exec $(q "$SHELL")"
 
 # ID PANE per agent: $AWB_DIR/panes ("ID PANE" lines, for agents started outside awb)
 # overrides the pane of the latest start event
-# mutual exclusion under $AWB_DIR (mkdir is atomic). Waits up to AWB_LOCK_WAIT seconds;
-# a lock whose holder died is taken over. Released on exit. Races found in model/tla/.
-# ponytail: takeover reads the pid then removes the dir, so two takers can race after a crash
+# mutual exclusion under $AWB_DIR. A kernel lock serializes acquisition and stale-marker
+# cleanup; a delayed cleaner cannot remove a new holder's marker. Never unlink the guard
+# file: its inode must remain the same for every waiter. The kernel releases it on exit.
+lock_fd() {
+  case ${1:-} in [3-9]) ;; *) die "lock needs an inherited descriptor from 3 to 9" ;; esac
+  case ${2:-} in ''|*[!0-9]*) die "lock timeout must be integer seconds" ;; esac
+  if command -v flock >/dev/null 2>&1; then flock -w "$2" "$1"
+  elif command -v lockf >/dev/null 2>&1; then lockf -t "$2" "$1"
+  else die "locking requires flock (Linux) or lockf (BSD/macOS)"; fi
+}
+
+lock_cleanup() {
+  for _lk_cleanup_fd in ${LOCK_FDS:-}; do
+    eval '_lk_cleanup_dir=${LOCK_DIR_'"$_lk_cleanup_fd"':-}'
+    [ -z "$_lk_cleanup_dir" ] || rm -rf "$_lk_cleanup_dir"
+    eval "exec $_lk_cleanup_fd>&-"
+  done
+  LOCK_FDS=
+}
+
+lock_slot() {
+  for _lk_candidate in 9 8 7 6 5 4 3; do
+    case " ${LOCK_FDS:-} " in *" $_lk_candidate "*) continue ;; esac
+    printf '%s' "$_lk_candidate"; return 0
+  done
+  die "too many nested locks"
+}
+
 lock() {
-  _l=$AWB_DIR/lock-$1; _n=0
-  until mkdir "$_l" 2>/dev/null; do
-    _o=$(cat "$_l/pid" 2>/dev/null || true)
-    if [ -n "$_o" ] && ! kill -0 "$_o" 2>/dev/null; then rm -rf "$_l"; continue; fi
-    _n=$((_n + 1)); [ $_n -le $((${AWB_LOCK_WAIT:-600} * 5)) ] || die "$1 is locked by pid ${_o:-?}"
+  _lk_path=$AWB_DIR/lock-$1; _lk_tries=0; _lk_fd=$(lock_slot)
+  eval "exec $_lk_fd>$(q "$_lk_path.guard")"
+  if ! lock_fd "$_lk_fd" "${AWB_LOCK_WAIT:-600}"; then
+    eval "exec $_lk_fd>&-"; die "$1 is locked"
+  fi
+  LOCK_FDS="${LOCK_FDS:-} $_lk_fd"
+  eval "LOCK_DIR_$_lk_fd="
+  trap 'lock_cleanup' EXIT; trap 'exit 130' INT TERM
+  until mkdir "$_lk_path" 2>/dev/null; do
+    _lk_owner=$(cat "$_lk_path/pid" 2>/dev/null || true)
+    # With the guard held, an empty marker can only belong to an interrupted acquisition.
+    if [ -z "$_lk_owner" ] || ! kill -0 "$_lk_owner" 2>/dev/null; then rm -rf "$_lk_path"; continue; fi
+    _lk_tries=$((_lk_tries + 1)); [ $_lk_tries -le $((${AWB_LOCK_WAIT:-600} * 5)) ] || die "$1 is locked by pid ${_lk_owner:-?}"
     sleep 0.2
   done
-  echo $$ > "$_l/pid"
-  LOCKS="${LOCKS:-} $_l"; trap 'rm -rf $LOCKS' EXIT; trap 'exit 130' INT TERM
+  echo $$ > "$_lk_path/pid"
+  eval "LOCK_DIR_$_lk_fd=$(q "$_lk_path")"
 }
-# drop it from LOCKS too: otherwise this process's EXIT trap would later remove the lock
-# another process has taken since, and a third one could enter
 unlock() {
-  rm -rf "$AWB_DIR/lock-$1"
-  _k=; for _x in ${LOCKS:-}; do [ "$_x" = "$AWB_DIR/lock-$1" ] || _k="$_k $_x"; done; LOCKS=$_k
+  for _lk_unlock_fd in ${LOCK_FDS:-}; do
+    eval '_lk_unlock_dir=${LOCK_DIR_'"$_lk_unlock_fd"':-}'
+    [ "$_lk_unlock_dir" = "$AWB_DIR/lock-$1" ] || continue
+    rm -rf "$_lk_unlock_dir"
+    # Forget the marker before releasing the guard, including on a signal during unlock.
+    eval "unset LOCK_DIR_$_lk_unlock_fd"
+    _lk_kept=; for _lk_candidate in ${LOCK_FDS:-}; do [ "$_lk_candidate" = "$_lk_unlock_fd" ] || _lk_kept="$_lk_kept $_lk_candidate"; done
+    LOCK_FDS=$_lk_kept
+    eval "exec $_lk_unlock_fd>&-"
+    return 0
+  done
 }
 
 # the agent's open milestone ("EP TEXT" of its last `now`, if no `done` came after)
@@ -1280,10 +1347,11 @@ self_report() {
 send() {
   _par=; if [ "${1:-}" = --under ]; then _par=${2:-}; shift 2 || die "--under needs a task id"; fi
   [ $# -ge 2 ] || die "usage: $PROG send [--under PARENT] ID TASK|TASKID [TEXT]   (prints the message to SendMessage)"
-  id=$1; shift; need_agent "$id"
+  id=$1; shift; init_dir
   # serialize the open-task check, key allocation, and append; two simultaneous sends must not
   # both observe an empty task slot for the same worker
   lock "send"
+  need_agent "$id"
   k=$(open_key "$id"); [ -z "$k" ] || die "$id already has open task #$k; wait for its reply (or: $PROG idle $id)"
   # a planned task (awb task T1 todo ...) not yet done or sent is sent as it is: its id is the key
   _pt=$(events_json | jq -r --arg t "$1" "$JQ_FOLD"' fold | select(all(.agents[]; .key != $t))
@@ -1526,7 +1594,16 @@ tell() {
   # one tell per pane at a time, each with its own buffer: concurrent tells merged or lost
   # messages otherwise (model/tla/AwbTell.tla)
   lock "tell-$_p"
+  if _dialog; then
+    echo "$PROG: $_id opened a permission dialog while waiting for the pane lock" >&2
+    unlock "tell-$_p"; return 1
+  fi
   printf '%s' "$_msg" | tm load-buffer -b "awb-tell-$$" -
+  if _dialog; then
+    tm delete-buffer -b "awb-tell-$$" 2>/dev/null || true
+    echo "$PROG: $_id opened a permission dialog before the paste" >&2
+    unlock "tell-$_p"; return 1
+  fi
   tm paste-buffer -p -d -b "awb-tell-$$" -t "$_p"
   # Confirm the paste actually submitted. A TUI can keep it in the input box
   # after one Enter: Claude leaves the text (or a collapsed "[Pasted text #N
@@ -1567,6 +1644,9 @@ tell() {
     if _unsubmitted "$_il"; then _try=$((_try + 1)); _enter || { unlock "tell-$_p"; return 1; }
     else _try=$_max; fi
   done
+  # The last Enter needs the same redraw interval as the first. Reading immediately
+  # after a retry can still see the old input even though the TUI accepted the message.
+  sleep ${AWB_TELL_SETTLE:-0.5}
   _il=$(_inputline)
   if _unsubmitted "$_il"; then
     # return, not die: check/nudge call tell as a function and must keep going
@@ -1677,17 +1757,20 @@ check() {
     rc=98; echo "expect: no output line matches $_exp" >> "$CHK_LOG"
   fi
   # a pass verifies the milestone it started on; if the agent moved on meanwhile, it is stale
+  lock send
   if [ "$rc" = 0 ] && [ "$(open_ms "$id")" != "$ms" ]; then
     rc=97; echo "stale: milestone changed during the check (was: ${ms#* }); re-run the check" >> "$CHK_LOG"
   fi
   if [ "$rc" = 0 ]; then
     append '{t:"done",time:$time,ep:$ep,id:$id,text:null,verified:true}' --arg id "$id"
+    unlock send
     echo "accepted: $what"
   else
     why=$(grep -v '^[[:space:]]*$' "$CHK_LOG" | tail -1 | cut -c1-120)
     [ -n "$why" ] || why="exit $rc"
     append '{t:"status",time:$time,ep:$ep,id:$id,status:"failed",reason:$r,gate:true}' \
       --arg id "$id" --arg r "验收未过($what): $why"
+    unlock send
     # tell the agent, unless the agent ran the check itself and already sees the output;
     # a run agent back at a plain shell prompt is a command line, not an agent TUI
     if [ "${AWB_NOTIFY:-1}" = 1 ] && [ "$(agent_pane "$id")" != "${TMUX_PANE:-}" ] \
@@ -1776,7 +1859,15 @@ EOF
 selftest() {
   t=$(mktemp -d)
   S=awbselftest$$
-  cleanup() { tmux -L "$S" kill-server 2>/dev/null || true; rm -rf "$t"; }
+  cleanup() {
+    test_rc=$?
+    for test_server in "$S" "${S}b" "${S}e" "${S}s"; do tmux -L "$test_server" kill-server 2>/dev/null || true; done
+    for test_socket in "$t/sock" "$t/up2/sock" "$t/parent/.awb/sock"; do
+      [ ! -S "$test_socket" ] || tmux -S "$test_socket" kill-server 2>/dev/null || true
+    done
+    if [ "$test_rc" = 0 ]; then rm -rf "$t"
+    else printf 'selftest: failure evidence kept at %s\n' "$t" >&2; fi
+  }
   trap cleanup EXIT
   export AWB_DIR=$t AWB_COLS=160 AWB_ROWS=200 AWB_NUDGE=0; EV=$t/events.jsonl
   # never the user's Lark group: a test board's watch loop would mirror itself there. A
@@ -1786,6 +1877,38 @@ selftest() {
   unset AWB_TMUX_SOCKET AWB_TMUX_FOR TMUX TMUX_PANE
   mkdir -p "$t/guard"; printf '#!/bin/sh\necho "$*" >> %s/guard/calls\nexit 1\n' "$t" > "$t/guard/lark-cli"
   chmod +x "$t/guard/lark-cli"; PATH=$t/guard:$PATH; export PATH
+  unset AWB_LARK_CHAT
+  # Failed release downloads must neither replace working binaries nor remove the skill.
+  it=$t/installer; mkdir -p "$it/mock" "$it/bin" "$it/skills/awb-workbench"
+  cp "$(dirname "$BIN")/install.sh" "$it/install.sh"
+  cat > "$it/mock/curl" <<'INSTALLCURL'
+#!/bin/sh
+out=; url=
+while [ $# -gt 0 ]; do
+  case $1 in -o) out=$2; shift 2 ;; https:*) url=$1; shift ;; *) shift ;; esac
+done
+case $url in *"$FAIL_ASSET") exit 22 ;; esac
+case $url in
+  */awb) cp "$TEST_SOURCE/awb" "$out" ;;
+  */awb-lark) cp "$TEST_SOURCE/awb-lark" "$out" ;;
+  *) cp "$TEST_SOURCE/skills/awb-workbench/SKILL.md" "$out" ;;
+esac
+INSTALLCURL
+  chmod +x "$it/mock/curl"
+  for asset in awb awb-lark SKILL.md; do
+    printf 'old-awb' > "$it/bin/awb"; printf 'old-lark' > "$it/bin/awb-lark"
+    printf 'old-skill' > "$it/skills/awb-workbench/SKILL.md"
+    if AWB_BIN_DIR=$it/bin AWB_SKILL_DIR=$it/skills TEST_SOURCE=$(dirname "$BIN") FAIL_ASSET=$asset \
+        PATH=$it/mock:$PATH sh "$it/install.sh" </dev/null >"$it/out" 2>"$it/err"; then
+      die "selftest: failed $asset download reported successful installation"
+    fi
+    [ "$(cat "$it/bin/awb")" = old-awb ] && [ "$(cat "$it/bin/awb-lark")" = old-lark ] \
+      && [ "$(cat "$it/skills/awb-workbench/SKILL.md")" = old-skill ] \
+      || die "selftest: failed $asset download changed an installed file"
+    [ "$(ls -A "$it/bin" | wc -l | tr -d ' ')" = 2 ] \
+      && [ "$(ls -A "$it/skills/awb-workbench" | wc -l | tr -d ' ')" = 1 ] \
+      || die "selftest: failed installation left temporary files"
+  done
 
   ( cd "$t" && AWB_DIR=help-probe "$BIN" up --help >/dev/null ) || die "selftest: up --help failed"
   [ ! -e "$t/help-probe" ] || die "selftest: up --help created AWB_DIR"
@@ -1959,6 +2082,107 @@ selftest() {
   for pid in $pids; do wait "$pid" || true; done
   [ "$(jq -sc --arg id srace '[.[] | select(.t == "now" and .id == $id and (.key | type) == "string")] | length' "$srd/events.jsonl")" = 1 ] \
     || die "selftest: concurrent sends opened multiple tasks for one worker"
+  sk=$(jq -r 'select(.t == "now" and .id == "srace") | .key' "$srd/events.jsonl")
+  pids=
+  for n in $(seq 1 12); do
+    AWB_DIR=$srd "$BIN" reply srace "$sk" "same reply" >"$t/reply-$n.out" 2>"$t/reply-$n.err" & pids="$pids $!"
+  done
+  for pid in $pids; do wait "$pid" || true; done
+  [ "$(jq -sc --arg k "$sk" '[.[] | select(.t == "done" and .key == $k)] | length' "$srd/events.jsonl")" = 1 ] \
+    || die "selftest: concurrent duplicate replies recorded multiple completions"
+  # jq flushes large output in chunks: append must serialize the whole event, including
+  # finishing an interrupted last line before writing the next event.
+  ed=$t/large-events; mkdir -p "$ed"; large=$(awk 'BEGIN {for (i=0;i<50000;i++) printf "z"}')
+  pids=
+  for n in $(seq 1 16); do
+    AWB_DIR=$ed "$BIN" news "$n:$large" >"$t/news-$n.out" 2>"$t/news-$n.err" & pids="$pids $!"
+  done
+  for pid in $pids; do wait "$pid" || die "selftest: a concurrent large append failed"; done
+  jq -se 'length == 16 and ([.[].text | split(":")[0]] | unique | length) == 16' "$ed/events.jsonl" >/dev/null \
+    || die "selftest: large concurrent events interleaved or disappeared"
+  printf '{"t":"news","text":"interrupted' >> "$ed/events.jsonl"
+  AWB_DIR=$ed "$BIN" news "after interruption" >/dev/null
+  jq -Rse '[split("\n")[] | fromjson?] | length == 17 and .[-1].text == "after interruption"' "$ed/events.jsonl" >/dev/null \
+    || die "selftest: an interrupted append consumed the next complete event"
+  # Force a delayed stale cleaner to overlap a new holder. The kernel guard must block
+  # the new holder until the cleaner enters and leaves its critical section.
+  ld="$t/locks with spaces"; mkdir -p "$ld/bin" "$ld/lock-unit"; echo 999999999 > "$ld/lock-unit/pid"
+  { printf 'set -eu\nPROG=lock-test\ndie() { echo "$*" >&2; exit 1; }\n'
+    awk '/^q\(\)/' "$BIN"
+    awk '/^# mutual exclusion under/{p=1} /^# the agent.s open milestone/{p=0} p' "$BIN"
+    cat <<'LOCKACTOR'
+lock unit
+: > "$TEST_ROOT/entered-$LABEL"
+for i in $(seq 1 200); do [ ! -e "$TEST_ROOT/release-$LABEL" ] || break; sleep .02; done
+unlock unit
+LOCKACTOR
+  } > "$ld/actor.sh"
+  cat > "$ld/bin/rm" <<'LOCKRM'
+#!/bin/sh
+if [ "$LABEL" = B ] && [ "$*" = "-rf $AWB_DIR/lock-unit" ] && [ ! -e "$TEST_ROOT/cleaner-paused" ]; then
+  : > "$TEST_ROOT/cleaner-paused"
+  for i in $(seq 1 200); do [ ! -e "$TEST_ROOT/allow-cleaner" ] || break; sleep .02; done
+fi
+exec /bin/rm "$@"
+LOCKRM
+  chmod +x "$ld/bin/rm"
+  AWB_DIR=$ld LABEL=B TEST_ROOT=$ld PATH="$ld/bin:$PATH" sh "$ld/actor.sh" >"$ld/B.log" 2>&1 & pb=$!
+  i=0; until [ -e "$ld/cleaner-paused" ]; do
+    i=$((i+1)); [ $i -lt 100 ] || { kill "$pb"; wait "$pb" || true; die "selftest: stale cleaner did not pause"; }; sleep .02
+  done
+  AWB_DIR=$ld LABEL=A TEST_ROOT=$ld PATH="$ld/bin:$PATH" sh "$ld/actor.sh" >"$ld/A.log" 2>&1 & pa=$!
+  sleep .2
+  if [ -e "$ld/entered-A" ]; then
+    kill "$pa" "$pb"; wait "$pa" "$pb" || true; die "selftest: stale takeover let a second holder enter"
+  fi
+  : > "$ld/allow-cleaner"
+  i=0; until [ -e "$ld/entered-B" ]; do
+    i=$((i+1)); [ $i -lt 100 ] || { kill "$pa" "$pb"; wait "$pa" "$pb" || true; die "selftest: cleaner did not take the lock"; }; sleep .02
+  done
+  [ ! -e "$ld/entered-A" ] || die "selftest: two lock holders entered together"
+  : > "$ld/release-B"; wait "$pb" || die "selftest: cleaner could not release its lock"
+  i=0; until [ -e "$ld/entered-A" ]; do
+    i=$((i+1)); [ $i -lt 100 ] || { kill "$pa"; wait "$pa" || true; die "selftest: waiter did not acquire released lock"; }; sleep .02
+  done
+  : > "$ld/release-A"; wait "$pa" || die "selftest: waiter could not release its lock"
+  # A crash between marker creation and pid publication is recoverable; path spaces must
+  # also remain intact during EXIT cleanup.
+  mkdir "$ld/lock-empty"
+  ( AWB_DIR=$ld; lock empty ) || die "selftest: an empty abandoned marker stopped recovery"
+  [ ! -d "$ld/lock-empty" ] || die "selftest: EXIT failed to clean a lock with spaces in its path"
+  # A reminder round must retain an outer lock while allocating its own guard and
+  # nested observation locks. Opening a fixed fd 9 used to release the outer guard.
+  { printf 'set -eu\nPROG=lock-test\ndie() { echo "$*" >&2; exit 1; }\n'
+    awk '/^q\(\)/' "$BIN"
+    awk '/^# mutual exclusion under/{p=1} /^# the agent.s open milestone/{p=0} p' "$BIN"
+    printf 'exec 3>"$AWB_DIR/lock-outer.guard"\nlock_fd 3 0\n'
+  } > "$ld/outer.sh"
+  ( AWB_DIR=$ld; lock outer
+    nudge_once() {
+      if AWB_LOCK_WAIT=0 sh "$ld/outer.sh" >"$ld/outer-probe.log" 2>&1; then
+        die "selftest: a reminder round released its outer guard"
+      fi
+      lock inner; unlock inner
+    }
+    nudge_round
+    if AWB_LOCK_WAIT=0 sh "$ld/outer.sh" >"$ld/outer-probe.log" 2>&1; then
+      die "selftest: reminder cleanup released its outer guard"
+    fi
+    unlock outer
+  ) || die "selftest: nested reminder locking failed"
+  mkdir "$t/no-lock-tools"
+  if PATH=$t/no-lock-tools AWB_DIR=$ld AWB=$BIN /bin/sh "$(dirname "$BIN")/awb-lark" sync --dry-run \
+       >"$t/missing-lock.out" 2>"$t/missing-lock.err"; then
+    die "selftest: Lark sync silently accepted missing lock tools"
+  fi
+  grep -Fq 'locking requires flock' "$t/missing-lock.err" \
+    || die "selftest: Lark sync did not report its missing lock dependency"
+  gd=$t/gate-lock-globals
+  AWB_DIR=$gd "$BIN" start gv gate-vars >/dev/null
+  AWB_DIR=$gd "$BIN" check gv -- true >/dev/null
+  AWB_DIR=$gd "$BIN" view --json | jq -e '.checks[0].ok and (.checks[0].steps | length) == 1
+    and .checks[0].steps[0].s == "cmd" and (.violations | length) == 0' >/dev/null \
+    || die "selftest: nested append locking changed the gate step name or violated its audit"
   # news: lines with one key are one fact, the latest shows; lines without a key all show
   bd4=$t/brief4; mkdir -p "$bd4"; nb() { AWB_DIR=$bd4 "$BIN" news "$@"; }
   nb "no key"; nb --key val@15000 "feed: val 1.888"; nb "other"; nb --key val@15000 "val 1.888, grad ok"; nb --key ck "saved"
@@ -2284,16 +2508,20 @@ EOF
   if command -v tmux >/dev/null; then
     boardpane=$(tmux -L "$S" new-session -d -s awb -n board -x 200 -y 120 -P -F '#{pane_id}' \
       "AWB_DIR=$(q "$t") $(q "$BIN") view")
-    work=$(tmux -L "$S" split-window -v -t "$boardpane" -d -p 60 -P -F '#{pane_id}' "$SHELL")
-    sleep 1
-    cap=$(tmux -L "$S" capture-pane -p -t "$boardpane")
-    printf '%s' "$cap" | grep -Fq "SHIP THE WORKBENCH" || die "selftest: board not live-rendering"
+    work=$(tmux -L "$S" split-window -v -t "$boardpane" -d -l 60% -P -F '#{pane_id}' "$SHELL")
+    i=0
+    until tmux -L "$S" capture-pane -p -t "$boardpane" | grep -Fq "SHIP THE WORKBENCH"; do
+      i=$((i+1)); [ $i -lt 60 ] || die "selftest: board not live-rendering"; sleep .25
+    done
 
     printf '%s\n' "$work" > "$t/work-pane"
-    tmux -L "$S" send-keys -t "$work" "export AWB_DIR=$(q "$t")" Enter
+    tmux -L "$S" send-keys -t "$work" "export AWB_DIR=$(q "$t"); echo awb-selftest-work-ready" Enter
+    i=0; until tmux -L "$S" capture-pane -p -t "$work" | grep -Fxq 'awb-selftest-work-ready'; do
+      i=$((i+1)); [ $i -lt 120 ] || die "selftest: work shell did not become ready"; sleep .25
+    done
     tmux -L "$S" send-keys -t "$work" "$(q "$BIN") run z1 demo -- sleep 2" Enter
     i=0; until "$BIN" _state | grep -q '^z1 done '; do
-      i=$((i + 1)); [ $i -lt 20 ] || die "selftest: a run that exited 0 not marked done"; sleep 0.5; done
+      i=$((i + 1)); [ $i -lt 120 ] || die "selftest: a run that exited 0 not marked done: $(tmux -L "$S" capture-pane -J -p -t "$work")"; sleep 0.25; done
     # the pane swaps `sleep 2` for its shell: type once the shell is in the foreground
     i=0; until AWB_TMUX_SOCKET=$(tmux -L "$S" display-message -p '#{socket_path}') shell_pane "$(agent_pane z1)"; do
       i=$((i + 1)); [ $i -lt 20 ] || die "selftest: z1 never reached its shell"; sleep 0.2; done
@@ -2368,15 +2596,16 @@ while [ "$i" -lt "$1" ]; do
   printf '  ⏵⏵ fake-footer\n'
   read -r _x; i=$((i+1))
 done
+sleep "${2:-0}"
 printf '❯\n'
 printf -- '────────────────────────────\n'
 printf 'FAKE_SUBMITTED_OK\n'; sleep 2
 FT
     chmod +x "$t/faketui.sh"
     ft_paste() { # $1=NEED
-      tmux -L "$S" new-window -d -P -F '#{pane_id}' "$t/faketui.sh $1"; }
+      tmux -L "$S" new-window -d -P -F '#{pane_id}' "$t/faketui.sh $1 ${2:-0}"; }
     # positive: TUI needs 1 extra Enter; tell (default max 2) must succeed
-    fp=$(ft_paste 1)
+    fp=$(ft_paste 1 1)
     printf 'ft %s\n' "$fp" > "$t/panes"
     # a loaded machine redraws slowly; the settle time is not what this case tests
     AWB_DIR=$t AWB_TMUX_SOCKET=$AWB_TMUX_SOCKET AWB_TELL_SETTLE=1.5 "$BIN" tell ft "ft-marker-ok-1234567890" \
@@ -2423,6 +2652,20 @@ FT
     wait; sleep 0.3
     ! tmux -L "$S" capture-pane -p -t "$zp" | grep -qx "mid-tell-enter" || die "selftest: tell pressed Enter into a dialog opened mid-tell"
     tmux -L "$S" send-keys -t "$zp" C-u
+    # A queued tell must re-read the dialog after taking its pane lock, before pasting.
+    reg idle
+    ( lock "tell-$zp"; : > "$t/tell-held"
+      for i in $(seq 1 100); do [ ! -e "$t/tell-release" ] || break; sleep .05; done
+      unlock "tell-$zp"
+    ) >"$t/tell-holder.log" 2>&1 & tp=$!
+    i=0; until [ -e "$t/tell-held" ]; do
+      i=$((i+1)); [ $i -lt 100 ] || { kill "$tp"; wait "$tp" || true; die "selftest: tell holder did not start"; }; sleep .02
+    done
+    ht tell z1 "dialog-lock-no-paste" >"$t/tell-wait.out" 2>"$t/tell-wait.err" & tq=$!
+    sleep .5; reg waiting "permission prompt"; : > "$t/tell-release"; wait "$tp"
+    if wait "$tq"; then die "selftest: queued tell accepted a permission dialog"; fi
+    ! tmux -L "$S" capture-pane -J -p -t "$zp" | grep -Fq "dialog-lock-no-paste" \
+      || die "selftest: queued tell pasted into a newly reported permission dialog"
     reg idle
     ! ht view --once | grep -Fq "待批准" || die "selftest: idle session shown as waiting for approval"
     ! ht peers | grep -q ' waiting' || die "selftest: idle session listed as waiting"
@@ -2468,7 +2711,12 @@ FT
     tmux -L "$S" send-keys -t "$zp" "echo '<invoke name=\"Bash\">'" Enter; sleep 0.4
     ht nudge --once >/dev/null 2>&1
     [ "$(grep -F '"why":"stuck"' "$EV" | grep -cF '"id":"z1"')" = 1 ] || die "selftest: a stuck session was not told to re-issue"
-    sleep 0.6; tmux -L "$S" capture-pane -p -t "$zp" | grep -Fq "被打印成了文本" || die "selftest: the stuck reminder was not typed"
+    sleep 0.6
+    cap=$(tmux -L "$S" capture-pane -J -p -t "$zp")
+    printf '%s\n' "$cap" | grep -Fq "被打印成了文本" || die "selftest: the stuck reminder was not typed: $cap"
+    if ! tmux -L "$S" capture-pane -p -t "$zp" | grep -Fq "被打印成了文本"; then
+      echo "selftest: stuck reminder wraps across pane lines"
+    fi
     ht view --json | jq -e '.agents[] | select(.id == "z1") | .flag | contains("工具调用没执行")' >/dev/null \
       || die "selftest: a stuck session is not flagged"
     ht nudge --once >/dev/null 2>&1
@@ -2487,8 +2735,9 @@ FT
     ! grep -F '"why":"hold"' "$EV" | grep -qF '"id":"z1"' || die "selftest: a holder running a command was told to release"
     ! AWB_STALE=1 ht view --json | jq -e 'any(.anomalies[]; .kind == "hold")' >/dev/null || die "selftest: a holder running a command shown as not working"
     reg idle "" 900; ht nudge --once >/dev/null 2>&1
-    [ "$(grep -F '"why":"hold"' "$EV" | grep -cF '"id":"z1"')" = 1 ] || die "selftest: an idle holder was not told"
-    sleep 0.6; tmux -L "$S" capture-pane -p -t "$zp" | grep -Fq "别人在排队" || die "selftest: the hold reminder was not typed"
+    [ "$(grep -F '"why":"hold"' "$EV" | grep -cF '"id":"z1"')" = 1 ] \
+      || die "selftest: an idle holder was not told: $(tmux -L "$S" capture-pane -J -p -t "$zp")"
+    sleep 0.6; tmux -L "$S" capture-pane -J -p -t "$zp" | grep -Fq "别人在排队" || die "selftest: the hold reminder was not typed"
     ht nudge --once >/dev/null 2>&1
     [ "$(grep -F '"why":"hold"' "$EV" | grep -cF '"id":"z1"')" = 1 ] || die "selftest: the hold reminder is not throttled"
     "$BIN" release gpu9 z1; tmux -L "$S" send-keys -t "$zp" C-u; tmux -L "$S" send-keys -t "$zp" clear Enter
@@ -2517,7 +2766,7 @@ FT
     # a message id already recorded never twice
     mkdir -p "$t/home/.claude/projects/p"; tr_=$t/home/.claude/projects/p/s-zz.jsonl
     printf '{"pid":%s,"name":"main-x","sessionId":"s-main","status":"busy","statusUpdatedAt":1}\n' $$ > "$t/home/.claude/sessions/2.json"
-    ts_() { date -u -r "$1" +%Y-%m-%dT%H:%M:%S.000Z; }
+    ts_() { jq -nr --argjson ep "$1" '$ep | strftime("%Y-%m-%dT%H:%M:%S.000Z")'; }
     out_() { jq -cn --arg ts "$(ts_ "$1")" --arg to "$2" --arg m "$3" \
       '{type:"assistant", timestamp:$ts, message:{content:[{type:"tool_use", id:("toolu" + $ts), name:"SendMessage", input:{to:$to, message:$m}}]}}'; }
     in_() { jq -cn --arg ts "$(ts_ "$1")" --arg n "$2" --arg b "$3" \
@@ -2571,6 +2820,25 @@ FT
     in_ "$(date +%s)" main-x "thanks, stand by" >> "$tr_"; ht _observe
     ! AWB_REPLY_IDLE=0 ht view --json | jq -e 'any(.anomalies[]; .kind == "noreply")' >/dev/null \
       || die "selftest: a notice to a worker with no open task flagged as not replied"
+    before=$(grep -cF '"t":"msg"' "$EV")
+    printf '{"t":"news","text":"interrupted' >> "$EV"
+    in_ "$(date +%s)" main-x "after interrupted event" >> "$tr_"; ht _observe
+    events_json | jq -e --argjson n "$((before + 1))" '[.[] | select(.t == "msg")] | length == $n' >/dev/null \
+      || die "selftest: a partial event consumed an imported message"
+    mkdir "$t/obs-crash-bin"
+    cat > "$t/obs-crash-bin/mv" <<'OBSCRASH'
+#!/bin/sh
+/bin/mv "$@" || exit $?
+if [ "$2" = "$AWB_DIR/obs" ]; then kill -KILL "$PPID"; fi
+OBSCRASH
+    chmod +x "$t/obs-crash-bin/mv"
+    in_ "$(date +%s)" main-x "cursor crash retry" >> "$tr_"
+    if PATH=$t/obs-crash-bin:$PATH ht _observe >"$t/obs-crash.out" 2>"$t/obs-crash.err"; then
+      die "selftest: observer crash injection did not stop the process"
+    fi
+    ht _observe; ht _observe
+    events_json | jq -e --argjson n "$((before + 2))" '[.[] | select(.t == "msg")] | length == $n' >/dev/null \
+      || die "selftest: interrupted observation lost or duplicated a message"
     reg idle
     rm -f "$t/home/.claude/sessions/2.json"
     # a pane given as session:window.pane in .awb/panes resolves to the same session
@@ -2606,7 +2874,7 @@ FT
     grep -q '^zn ' "$fn/diffs" || die "selftest: freeze scan died on a board without a panes file"
     [ -z "$(ls "$fn" | grep '^diffs\.')" ] || die "selftest: freeze scan left a temp file"
     sleep 0.6
-    tmux -L "$S" capture-pane -p -t "$pl" | grep -Fq "没有代码改动" \
+    tmux -L "$S" capture-pane -J -p -t "$pl" | grep -Fq "没有代码改动" \
       || die "selftest: live frozen agent not reminded past a dead pane"
     # the throttle reads the latest reminder: an older line must not let the next round remind
     { echo "zl $(($(date +%s) - 5000))"; cat "$fz/fnudged"; } > "$fz/fn.x" && mv "$fz/fn.x" "$fz/fnudged"
@@ -2880,6 +3148,11 @@ cmd=${1:-}; shift 2>/dev/null || true
 case "${1:-}" in -h|--help) usage; exit 0 ;; esac
 case "$cmd" in ""|-h|--help|help|version|--version|-V) ;;
   *) command -v jq >/dev/null 2>&1 || die "jq is required: brew install jq (macOS), apt install jq (Debian/Ubuntu)" ;; esac
+# Key validation and its state change share send's lock. A duplicate reply or restart
+# cannot interleave between checking the old key and appending its completion.
+case "$cmd" in
+  start|now|done|block|unblock|fail|finish|reply|idle|_enter|_leave|task|reset) init_dir; lock send ;;
+esac
 case "$cmd" in
   up)       up "$@" ;;
   down)     init_dir   # only the session awb up made for this board, never the server it runs in
@@ -2969,8 +3242,9 @@ case "$cmd" in
               --arg id "$1" --arg text "${2:-}"
             append '{t:"status",time:$time,ep:$ep,id:$id,status:"done",reason:""}' --arg id "$1" ;;
   reset)    init_dir   # the log is the only record: keep a copy, then clear in place (watch keeps its file)
+            lock append
             _b=$EV.$(date +%s).bak; [ -s "$EV" ] && { cp "$EV" "$_b"; echo "cleared; the old log is $_b"; }
-            : > "$EV" ;;
+            : > "$EV"; unlock append ;;
   replay)   replay "$@" ;;
   _view)    # a snapshot on stdin, drawn as the board: awb _view [COLS ROWS]. Probed, a width
             # under 40 is a pane of another server or a worker's sliver, not where this output goes
@@ -3003,6 +3277,7 @@ case "$cmd" in
   reply)    reply "$@" ;;
   idle)     idle "$@" ;;
   _observe) init_dir; observe_once ;;   # one observation round (the board runs it with nudge)
+  _lockfd)  lock_fd "$@" ;;  # awb-lark inherits its parent's open descriptor
   _state)   state ;;   # the jq fold per agent, for the differential test against the Lean model
   version|--version|-V) echo "$PROG $VERSION" ;;
   skill)    skill ;;

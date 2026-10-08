@@ -5,7 +5,7 @@ description: tmux milestone board for many agents (awb). Use when running severa
 
 # awb — tmux agent workbench
 
-单个 POSIX sh 文件（依赖 `tmux`、`jq`；Lean 验收另需 elan）。仓库：https://github.com/cklxx/awb。
+单个 POSIX sh 文件（依赖 `tmux`、`jq`，Linux 的 `flock` 或 BSD/macOS 的 `lockf`；Lean 验收另需 elan）。仓库：https://github.com/cklxx/awb。
 `.awb/events.jsonl` 是唯一的事实源（只追加）。`awb skill` 随时打印本手册。
 安装或更新 awb 与本 skill：
 

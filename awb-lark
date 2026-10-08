@@ -128,6 +128,11 @@ sync() {
   # open two topics or patch an older state over a newer one (model/tla/AwbLark.tla).
   # A hung sync is killed by the board's watch loop, which then frees the lock this way.
   lk=$AWB_DIR/lock-lark
+  command -v flock >/dev/null 2>&1 || command -v lockf >/dev/null 2>&1 \
+    || die "locking requires flock (Linux) or lockf (BSD/macOS)"
+  exec 9>"$lk.guard"
+  # Acquisition and stale-marker cleanup use the same stable kernel lock as awb.
+  "$AWB" _lockfd 9 0 || return 0
   # awb 0.0.7 locked with a directory, and ln -s would link inside it
   if [ -d "$lk" ] && [ ! -L "$lk" ]; then rm -rf "$lk"; fi
   if ! ln -s "$$" "$lk" 2>/dev/null; then
@@ -135,7 +140,8 @@ sync() {
     if [ -n "$hp" ] && kill -0 "$hp" 2>/dev/null; then return 0; fi
     rm -rf "$lk"; ln -s "$$" "$lk" 2>/dev/null || return 0
   fi
-  trap 'rm -f "$AWB_DIR/lock-lark"' EXIT INT TERM
+  trap 'rm -f "$AWB_DIR/lock-lark"' EXIT
+  trap 'exit 130' INT TERM
   snap=$("$AWB" view --json)
   # topic title: the project directory for ./.awb, else the board directory's own name
   proj=$(basename "$AWB_DIR"); [ "$proj" != .awb ] || proj=$(basename "$(dirname "$AWB_DIR")")
