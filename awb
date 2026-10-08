@@ -1162,7 +1162,7 @@ up() {
     -e "AWB_DIR=$AWB_DIR" -e "AWB_TMUX_SOCKET=$SOCK" -e "AWB_TMUX_FOR=$AWB_DIR" \
     "AWB_DIR=$(q "$AWB_DIR") AWB_TMUX_SOCKET=$(q "$SOCK") AWB_TMUX_FOR=$(q "$AWB_DIR") $(q "$BIN") view" >/dev/null
   board=$(tmux -S "$SOCK" list-panes -t awb:board -F '#{pane_id}' | head -1)
-  work=$(tmux -S "$SOCK" split-window -v -t "$board" -d -p 45 -P -F '#{pane_id}' \
+  work=$(tmux -S "$SOCK" split-window -v -t "$board" -d -l 45% -P -F '#{pane_id}' \
            -e "AWB_DIR=$AWB_DIR" -e "AWB_TMUX_SOCKET=$SOCK" -e "AWB_TMUX_FOR=$AWB_DIR" "$SHELL")
   printf '%s\n' "$work" > "$AWB_DIR/work-pane"
   tmux -S "$SOCK" select-pane -t "$board" -T board
