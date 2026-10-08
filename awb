@@ -1859,7 +1859,15 @@ EOF
 selftest() {
   t=$(mktemp -d)
   S=awbselftest$$
-  cleanup() { tmux -L "$S" kill-server 2>/dev/null || true; rm -rf "$t"; }
+  cleanup() {
+    test_rc=$?
+    for test_server in "$S" "${S}b" "${S}e" "${S}s"; do tmux -L "$test_server" kill-server 2>/dev/null || true; done
+    for test_socket in "$t/sock" "$t/up2/sock" "$t/parent/.awb/sock"; do
+      [ ! -S "$test_socket" ] || tmux -S "$test_socket" kill-server 2>/dev/null || true
+    done
+    if [ "$test_rc" = 0 ]; then rm -rf "$t"
+    else printf 'selftest: failure evidence kept at %s\n' "$t" >&2; fi
+  }
   trap cleanup EXIT
   export AWB_DIR=$t AWB_COLS=160 AWB_ROWS=200 AWB_NUDGE=0; EV=$t/events.jsonl
   # never the user's Lark group: a test board's watch loop would mirror itself there. A
@@ -2507,10 +2515,13 @@ EOF
     done
 
     printf '%s\n' "$work" > "$t/work-pane"
-    tmux -L "$S" send-keys -t "$work" "export AWB_DIR=$(q "$t")" Enter
+    tmux -L "$S" send-keys -t "$work" "export AWB_DIR=$(q "$t"); echo awb-selftest-work-ready" Enter
+    i=0; until tmux -L "$S" capture-pane -p -t "$work" | grep -Fxq 'awb-selftest-work-ready'; do
+      i=$((i+1)); [ $i -lt 120 ] || die "selftest: work shell did not become ready"; sleep .25
+    done
     tmux -L "$S" send-keys -t "$work" "$(q "$BIN") run z1 demo -- sleep 2" Enter
     i=0; until "$BIN" _state | grep -q '^z1 done '; do
-      i=$((i + 1)); [ $i -lt 20 ] || die "selftest: a run that exited 0 not marked done"; sleep 0.5; done
+      i=$((i + 1)); [ $i -lt 120 ] || die "selftest: a run that exited 0 not marked done: $(tmux -L "$S" capture-pane -J -p -t "$work")"; sleep 0.25; done
     # the pane swaps `sleep 2` for its shell: type once the shell is in the foreground
     i=0; until AWB_TMUX_SOCKET=$(tmux -L "$S" display-message -p '#{socket_path}') shell_pane "$(agent_pane z1)"; do
       i=$((i + 1)); [ $i -lt 20 ] || die "selftest: z1 never reached its shell"; sleep 0.2; done
