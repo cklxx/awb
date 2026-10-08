@@ -13,10 +13,20 @@ if [ -f "$here/awb" ] && [ -f "$here/skills/awb-workbench/SKILL.md" ]; then
   ln -sf "$here/skills/awb-workbench/SKILL.md" "$skill/SKILL.md"
 else
   url=https://github.com/cklxx/awb/releases/latest/download
+  stage=$(mktemp -d "$bin/.awb-install.XXXXXX")
+  skill_tmp=
+  trap 'rm -rf "$stage"; [ -z "$skill_tmp" ] || rm -f "$skill_tmp"' EXIT
+  trap 'exit 130' INT TERM
   for f in awb awb-lark; do
-    curl -fsSL "$url/$f" -o "$bin/$f.tmp" && chmod +x "$bin/$f.tmp" && mv "$bin/$f.tmp" "$bin/$f"
+    curl -fsSL "$url/$f" -o "$stage/$f"
+    chmod +x "$stage/$f"
   done
-  rm -f "$skill/SKILL.md"; curl -fsSL "$url/SKILL.md" -o "$skill/SKILL.md"
+  skill_tmp=$(mktemp "$skill/.SKILL.md.XXXXXX")
+  curl -fsSL "$url/SKILL.md" -o "$skill_tmp"
+  # A failed download must leave the existing installation intact. Each replacement
+  # is renamed from its destination filesystem after all downloads have succeeded.
+  for f in awb awb-lark; do mv "$stage/$f" "$bin/$f"; done
+  mv "$skill_tmp" "$skill/SKILL.md"; skill_tmp=
 fi
 # optional: the compiled Lean model enables the board's audit and the differential selftest
 if [ -f "$here/model/lakefile.toml" ]; then

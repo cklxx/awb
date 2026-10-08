@@ -1866,6 +1866,38 @@ selftest() {
   unset AWB_TMUX_SOCKET AWB_TMUX_FOR TMUX TMUX_PANE
   mkdir -p "$t/guard"; printf '#!/bin/sh\necho "$*" >> %s/guard/calls\nexit 1\n' "$t" > "$t/guard/lark-cli"
   chmod +x "$t/guard/lark-cli"; PATH=$t/guard:$PATH; export PATH
+  unset AWB_LARK_CHAT
+  # Failed release downloads must neither replace working binaries nor remove the skill.
+  it=$t/installer; mkdir -p "$it/mock" "$it/bin" "$it/skills/awb-workbench"
+  cp "$(dirname "$BIN")/install.sh" "$it/install.sh"
+  cat > "$it/mock/curl" <<'INSTALLCURL'
+#!/bin/sh
+out=; url=
+while [ $# -gt 0 ]; do
+  case $1 in -o) out=$2; shift 2 ;; https:*) url=$1; shift ;; *) shift ;; esac
+done
+case $url in *"$FAIL_ASSET") exit 22 ;; esac
+case $url in
+  */awb) cp "$TEST_SOURCE/awb" "$out" ;;
+  */awb-lark) cp "$TEST_SOURCE/awb-lark" "$out" ;;
+  *) cp "$TEST_SOURCE/skills/awb-workbench/SKILL.md" "$out" ;;
+esac
+INSTALLCURL
+  chmod +x "$it/mock/curl"
+  for asset in awb awb-lark SKILL.md; do
+    printf 'old-awb' > "$it/bin/awb"; printf 'old-lark' > "$it/bin/awb-lark"
+    printf 'old-skill' > "$it/skills/awb-workbench/SKILL.md"
+    if AWB_BIN_DIR=$it/bin AWB_SKILL_DIR=$it/skills TEST_SOURCE=$(dirname "$BIN") FAIL_ASSET=$asset \
+        PATH=$it/mock:$PATH sh "$it/install.sh" </dev/null >"$it/out" 2>"$it/err"; then
+      die "selftest: failed $asset download reported successful installation"
+    fi
+    [ "$(cat "$it/bin/awb")" = old-awb ] && [ "$(cat "$it/bin/awb-lark")" = old-lark ] \
+      && [ "$(cat "$it/skills/awb-workbench/SKILL.md")" = old-skill ] \
+      || die "selftest: failed $asset download changed an installed file"
+    [ "$(ls -A "$it/bin" | wc -l | tr -d ' ')" = 2 ] \
+      && [ "$(ls -A "$it/skills/awb-workbench" | wc -l | tr -d ' ')" = 1 ] \
+      || die "selftest: failed installation left temporary files"
+  done
 
   ( cd "$t" && AWB_DIR=help-probe "$BIN" up --help >/dev/null ) || die "selftest: up --help failed"
   [ ! -e "$t/help-probe" ] || die "selftest: up --help created AWB_DIR"
