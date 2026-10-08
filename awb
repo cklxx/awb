@@ -2632,7 +2632,12 @@ FT
     tmux -L "$S" send-keys -t "$zp" "echo '<invoke name=\"Bash\">'" Enter; sleep 0.4
     ht nudge --once >/dev/null 2>&1
     [ "$(grep -F '"why":"stuck"' "$EV" | grep -cF '"id":"z1"')" = 1 ] || die "selftest: a stuck session was not told to re-issue"
-    sleep 0.6; tmux -L "$S" capture-pane -p -t "$zp" | grep -Fq "被打印成了文本" || die "selftest: the stuck reminder was not typed"
+    sleep 0.6
+    cap=$(tmux -L "$S" capture-pane -J -p -t "$zp")
+    printf '%s\n' "$cap" | grep -Fq "被打印成了文本" || die "selftest: the stuck reminder was not typed: $cap"
+    if ! tmux -L "$S" capture-pane -p -t "$zp" | grep -Fq "被打印成了文本"; then
+      echo "selftest: stuck reminder wraps across pane lines"
+    fi
     ht view --json | jq -e '.agents[] | select(.id == "z1") | .flag | contains("工具调用没执行")' >/dev/null \
       || die "selftest: a stuck session is not flagged"
     ht nudge --once >/dev/null 2>&1
@@ -2652,7 +2657,7 @@ FT
     ! AWB_STALE=1 ht view --json | jq -e 'any(.anomalies[]; .kind == "hold")' >/dev/null || die "selftest: a holder running a command shown as not working"
     reg idle "" 900; ht nudge --once >/dev/null 2>&1
     [ "$(grep -F '"why":"hold"' "$EV" | grep -cF '"id":"z1"')" = 1 ] || die "selftest: an idle holder was not told"
-    sleep 0.6; tmux -L "$S" capture-pane -p -t "$zp" | grep -Fq "别人在排队" || die "selftest: the hold reminder was not typed"
+    sleep 0.6; tmux -L "$S" capture-pane -J -p -t "$zp" | grep -Fq "别人在排队" || die "selftest: the hold reminder was not typed"
     ht nudge --once >/dev/null 2>&1
     [ "$(grep -F '"why":"hold"' "$EV" | grep -cF '"id":"z1"')" = 1 ] || die "selftest: the hold reminder is not throttled"
     "$BIN" release gpu9 z1; tmux -L "$S" send-keys -t "$zp" C-u; tmux -L "$S" send-keys -t "$zp" clear Enter
@@ -2770,7 +2775,7 @@ FT
     grep -q '^zn ' "$fn/diffs" || die "selftest: freeze scan died on a board without a panes file"
     [ -z "$(ls "$fn" | grep '^diffs\.')" ] || die "selftest: freeze scan left a temp file"
     sleep 0.6
-    tmux -L "$S" capture-pane -p -t "$pl" | grep -Fq "没有代码改动" \
+    tmux -L "$S" capture-pane -J -p -t "$pl" | grep -Fq "没有代码改动" \
       || die "selftest: live frozen agent not reminded past a dead pane"
     # the throttle reads the latest reminder: an older line must not let the next round remind
     { echo "zl $(($(date +%s) - 5000))"; cat "$fz/fnudged"; } > "$fz/fn.x" && mv "$fz/fn.x" "$fz/fnudged"
