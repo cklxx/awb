@@ -846,19 +846,20 @@ freeze_once() {
 # rounds, and a round already running in a live process is not repeated
 nudge_round() {
   _nl=$AWB_DIR/lock-nudge
-  exec 9>"$_nl.guard"
-  lock_fd 9 0 || { exec 9>&-; return 0; }
+  _nl_fd=$(lock_slot)
+  eval "exec $_nl_fd>$(q "$_nl.guard")"
+  lock_fd "$_nl_fd" 0 || { eval "exec $_nl_fd>&-"; return 0; }
   if ! ln -s "$$" "$_nl" 2>/dev/null; then
     _hp=$(readlink "$_nl" 2>/dev/null || true)
-    if [ -n "$_hp" ] && [ "$_hp" != "$$" ] && kill -0 "$_hp" 2>/dev/null; then exec 9>&-; return 0; fi
-    rm -f "$_nl"; ln -s "$$" "$_nl" 2>/dev/null || { exec 9>&-; return 0; }
+    if [ -n "$_hp" ] && [ "$_hp" != "$$" ] && kill -0 "$_hp" 2>/dev/null; then eval "exec $_nl_fd>&-"; return 0; fi
+    rm -f "$_nl"; ln -s "$$" "$_nl" 2>/dev/null || { eval "exec $_nl_fd>&-"; return 0; }
   fi
-  LOCK_FDS="${LOCK_FDS:-} 9"   # nested observation/tell locks must keep the nudge guard open
+  LOCK_FDS="${LOCK_FDS:-} $_nl_fd"
   nudge_once
   rm -f "$_nl"
-  _kept=; for _f in ${LOCK_FDS:-}; do [ "$_f" = 9 ] || _kept="$_kept $_f"; done
+  _kept=; for _f in ${LOCK_FDS:-}; do [ "$_f" = "$_nl_fd" ] || _kept="$_kept $_f"; done
   LOCK_FDS=$_kept
-  exec 9>&-
+  eval "exec $_nl_fd>&-"
 }
 
 # the main agent's messaging, observed read-only in the Claude Code transcripts of this
@@ -1271,13 +1272,16 @@ lock_cleanup() {
   LOCK_FDS=
 }
 
-lock() {
-  _lk_path=$AWB_DIR/lock-$1; _lk_tries=0; _lk_fd=
+lock_slot() {
   for _lk_candidate in 9 8 7 6 5 4 3; do
     case " ${LOCK_FDS:-} " in *" $_lk_candidate "*) continue ;; esac
-    _lk_fd=$_lk_candidate; break
+    printf '%s' "$_lk_candidate"; return 0
   done
-  [ -n "$_lk_fd" ] || die "too many nested locks"
+  die "too many nested locks"
+}
+
+lock() {
+  _lk_path=$AWB_DIR/lock-$1; _lk_tries=0; _lk_fd=$(lock_slot)
   eval "exec $_lk_fd>$(q "$_lk_path.guard")"
   if ! lock_fd "$_lk_fd" "${AWB_LOCK_WAIT:-600}"; then
     eval "exec $_lk_fd>&-"; die "$1 is locked"
@@ -2086,6 +2090,33 @@ LOCKRM
   mkdir "$ld/lock-empty"
   ( AWB_DIR=$ld; lock empty ) || die "selftest: an empty abandoned marker stopped recovery"
   [ ! -d "$ld/lock-empty" ] || die "selftest: EXIT failed to clean a lock with spaces in its path"
+  # A reminder round must retain an outer lock while allocating its own guard and
+  # nested observation locks. Opening a fixed fd 9 used to release the outer guard.
+  { printf 'set -eu\nPROG=lock-test\ndie() { echo "$*" >&2; exit 1; }\n'
+    awk '/^q\(\)/' "$BIN"
+    awk '/^# mutual exclusion under/{p=1} /^# the agent.s open milestone/{p=0} p' "$BIN"
+    printf 'exec 3>"$AWB_DIR/lock-outer.guard"\nlock_fd 3 0\n'
+  } > "$ld/outer.sh"
+  ( AWB_DIR=$ld; lock outer
+    nudge_once() {
+      if AWB_LOCK_WAIT=0 sh "$ld/outer.sh" >"$ld/outer-probe.log" 2>&1; then
+        die "selftest: a reminder round released its outer guard"
+      fi
+      lock inner; unlock inner
+    }
+    nudge_round
+    if AWB_LOCK_WAIT=0 sh "$ld/outer.sh" >"$ld/outer-probe.log" 2>&1; then
+      die "selftest: reminder cleanup released its outer guard"
+    fi
+    unlock outer
+  ) || die "selftest: nested reminder locking failed"
+  mkdir "$t/no-lock-tools"
+  if PATH=$t/no-lock-tools AWB_DIR=$ld AWB=$BIN /bin/sh "$(dirname "$BIN")/awb-lark" sync --dry-run \
+       >"$t/missing-lock.out" 2>"$t/missing-lock.err"; then
+    die "selftest: Lark sync silently accepted missing lock tools"
+  fi
+  grep -Fq 'locking requires flock' "$t/missing-lock.err" \
+    || die "selftest: Lark sync did not report its missing lock dependency"
   gd=$t/gate-lock-globals
   AWB_DIR=$gd "$BIN" start gv gate-vars >/dev/null
   AWB_DIR=$gd "$BIN" check gv -- true >/dev/null
@@ -2417,7 +2448,7 @@ EOF
   if command -v tmux >/dev/null; then
     boardpane=$(tmux -L "$S" new-session -d -s awb -n board -x 200 -y 120 -P -F '#{pane_id}' \
       "AWB_DIR=$(q "$t") $(q "$BIN") view")
-    work=$(tmux -L "$S" split-window -v -t "$boardpane" -d -p 60 -P -F '#{pane_id}' "$SHELL")
+    work=$(tmux -L "$S" split-window -v -t "$boardpane" -d -l 60% -P -F '#{pane_id}' "$SHELL")
     sleep 1
     cap=$(tmux -L "$S" capture-pane -p -t "$boardpane")
     printf '%s' "$cap" | grep -Fq "SHIP THE WORKBENCH" || die "selftest: board not live-rendering"

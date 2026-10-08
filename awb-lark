@@ -128,6 +128,8 @@ sync() {
   # open two topics or patch an older state over a newer one (model/tla/AwbLark.tla).
   # A hung sync is killed by the board's watch loop, which then frees the lock this way.
   lk=$AWB_DIR/lock-lark
+  command -v flock >/dev/null 2>&1 || command -v lockf >/dev/null 2>&1 \
+    || die "locking requires flock (Linux) or lockf (BSD/macOS)"
   exec 9>"$lk.guard"
   # Acquisition and stale-marker cleanup use the same stable kernel lock as awb.
   "$AWB" _lockfd 9 0 || return 0
