@@ -1644,6 +1644,9 @@ tell() {
     if _unsubmitted "$_il"; then _try=$((_try + 1)); _enter || { unlock "tell-$_p"; return 1; }
     else _try=$_max; fi
   done
+  # The last Enter needs the same redraw interval as the first. Reading immediately
+  # after a retry can still see the old input even though the TUI accepted the message.
+  sleep ${AWB_TELL_SETTLE:-0.5}
   _il=$(_inputline)
   if _unsubmitted "$_il"; then
     # return, not die: check/nudge call tell as a function and must keep going
@@ -2498,9 +2501,10 @@ EOF
     boardpane=$(tmux -L "$S" new-session -d -s awb -n board -x 200 -y 120 -P -F '#{pane_id}' \
       "AWB_DIR=$(q "$t") $(q "$BIN") view")
     work=$(tmux -L "$S" split-window -v -t "$boardpane" -d -l 60% -P -F '#{pane_id}' "$SHELL")
-    sleep 1
-    cap=$(tmux -L "$S" capture-pane -p -t "$boardpane")
-    printf '%s' "$cap" | grep -Fq "SHIP THE WORKBENCH" || die "selftest: board not live-rendering"
+    i=0
+    until tmux -L "$S" capture-pane -p -t "$boardpane" | grep -Fq "SHIP THE WORKBENCH"; do
+      i=$((i+1)); [ $i -lt 60 ] || die "selftest: board not live-rendering"; sleep .25
+    done
 
     printf '%s\n' "$work" > "$t/work-pane"
     tmux -L "$S" send-keys -t "$work" "export AWB_DIR=$(q "$t")" Enter
@@ -2581,15 +2585,16 @@ while [ "$i" -lt "$1" ]; do
   printf '  ⏵⏵ fake-footer\n'
   read -r _x; i=$((i+1))
 done
+sleep "${2:-0}"
 printf '❯\n'
 printf -- '────────────────────────────\n'
 printf 'FAKE_SUBMITTED_OK\n'; sleep 2
 FT
     chmod +x "$t/faketui.sh"
     ft_paste() { # $1=NEED
-      tmux -L "$S" new-window -d -P -F '#{pane_id}' "$t/faketui.sh $1"; }
+      tmux -L "$S" new-window -d -P -F '#{pane_id}' "$t/faketui.sh $1 ${2:-0}"; }
     # positive: TUI needs 1 extra Enter; tell (default max 2) must succeed
-    fp=$(ft_paste 1)
+    fp=$(ft_paste 1 1)
     printf 'ft %s\n' "$fp" > "$t/panes"
     # a loaded machine redraws slowly; the settle time is not what this case tests
     AWB_DIR=$t AWB_TMUX_SOCKET=$AWB_TMUX_SOCKET AWB_TELL_SETTLE=1.5 "$BIN" tell ft "ft-marker-ok-1234567890" \
@@ -2719,7 +2724,8 @@ FT
     ! grep -F '"why":"hold"' "$EV" | grep -qF '"id":"z1"' || die "selftest: a holder running a command was told to release"
     ! AWB_STALE=1 ht view --json | jq -e 'any(.anomalies[]; .kind == "hold")' >/dev/null || die "selftest: a holder running a command shown as not working"
     reg idle "" 900; ht nudge --once >/dev/null 2>&1
-    [ "$(grep -F '"why":"hold"' "$EV" | grep -cF '"id":"z1"')" = 1 ] || die "selftest: an idle holder was not told"
+    [ "$(grep -F '"why":"hold"' "$EV" | grep -cF '"id":"z1"')" = 1 ] \
+      || die "selftest: an idle holder was not told: $(tmux -L "$S" capture-pane -J -p -t "$zp")"
     sleep 0.6; tmux -L "$S" capture-pane -J -p -t "$zp" | grep -Fq "别人在排队" || die "selftest: the hold reminder was not typed"
     ht nudge --once >/dev/null 2>&1
     [ "$(grep -F '"why":"hold"' "$EV" | grep -cF '"id":"z1"')" = 1 ] || die "selftest: the hold reminder is not throttled"
