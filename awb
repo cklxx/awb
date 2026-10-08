@@ -654,8 +654,18 @@ snapshot() {
     fi
   fi
   # the last observation round (the obs file is rewritten by each) and how many transcripts it read
-  obs=null; [ ! -f "$AWB_DIR/obs" ] || [ -n "${AWB_NOW:-}" ] || \
-    obs=$(printf '{"last":%s,"files":%s}' "$(stat -f %m "$AWB_DIR/obs" 2>/dev/null || stat -c %Y "$AWB_DIR/obs")" "$(grep -c . "$AWB_DIR/obs" || true)")
+  obs=null
+  if [ -f "$AWB_DIR/obs" ] && [ -z "${AWB_NOW:-}" ]; then
+    _obs_last=$(stat -c %Y "$AWB_DIR/obs" 2>/dev/null || stat -f %m "$AWB_DIR/obs" 2>/dev/null || true)
+    case $_obs_last in
+      ''|*[!0-9]*) ;;
+      *)
+        _obs_files=$(grep -c . "$AWB_DIR/obs" || true)
+        case $_obs_files in ''|*[!0-9]*) _obs_files=0 ;; esac
+        obs=$(printf '{"last":%s,"files":%s}' "$_obs_last" "$_obs_files")
+        ;;
+    esac
+  fi
   events_json | jq -r --arg viol "$viol" --arg lean "$lean" --argjson undeliv "${AWB_UNDELIVERED:-180}" --argjson obs "$obs" \
     --arg now "$(jq -nr --argjson t "$nowep" '$t | strflocaltime("%H:%M:%S")')" --argjson nowep "$nowep" \
     --argjson live "$live" --arg stale "${AWB_STALE:-600}" --argjson replyidle "${AWB_REPLY_IDLE:-600}" \
@@ -692,8 +702,8 @@ replay() {
     def med: sort | if length == 0 then null else .[length / 2 | floor] end;
     # one item on consecutive snapshots is one episode
     def episodes: group_by(.key) | [ .[] | sort_by(.T)
-        | reduce .[] as $x ([]; if length > 0 and $x.T - .[-1].last <= $step
-                               then .[-1].last = $x.T else . + [$x + {first:$x.T, last:$x.T}] end)[]
+        | (reduce .[] as $x ([]; if length > 0 and $x.T - .[-1].last <= $step
+                                then .[-1].last = $x.T else . + [$x + {first:$x.T, last:$x.T}] end))[]
         | . + {span:(.last - .first + $step)} ];
     . as $S
     # a sent task (keyed now) ends with its reply (keyed done); with `finish` (status done, no
@@ -1271,6 +1281,9 @@ send() {
   _par=; if [ "${1:-}" = --under ]; then _par=${2:-}; shift 2 || die "--under needs a task id"; fi
   [ $# -ge 2 ] || die "usage: $PROG send [--under PARENT] ID TASK|TASKID [TEXT]   (prints the message to SendMessage)"
   id=$1; shift; need_agent "$id"
+  # serialize the open-task check, key allocation, and append; two simultaneous sends must not
+  # both observe an empty task slot for the same worker
+  lock "send"
   k=$(open_key "$id"); [ -z "$k" ] || die "$id already has open task #$k; wait for its reply (or: $PROG idle $id)"
   # a planned task (awb task T1 todo ...) not yet done or sent is sent as it is: its id is the key
   _pt=$(events_json | jq -r --arg t "$1" "$JQ_FOLD"' fold | select(all(.agents[]; .key != $t))
@@ -1284,6 +1297,7 @@ send() {
   fi
   append '{t:"now",time:$time,ep:$ep,id:$id,text:$x,key:$k} + (if $p == "" then {} else {parent:$p} end)' \
     --arg id "$id" --arg x "$*" --arg k "$k" --arg p "$_par"
+  unlock "send"
   printf '[awb %s#%s] %s\n做完后回复一行：以 [awb %s#%s] 开头，写结果（做不了也照此格式说明原因）。\n' "$id" "$k" "$*" "$id" "$k"
   # the task is only recorded here; the text above still has to reach the worker
   echo "$PROG: recorded $id #$k; deliver the text above with SendMessage (or: $PROG tell $id \"\$msg\")" >&2
@@ -1416,7 +1430,7 @@ merge() {
             | select(($l | contains($h)) and ($l | test("APPROVE|REQUEST CHANGES|CHANGES REQUESTED")))
             | {ep:.createdAt, ok:($l | test($re))}]
          | sort_by(.ep) | last) as $v
-      | [(.statusCheckRollup // [])[] | {name:(.name // .context // ""), c:((.conclusion // "") | if . == "" then null else . end) // (.state // "")}] as $cs
+      | [(.statusCheckRollup // [])[] | {name:(.name // .context // ""), c:(if (.conclusion // "") == "" then (.state // "") else .conclusion end)}] as $cs
       | ([$cs[] | select(.c | IN("","PENDING","EXPECTED","QUEUED","IN_PROGRESS"))] | length) as $pend
       | ([$cs[] | select(.c | IN("FAILURE","ERROR","CANCELLED","TIMED_OUT","ACTION_REQUIRED","STARTUP_FAILURE"))] | length) as $bad
       | ([$cs[] | select(.c == "SUCCESS" and (.name | test($req)))] | length) as $good
@@ -1814,6 +1828,9 @@ selftest() {
   "$BIN" view --json | jq -e '[.agents[] | [.id, .status, .text, .dn]]
     == [["a2","blocked","等 waiting on review",0], ["a1","running","render board",1]]' >/dev/null \
     || die "selftest: agents in the snapshot: $("$BIN" view --json | jq -c '[.agents[] | [.id, .status, .text, .dn]]')"
+  od=$t/obs-json; mkdir -p "$od"; printf 'one transcript\n' > "$od/obs"
+  AWB_DIR=$od "$BIN" view --json | jq -e '.observe.files == 1 and (.observe.last | type) == "number"' >/dev/null \
+    || die "selftest: an observation file did not produce valid JSON metadata"
 
   # the brief view answers: how far and moving (metric trend, ETA, last hour), what needs
   # you (above the agents), what each agent does now, what is folded away. Own log, so
@@ -1930,6 +1947,18 @@ selftest() {
   AWB_NOTIFY=0 sn check d1 -- false >/dev/null 2>&1 || true
   sn peers | grep -q '^d1 .*#k9' || die "selftest: a rejected check lost the sent task: $(sn peers)"
   sn check d1 -- true >/dev/null && sn reply d1 k9 "fixed" >/dev/null || die "selftest: the reply after a re-check was refused"
+  # simultaneous sends to one worker must serialize the empty-slot check and append
+  srd=$t/send-race-board; mkdir -p "$srd"; AWB_DIR=$srd "$BIN" start srace send-race >/dev/null
+  gate=$t/send-race-go; pids=
+  for task in first second; do
+    (while [ ! -e "$gate" ]; do sleep 0.01; done
+      AWB_DIR=$srd "$BIN" send srace "$task" > "$t/send-$task.out" 2> "$t/send-$task.err") &
+    pids="$pids $!"
+  done
+  : > "$gate"
+  for pid in $pids; do wait "$pid" || true; done
+  [ "$(jq -sc --arg id srace '[.[] | select(.t == "now" and .id == $id and (.key | type) == "string")] | length' "$srd/events.jsonl")" = 1 ] \
+    || die "selftest: concurrent sends opened multiple tasks for one worker"
   # news: lines with one key are one fact, the latest shows; lines without a key all show
   bd4=$t/brief4; mkdir -p "$bd4"; nb() { AWB_DIR=$bd4 "$BIN" news "$@"; }
   nb "no key"; nb --key val@15000 "feed: val 1.888"; nb "other"; nb --key val@15000 "val 1.888, grad ok"; nb --key ck "saved"
