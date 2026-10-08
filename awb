@@ -37,17 +37,22 @@ append() {
   init_dir
   lock append
   _f=$1; shift
-  # A killed writer may leave an incomplete last line. Keep it separate from the next event;
-  # readers already ignore malformed lines. Concurrent large events must never interleave.
-  if [ -s "$EV" ] && [ "$(tail -c 1 "$EV" | od -An -tx1 | tr -d ' ')" != 0a ]; then
-    printf '\n' >> "$EV"
-  fi
+  event_boundary
   if ! jq -cn --arg time "$(date +$TS_FMT)" --argjson ep "$(date +%s)" "$_f" "$@" >> "$EV"; then
     unlock append; die "cannot append an event to $EV"
   fi
   unlock append
   # once per command, so a caller sees which board it wrote to
   [ -n "${AWB_TOLD:-}" ] || { AWB_TOLD=1; printf '%s: recorded in %s\n' "$PROG" "$AWB_DIR" >&2; }
+}
+
+# Caller holds the append lock, for both direct events and imported messages.
+event_boundary() {
+  # A killed writer may leave an incomplete last line. Keep it separate from the next event;
+  # readers already ignore malformed lines. Concurrent large events must never interleave.
+  if [ -s "$EV" ] && [ "$(tail -c 1 "$EV" | od -An -tx1 | tr -d ' ')" != 0a ]; then
+    printf '\n' >> "$EV"
+  fi
 }
 
 q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
@@ -925,7 +930,6 @@ observe_once() {
         else empty end end' 2>/dev/null
   done > "$_new"
   rm -f "$_new.c"
-  mv "$_nf" "$_of"
   if [ -s "$_new" ]; then
     lock append
     jq -sc --argjson seen "$(grep -F '"t":"msg"' "$EV" | jq -Rsc '[split("\n")[] | fromjson? | .mid // empty | select(. != "")]
@@ -934,9 +938,13 @@ observe_once() {
        | sort_by(.ep)[]' "$_new" > "$_new.u"
     # a keyed reply is only recorded: a progress report carries the key too (Meshy, 2026-09-28:
     # "[awb env#K] 进度：…安装中" closed the task), so the main agent closes it with awb reply
-    cat "$_new.u" >> "$EV"
+    event_boundary
+    cat "$_new.u" >> "$EV" || die "cannot import messages to $EV"
     unlock append
   fi
+  # Publish offsets only after the events. A killed observer replays the old offsets;
+  # message ids remove duplicates already appended before that interruption.
+  mv "$_nf" "$_of"
   rm -f "$_new" "$_new.u"; unlock obs
 }
 
@@ -1586,7 +1594,16 @@ tell() {
   # one tell per pane at a time, each with its own buffer: concurrent tells merged or lost
   # messages otherwise (model/tla/AwbTell.tla)
   lock "tell-$_p"
+  if _dialog; then
+    echo "$PROG: $_id opened a permission dialog while waiting for the pane lock" >&2
+    unlock "tell-$_p"; return 1
+  fi
   printf '%s' "$_msg" | tm load-buffer -b "awb-tell-$$" -
+  if _dialog; then
+    tm delete-buffer -b "awb-tell-$$" 2>/dev/null || true
+    echo "$PROG: $_id opened a permission dialog before the paste" >&2
+    unlock "tell-$_p"; return 1
+  fi
   tm paste-buffer -p -d -b "awb-tell-$$" -t "$_p"
   # Confirm the paste actually submitted. A TUI can keep it in the input box
   # after one Enter: Claude leaves the text (or a collapsed "[Pasted text #N
@@ -2587,6 +2604,20 @@ FT
     wait; sleep 0.3
     ! tmux -L "$S" capture-pane -p -t "$zp" | grep -qx "mid-tell-enter" || die "selftest: tell pressed Enter into a dialog opened mid-tell"
     tmux -L "$S" send-keys -t "$zp" C-u
+    # A queued tell must re-read the dialog after taking its pane lock, before pasting.
+    reg idle
+    ( lock "tell-$zp"; : > "$t/tell-held"
+      for i in $(seq 1 100); do [ ! -e "$t/tell-release" ] || break; sleep .05; done
+      unlock "tell-$zp"
+    ) >"$t/tell-holder.log" 2>&1 & tp=$!
+    i=0; until [ -e "$t/tell-held" ]; do
+      i=$((i+1)); [ $i -lt 100 ] || { kill "$tp"; wait "$tp" || true; die "selftest: tell holder did not start"; }; sleep .02
+    done
+    ht tell z1 "dialog-lock-no-paste" >"$t/tell-wait.out" 2>"$t/tell-wait.err" & tq=$!
+    sleep .5; reg waiting "permission prompt"; : > "$t/tell-release"; wait "$tp"
+    if wait "$tq"; then die "selftest: queued tell accepted a permission dialog"; fi
+    ! tmux -L "$S" capture-pane -J -p -t "$zp" | grep -Fq "dialog-lock-no-paste" \
+      || die "selftest: queued tell pasted into a newly reported permission dialog"
     reg idle
     ! ht view --once | grep -Fq "待批准" || die "selftest: idle session shown as waiting for approval"
     ! ht peers | grep -q ' waiting' || die "selftest: idle session listed as waiting"
@@ -2686,7 +2717,7 @@ FT
     # a message id already recorded never twice
     mkdir -p "$t/home/.claude/projects/p"; tr_=$t/home/.claude/projects/p/s-zz.jsonl
     printf '{"pid":%s,"name":"main-x","sessionId":"s-main","status":"busy","statusUpdatedAt":1}\n' $$ > "$t/home/.claude/sessions/2.json"
-    ts_() { date -u -r "$1" +%Y-%m-%dT%H:%M:%S.000Z; }
+    ts_() { jq -nr --argjson ep "$1" '$ep | strftime("%Y-%m-%dT%H:%M:%S.000Z")'; }
     out_() { jq -cn --arg ts "$(ts_ "$1")" --arg to "$2" --arg m "$3" \
       '{type:"assistant", timestamp:$ts, message:{content:[{type:"tool_use", id:("toolu" + $ts), name:"SendMessage", input:{to:$to, message:$m}}]}}'; }
     in_() { jq -cn --arg ts "$(ts_ "$1")" --arg n "$2" --arg b "$3" \
@@ -2740,6 +2771,25 @@ FT
     in_ "$(date +%s)" main-x "thanks, stand by" >> "$tr_"; ht _observe
     ! AWB_REPLY_IDLE=0 ht view --json | jq -e 'any(.anomalies[]; .kind == "noreply")' >/dev/null \
       || die "selftest: a notice to a worker with no open task flagged as not replied"
+    before=$(grep -cF '"t":"msg"' "$EV")
+    printf '{"t":"news","text":"interrupted' >> "$EV"
+    in_ "$(date +%s)" main-x "after interrupted event" >> "$tr_"; ht _observe
+    events_json | jq -e --argjson n "$((before + 1))" '[.[] | select(.t == "msg")] | length == $n' >/dev/null \
+      || die "selftest: a partial event consumed an imported message"
+    mkdir "$t/obs-crash-bin"
+    cat > "$t/obs-crash-bin/mv" <<'OBSCRASH'
+#!/bin/sh
+/bin/mv "$@" || exit $?
+if [ "$2" = "$AWB_DIR/obs" ]; then kill -KILL "$PPID"; fi
+OBSCRASH
+    chmod +x "$t/obs-crash-bin/mv"
+    in_ "$(date +%s)" main-x "cursor crash retry" >> "$tr_"
+    if PATH=$t/obs-crash-bin:$PATH ht _observe >"$t/obs-crash.out" 2>"$t/obs-crash.err"; then
+      die "selftest: observer crash injection did not stop the process"
+    fi
+    ht _observe; ht _observe
+    events_json | jq -e --argjson n "$((before + 2))" '[.[] | select(.t == "msg")] | length == $n' >/dev/null \
+      || die "selftest: interrupted observation lost or duplicated a message"
     reg idle
     rm -f "$t/home/.claude/sessions/2.json"
     # a pane given as session:window.pane in .awb/panes resolves to the same session
