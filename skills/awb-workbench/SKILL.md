@@ -155,6 +155,25 @@ ID 字符集 `[A-Za-z0-9_-]`；先 `awb start` 注册 agent id，其他命令才
 `awb replay [步长]` 回放日志：异常按 episode 列出，然后是核心指标——
 发出的任务及其结局（回复、`finish` 无回复、丢失、open）、每个"需要你"在看板上停留的时长、worker 重启次数。
 
+## 采集事实与告警
+
+采集器用 `news --key` 写入事实。相同 key 只展示最新记录。
+
+```sh
+awb news --key health --ttl 600 "worker 正常"
+awb news --key health --ttl 600 --warn "worker 已退出"
+awb news --key health --ttl 600 "worker 已恢复"
+```
+
+- `--warn` 立即加入异常区。相同 key 的下一条正常记录清除告警。
+- `--ttl` 指定读数有效期，单位为秒。支持 1 到 2147483647 的整数。
+- 读数年龄超过有效期后，快照显示过期告警。等于有效期时仍有效。
+- 两个参数都要求非空 `--key`。每次写入都需声明有效期。
+- 新记录省略 `--ttl`，该 key 不再检查过期。
+- 告警沿用终端与飞书卡片的异常区。飞书仍依赖正常同步。
+- 过期只表示读数陈旧，不证明远端任务退出。
+- AWB 不采集远端事实，也不启动或恢复训练。
+
 ## Lean 4 验收
 
 `awb check <id> -- <awb 目录>/model/accept.sh <项目目录> ACCEPT.lean`：
