@@ -79,7 +79,15 @@ card() {
        # reading on top of an hourly probe) collapse to the newest, so the line shows one point
        + (($s.metric.history // []) as $mh
           | (($mh | length) > 0 and all($mh[]; .x != null)) as $steps
-          | (if $steps then [($s.refs // [])[] | select((.history | length) > 0)] else [] end) as $rf
+          | (if $steps then
+               ([$mh[].x] | min) as $xlo | ([$mh[].x] | max) as $xhi
+               # only references that share the current metric step range: reference series from
+               # a closed earlier phase (a base comparison, an early validation loss) stay off the
+               # chart and no longer drown the current segment.
+               | [($s.refs // [])[]
+                   | select((.history | length) > 0)
+                   | select([.history[].x] | any(. >= $xlo and . <= $xhi))]
+             else [] end) as $rf
           | if $s.metric and (($mh | length) >= 2 or (($mh | length) >= 1 and ($rf | length) > 0)) then
               ((if $steps then [$mh[] | {t:.x, v:.value, s:$s.metric.name}]
                   + [$rf[] | .name as $n | .history[] | {t:.x, v:.value, s:$n}]
