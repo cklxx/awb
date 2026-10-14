@@ -2031,6 +2031,30 @@ INSTALLCURL
   jq -e '[.body.elements[]? | select(.tag=="chart") | .chart_spec.data.values[].s] | unique == ["HumanEval","cur"]' "$t/cs.json" >/dev/null \
     && jq -e '[.body.elements[]? | select(.tag=="chart") | .chart_spec.data.values[] | select(.s=="HumanEval") | .t] == [56000,60000,64000]' "$t/cs.json" >/dev/null \
     || die "selftest: a reference outside the current segment leaked onto the chart: $(jq -c '[.body.elements[]? | select(.tag=="chart") | .chart_spec.data.values] | .[0]' "$t/cs.json")"
+  # news fold: six stable facts all render; the long multiline per-domain block is not clipped.
+  nf=$t/newsfold; mkdir -p "$nf"; nfadd() { AWB_DIR=$nf "$BIN" news --key "$1" "$2" >/dev/null; }
+  nfadd stage3 "训练：step 64000"
+  nfadd health "健康：进程存活"
+  nfadd battery "battery 最新 step64000：dc156 39/156"
+  nfadd bdomains "battery step64000 · 9域 bpb（值 / 对62269 Δ，↓=更优）
+code_l3　0.2893 +0.0076
+code_l2　0.3946 +0.0037
+math_g4　0.7729 +0.0135
+math_cot2　0.3795 +0.0254
+en_fwe4　1.0232 +0.0003
+cosmo　0.7426 -0.0046
+en_c4　1.0695 +0.0059
+code_opencot　0.6493 +0.0254
+py_commit　0.5049 +0.0031"
+  nfadd he "HumanEval 全量最新 step64000"
+  nfadd watchers "watchers：全量HumanEval eval；battery idle"
+  if AWB_DIR=$nf AWB=$BIN /bin/sh "$lkdir/awb-lark" sync --dry-run > "$t/nf.json" 2>/dev/null; then :; fi
+  nfhd=$(jq -c '[.body.elements[]? | select(.tag=="collapsible_panel") | .header.title.content]' "$t/nf.json")
+  nfbd=$(jq -c '[.body.elements[]? | select(.tag=="collapsible_panel") | .elements[] | select(.tag=="markdown") | .content]' "$t/nf.json")
+  printf '%s' "$nfhd" | jq -e 'length == 1' >/dev/null \
+    && printf '%s' "$nfbd" | jq -e 'length == 5' >/dev/null \
+    && printf '%s' "$nfbd" | jq -e 'join("\n") | contains("py_commit") and contains("code_l3") and (contains("…")|not)' >/dev/null \
+    || die "selftest: news fold lost a fact or clipped the per-domain block: $(printf '%s' "$nfhd" "$nfbd" | cut -c1-500)"
   # replay: the board as of each step, from the log alone. An agent silent for two hours is
   # one silent episode; a board AWB_NOW renders never reads the live registry or panes.
   rd=$t/replay; mkdir -p "$rd"; r0=$((bn - 20000))

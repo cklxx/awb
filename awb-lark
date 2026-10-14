@@ -111,8 +111,10 @@ card() {
           else [] end)
        # folded under the latest news line: the earlier news and the task tree. With neither
        # news nor tasks the panel is omitted (an empty folded panel showed nothing)
-       + (($s.news[-5:] | reverse) as $nw
-          | ([ $nw[1:][] | {tag:"markdown", content:(("\(.time[0:5])" | grey) + "　\(.text | clip(100))")} ]
+       + (($s.news[-6:] | reverse) as $nw
+          | ([ $nw[1:][] | {tag:"markdown", content:(("\(.time[0:5])" | grey) + "　"
+               + (if (.text | startswith("battery step")) and (.text | contains("9域 bpb")) then .text
+                  else (.text | clip(100)) end))} ]
              + [ $s.tasks[] | {tag:"markdown", content:(
                  "**\(.text | clip(60))**　\(.d)/\(.t)" + (if .quiet then "　" + ("\(.quiet | ago)没更新" | grey) else "" end)
                  + (if .folded > 0 then "\n✓ 另 \(.folded) 项已完成" else "" end)
