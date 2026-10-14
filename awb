@@ -1869,6 +1869,19 @@ selftest() {
     else printf 'selftest: failure evidence kept at %s\n' "$t" >&2; fi
   }
   trap cleanup EXIT
+  # Stop a background board with a bounded shutdown. A catchable signal can be
+  # ignored in a restricted shell (a sandbox or a container); then escalate to
+  # SIGKILL so the test never blocks in wait forever.
+  stop_bg() {
+    kill "$1" 2>/dev/null || true
+    _sb=0
+    while [ $_sb -lt 20 ]; do
+      kill -0 "$1" 2>/dev/null || return 0
+      sleep 0.1; _sb=$((_sb + 1))
+    done
+    kill -9 "$1" 2>/dev/null || true
+    wait "$1" 2>/dev/null || true
+  }
   export AWB_DIR=$t AWB_COLS=160 AWB_ROWS=200 AWB_NUDGE=0; EV=$t/events.jsonl
   # never the user's Lark group: a test board's watch loop would mirror itself there. A
   # guard lark-cli first on PATH records any call that escapes the fakes below.
@@ -2003,6 +2016,21 @@ INSTALLCURL
   AWB_DIR=$rf "$BIN" view --json | jq -e '.metric.name == "he 0926" and .day.metric == null and .metric.since == null
     and .refs == [{name:"base 0923", target:30, history:[{x:2000, value:3}, {x:4000, value:7}, {x:6000, value:9}]}]' >/dev/null \
     || die "selftest: a reference series leaked into the metric: $(AWB_DIR=$rf "$BIN" view --json | jq -c '{m:.metric.name, d:.day.metric, refs}')"
+  # chart segment filter: a reference with no point in the current metric step range stays off
+  # the chart, so a closed-phase base comparison no longer drowns the current segment.
+  cs=$t/chartseg; mkdir -p "$cs"; cb() { AWB_DIR=$cs "$BIN" metric "$@"; }
+  cb --step 64000 "cur" 64000 77527
+  cb --step 64050 "cur" 64050 77527
+  cb --ref --step 56000 "HumanEval" 28.21 30
+  cb --ref --step 60000 "HumanEval" 28.85 30
+  cb --ref --step 64000 "HumanEval" 30.0 30
+  cb --ref --step 2000 "base 0923" 3 30
+  cb --ref --step 4000 "base 0923" 7 30
+  lkdir=$(dirname "$(readlink "$BIN" || echo "$BIN")")
+  if AWB_DIR=$cs AWB=$BIN /bin/sh "$lkdir/awb-lark" sync --dry-run > "$t/cs.json" 2>/dev/null; then :; fi
+  jq -e '[.body.elements[]? | select(.tag=="chart") | .chart_spec.data.values[].s] | unique == ["HumanEval","cur"]' "$t/cs.json" >/dev/null \
+    && jq -e '[.body.elements[]? | select(.tag=="chart") | .chart_spec.data.values[] | select(.s=="HumanEval") | .t] == [56000,60000,64000]' "$t/cs.json" >/dev/null \
+    || die "selftest: a reference outside the current segment leaked onto the chart: $(jq -c '[.body.elements[]? | select(.tag=="chart") | .chart_spec.data.values] | .[0]' "$t/cs.json")"
   # replay: the board as of each step, from the log alone. An agent silent for two hours is
   # one silent episode; a board AWB_NOW renders never reads the live registry or panes.
   rd=$t/replay; mkdir -p "$rd"; r0=$((bn - 20000))
@@ -2245,7 +2273,7 @@ LOCKRM
     && chmod +x "$hr/awb.new" && mv "$hr/awb.new" "$hr/awb"
   i=0; until [ -s "$t/hotmark" ]; do
     i=$((i + 1)); [ $i -lt 40 ] || { kill $hp; die "selftest: a running board did not take a new install of awb"; }; sleep 0.25; done
-  kill $hp; wait $hp 2>/dev/null || true
+  stop_bg $hp
   AWB_STALE=0 hb view --json | jq -e '(.holds | length) == 0 and (any(.anomalies[]; .kind == "hold") | not)' >/dev/null \
     || die "selftest: a released resource still shown"
   # merge: only the newest verdict naming the current head counts, a conditional or retracted
@@ -2753,7 +2781,7 @@ FT
     wp=$!; i=0
     until grep -F '"t":"nudge"' "$EV" | grep -F '"id":"z1"' | grep -qvF '"why"'; do
       i=$((i + 1)); [ $i -lt 40 ] || { kill $wp; die "selftest: an open board did not nudge a silent agent"; }; sleep 0.25; done
-    kill $wp; wait $wp 2>/dev/null || true
+    stop_bg $wp
     tmux -L "$S" send-keys -t "$zp" C-u; tmux -L "$S" send-keys -t "$zp" clear Enter
     "$BIN" now z1 "quiet"
     ! AWB_STALE=0 ht peers | grep '^z1 ' | grep -q silent || die "selftest: an agent with a Claude session listed silent"
@@ -2805,7 +2833,7 @@ FT
     wp=$!; i=0
     until [ "$(grep -F '"t":"msg"' "$EV" | grep -cF '"dir":"in"')" = 3 ]; do
       i=$((i + 1)); [ $i -lt 40 ] || { kill $wp; die "selftest: a board with AWB_NUDGE=0 did not observe"; }; sleep 0.25; done
-    kill $wp; wait $wp 2>/dev/null || true
+    stop_bg $wp
     ht view --json | jq -e '.observe.files >= 1 and .observe.last > 0' >/dev/null || die "selftest: the last observation round not in the snapshot"
     # a keyed reply after the send, then an idle session: shown until the main agent records it
     AWB_REPLY_IDLE=0 ht view --json | jq -e --arg k "$ok_" 'any(.anomalies[]; .kind == "replied" and (.text | contains("awb reply z1 " + $k)))' >/dev/null \
@@ -3108,7 +3136,7 @@ FAKE
     [ ! -e "$lb/lock-lark" ] || die "selftest: awb-lark left its lock behind"
     sleep 30 & lp=$!; ln -s "$lp" "$lb/lock-lark"; : > "$t/lark.log"; lr sync
     ! grep -q 'messages patch' "$t/lark.log" || die "selftest: awb-lark took a live sync's lock"
-    kill $lp; wait $lp 2>/dev/null || true; rm -f "$lb/lock-lark"
+    stop_bg $lp; rm -f "$lb/lock-lark"
     mkdir "$lb/lock-lark"; : > "$t/lark.log"; lr sync
     grep -q 'messages patch' "$t/lark.log" || die "selftest: an old lock directory stopped the refresh"
     # the topic is created with a key derived from the board, so a repeated send is deduplicated
@@ -3116,7 +3144,7 @@ FAKE
     # a board never linked (no lark.json) does not post itself, even with the group set
     nl=$t/unlinked; mkdir -p "$nl"; AWB_DIR=$nl "$BIN" goal "scratch" >/dev/null; : > "$t/lark.log"
     AWB_DIR=$nl XDG_CONFIG_HOME=$t/xdg PATH=$fb:$PATH AWB_LARK_EVERY=1 AWB_INTERVAL=0.2 "$BIN" view >/dev/null 2>&1 &
-    wp=$!; sleep 2.5; kill $wp; wait $wp 2>/dev/null || true
+    wp=$!; sleep 2.5; stop_bg $wp
     [ ! -s "$t/lark.log" ] && [ ! -e "$nl/lark.json" ] || die "selftest: an unlinked board posted itself to the Lark group"
     # the refresh itself: a running board (watch) patches the card on its own, again and
     # again, and each patch carries the board's latest state
@@ -3128,7 +3156,7 @@ FAKE
     AWB_DIR=$lb "$BIN" task rp wip "refresh-probe"; AWB_DIR=$lb "$BIN" news "news-while-watching"
     i=0; until grep -q 'refresh-probe' "$t/lark-last.json" 2>/dev/null && grep -q 'news-while-watching' "$t/lark-last.json"; do
       i=$((i + 1)); [ $i -lt 40 ] || { kill $wp; die "selftest: a refresh did not carry the new state"; }; sleep 0.25; done
-    kill $wp; wait $wp 2>/dev/null || true
+    stop_bg $wp
     ! grep -q -e '+messages-send' -e '+messages-reply' "$t/lark.log" || die "selftest: a refresh posted a message"
   fi
   [ ! -s "$t/guard/calls" ] || die "selftest: a test reached lark-cli: $(head -1 "$t/guard/calls")"
