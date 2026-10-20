@@ -2460,13 +2460,19 @@ LOCKRM
   ! hb nosuchcmd 2>&1 | grep -Fq "did you mean" || die "selftest: a far miss got a suggestion"
   # a running board takes a new install of its script (a moved pin) by re-executing itself
   hr=$t/hot; mkdir -p "$hr/b"; cp "$BIN" "$hr/awb"
-  HOT_MARK=$t/hotmark AWB_DIR=$hr/b AWB_NUDGE=0 AWB_NUDGE_POLL=1 AWB_INTERVAL=0.2 "$hr/awb" view >/dev/null 2>&1 </dev/null &
-  hp=$!; sleep 0.5
+  AWB_DIR=$hr/b "$BIN" goal "hot-reload-ready" >/dev/null
+  HOT_MARK=$t/hotmark AWB_DIR=$hr/b AWB_NUDGE=0 AWB_NUDGE_POLL=1 AWB_INTERVAL=0.2 "$hr/awb" view >"$hr/view.out" 2>"$hr/view.err" </dev/null &
+  # The first rendered board proves watch has read the original script's checksum.
+  # A fixed startup sleep can install the replacement before that baseline is read.
+  hp=$!; i=0; until grep -Fq "hot-reload-ready" "$hr/view.out"; do
+    i=$((i + 1)); [ $i -lt 40 ] && kill -0 "$hp" 2>/dev/null \
+      || { stop_bg "$hp"; die "selftest: the original board did not become ready for a new install of awb"; }; sleep 0.25; done
   awk 'NR == 2 {print "[ \"${1:-}\" = view ] && echo reloaded >> \"$HOT_MARK\""} 1' "$hr/awb" > "$hr/awb.new" \
     && chmod +x "$hr/awb.new" && mv "$hr/awb.new" "$hr/awb"
   i=0; until [ -s "$t/hotmark" ]; do
-    i=$((i + 1)); [ $i -lt 40 ] || { kill $hp; die "selftest: a running board did not take a new install of awb"; }; sleep 0.25; done
-  stop_bg $hp
+    i=$((i + 1)); [ $i -lt 40 ] && kill -0 "$hp" 2>/dev/null \
+      || { stop_bg "$hp"; die "selftest: a running board did not take a new install of awb"; }; sleep 0.25; done
+  stop_bg "$hp"
   AWB_STALE=0 hb view --json | jq -e '(.holds | length) == 0 and (any(.anomalies[]; .kind == "hold") | not)' >/dev/null \
     || die "selftest: a released resource still shown"
   # merge: only the newest verdict naming the current head counts, a conditional or retracted
