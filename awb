@@ -1847,7 +1847,10 @@ check() {
     unlock send
     echo "accepted: $what"
   else
-    why=$(grep -v '^[[:space:]]*$' "$CHK_LOG" | tail -1 | cut -c1-120)
+    why=$(awk -v re="${AWB_WHY_RE:-error|fail|assert|not found|no such|uncommitted|refused|denied|expect:|stale:}" '
+      /^awb: recorded in / || /^[[:space:]]*$/ {next}
+      {last = $0; if (tolower($0) ~ tolower(re)) hit = $0}
+      END {print (hit != "" ? hit : last)}' "$CHK_LOG" | cut -c1-120)
     [ -n "$why" ] || why="exit $rc"
     append '{t:"status",time:$time,ep:$ep,id:$id,status:"failed",reason:$r,gate:true}' \
       --arg id "$id" --arg r "验收未过($what): $why"
@@ -2574,6 +2577,25 @@ EOF
   "$BIN" now a1 "post-unknown-still-works"
   "$BIN" view --json | jq -e 'any(.agents[]; .id == "a1" and .text == "post-unknown-still-works")' >/dev/null \
     || die "selftest: events after an unknown no-id event dropped"
+  # Rejection reasons prefer meaningful errors over trailing status/file listings.
+  wb=$t/why; mkdir -p "$wb"
+  wt() { AWB_DIR=$wb AWB_NOTIFY=0 "$BIN" "$@"; }
+  wt start why reason >/dev/null
+  ! wt check why -- sh -c 'printf "ERROR first\nuncommitted:\n M a.py\nawb: recorded in somewhere\n"; exit 1' >/dev/null \
+    || die "selftest: reason check accepted"
+  wt view --json | jq -e '.need | any(.id == "why" and (.text | endswith("uncommitted:")))' >/dev/null \
+    || die "selftest: rejection hid uncommitted reason"
+  ! AWB_WHY_RE='marker:' wt check why -- sh -c 'printf "MARKER: selected\nerror ignored\n"; exit 1' >/dev/null \
+    || die "selftest: custom reason check accepted"
+  wt view --json | jq -e '.need | any(.id == "why" and (.text | endswith("MARKER: selected")))' >/dev/null \
+    || die "selftest: custom reason regex was not case insensitive"
+  ! wt check why -- sh -c 'printf "plain last line\n\nawb: recorded in somewhere\n"; exit 1' >/dev/null \
+    || die "selftest: plain reason check accepted"
+  wt view --json | jq -e '.need | any(.id == "why" and (.text | endswith("plain last line")))' >/dev/null \
+    || die "selftest: rejection did not fall back to last nonempty line"
+  ! wt check why -- false >/dev/null || die "selftest: empty reason check accepted"
+  wt view --json | jq -e '.need | any(.id == "why" and (.text | endswith("exit 1")))' >/dev/null \
+    || die "selftest: rejection did not fall back to exit code"
   # verified vs self-reported milestones: a1 has one done, none verified yet
   "$BIN" view --json | jq -e '.verified == {v:0, n:1}' >/dev/null || die "selftest: milestone verified/self-reported count wrong"
 

@@ -180,6 +180,9 @@ nobody updated that long (default 21600), `AWB_FROZEN=SECS`
 flags a running agent whose git working tree is unchanged that long (default 900).
 
 Keep acceptance files outside the agent's working directory so the agent cannot edit them.
+Rejected checks use the last case-insensitive `AWB_WHY_RE` match as their reason (default
+`error|fail|assert|not found|no such|uncommitted|refused|denied|expect:|stale:`), otherwise the
+last non-empty line, otherwise the exit code. Lines starting `awb: recorded in ` are ignored.
 
 Each check shows on the board under 验收 as it runs: `build → sorry → types → axioms` for
 Lean (one `cmd` step otherwise), with a timer on the running step and the reason under a
