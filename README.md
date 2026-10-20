@@ -288,7 +288,11 @@ non-git directories are skipped.
   selects the default tmux server (with `TMUX` unset), and `%N@/absolute/socket/path`
   selects that socket. Bare `%N` keeps using the board's server. Pane ids are unique only
   within a server; `peers`, session discovery and pane commands preserve that pair even
-  when the board has its own server.
+  when the board has its own server. Use `awb adopt ID NAME TMUX-TARGET [GROUP]` to
+  register an existing session or `session:window.pane` target: it resolves the default
+  server first, then the board server, records the pane's current directory and prints
+  `ID PANE SESSION` (`-` without a Claude registry match). Repeating it replaces the
+  mapping without adding another start event; the process is never restarted.
 
 ## Contributing and releases
 

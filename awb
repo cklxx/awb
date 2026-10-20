@@ -1621,6 +1621,32 @@ need_agent() {
     || die "unknown agent: $1 (a worker registers with $PROG run, tui or start; the main agent needs no id: $PROG task ID STATE TEXT, $PROG goal, $PROG news)"
 }
 
+# Attach an existing pane without restarting its process or duplicating its start event.
+adopt() {
+  [ $# -ge 3 ] || die "usage: $PROG adopt ID NAME TMUX-TARGET [GROUP]"
+  _ad_id=$1; _ad_name=$2; _ad_target=$3; _ad_group=${4:-default}; init_dir
+  if _ad_pane=$(tmp %0@default display-message -p -t "$_ad_target" '#{pane_id}') && [ -n "$_ad_pane" ]; then
+    _ad_token=$_ad_pane@default
+  else
+    _ad_pane=$(tm display-message -p -t "$_ad_target" '#{pane_id}')
+    [ -n "$_ad_pane" ] || die "no tmux pane for $_ad_target"
+    _ad_token=$_ad_pane@$(tm display-message -p -t "$_ad_pane" '#{socket_path}')
+  fi
+  _ad_path=$(tmp "$_ad_token" display-message -p -t "$_ad_pane" '#{pane_current_path}')
+  touch "$AWB_DIR/panes"
+  _ad_file=$(mktemp "$AWB_DIR/panes.XXXXXX")
+  awk -v id="$_ad_id" '$1 != id' "$AWB_DIR/panes" > "$_ad_file"
+  printf '%s %s %s\n' "$_ad_id" "$_ad_token" "$_ad_path" >> "$_ad_file"
+  mv "$_ad_file" "$AWB_DIR/panes"
+  _ad_session=$(sessions_json | jq -r --arg id "$_ad_id" '.[$id].name // "-"')
+  _ad_kind=cli; [ "$_ad_session" = - ] || _ad_kind=claude
+  if ! events_json | jq -e --arg id "$_ad_id" 'any(.[]; .t == "start" and .id == $id)' >/dev/null; then
+    append '{t:"start",time:$time,ep:$ep,id:$id,name:$name,kind:$kind,pane:$pane,group:$group}' \
+      --arg id "$_ad_id" --arg name "$_ad_name" --arg kind "$_ad_kind" --arg pane "$_ad_token" --arg group "$_ad_group"
+  fi
+  printf '%s %s %s\n' "$_ad_id" "$_ad_token" "$_ad_session"
+}
+
 # type a message into an agent's TUI (claude, codex, any): a named buffer, then Enter.
 # Claude queues it if a turn is running. Plain send-keys Enter does not submit in claude.
 # a run agent back at a plain shell prompt is a command line, not an agent TUI: a rejected
@@ -1910,6 +1936,7 @@ One unit of work, the task. You talk to one Claude (the main agent); it keeps th
   $PROG goal TEXT                   the goal; its first line is the title
   $PROG tui [-g GROUP] ID NAME      a Claude worker; prints its session name when ready
                                     (AWB_TUI_CMD, default claude-db if on PATH else claude)
+  $PROG adopt ID NAME TMUX-TARGET [GROUP]  track an existing pane (default server, then board)
   $PROG send [--under PARENT] ID TASK
                                     a task for worker ID, a node of the task tree; prints the
                                     message: SendMessage(to: <session>, message: it, notify_when_idle: true)
@@ -2759,6 +2786,28 @@ EOF
     printf 'x1 %s@default\nb1 %s\n' "$xp" "$boardpane" > "$xd/panes"
     PATH=$xd/bin:$PATH xt peers | grep -Fxq "x1 $xp@default external-session idle" \
       || die "selftest: default-server qualifier was not resolved"
+    # Adopt resolves default first, falls back to the board, and never duplicates a start.
+    ad=$t/adopt; mkdir -p "$ad"
+    at() { PATH=$xd/bin:$PATH HOME=$xd/home AWB_DIR=$ad AWB_TMUX_SOCKET=$AWB_TMUX_SOCKET "$BIN" "$@"; }
+    ar=$(at adopt ad1 adopted awb team)
+    [ "$ar" = "ad1 $xp@default external-session" ] || die "selftest: adopt default resolution/output wrong: $ar"
+    at adopt ad1 adopted awb team >/dev/null
+    [ "$(awk '$1 == "ad1" {n++} END {print n}' "$ad/panes")" = 1 ] || die "selftest: adopt duplicated panes line"
+    [ "$(jq -s '[.[] | select(.t == "start" and .id == "ad1")] | length' "$ad/events.jsonl")" = 1 ] \
+      || die "selftest: adopt duplicated start"
+    jq -se 'any(.[]; .id == "ad1" and .kind == "claude" and .group == "team")' "$ad/events.jsonl" >/dev/null \
+      || die "selftest: adopt lost Claude kind or group"
+    apath=$(tmux -L "$S-ext" display-message -p -t "$xp" '#{pane_current_path}')
+    grep -Fxq "ad1 $xp@default $apath" "$ad/panes" || die "selftest: adopt did not record current path"
+    at peers | grep -Fxq "ad1 $xp@default external-session idle" || die "selftest: adopted pane not in peers"
+    abp=$(tmux -L "$S" new-session -d -s adopt-board -P -F '#{pane_id}' "$SHELL")
+    ar=$(at adopt ad2 cli adopt-board:0.0)
+    [ "$ar" = "ad2 $abp@$AWB_TMUX_SOCKET -" ] || die "selftest: adopt board resolution/output wrong: $ar"
+    jq -se 'any(.[]; .id == "ad2" and .kind == "cli" and .group == "default")' "$ad/events.jsonl" >/dev/null \
+      || die "selftest: adopt CLI kind/default group wrong"
+    ! at adopt absent missing no-such-adopt-session >/dev/null 2>&1 || die "selftest: adopt accepted missing target"
+    ! at adopt >/dev/null 2>&1 || die "selftest: adopt accepted missing arguments"
+    tmux -L "$S" kill-session -t adopt-board
     printf 'x1 %s@%s\nb1 %s\n' "$xp" "$xs" "$boardpane" > "$xd/panes"
     tmux -L "$S-ext" kill-server
     xt peers | grep -Fxq "x1 $xp@$xs - gone" || die "selftest: closed external pane not marked gone"
@@ -3432,7 +3481,7 @@ case "$cmd" in ""|-h|--help|help|version|--version|-V) ;;
 # Key validation and its state change share send's lock. A duplicate reply or restart
 # cannot interleave between checking the old key and appending its completion.
 case "$cmd" in
-  start|now|done|block|unblock|fail|finish|reply|idle|_enter|_leave|task|reset) init_dir; lock send ;;
+  start|adopt|now|done|block|unblock|fail|finish|reply|idle|_enter|_leave|task|reset) init_dir; lock send ;;
 esac
 case "$cmd" in
   up)       up "$@" ;;
@@ -3445,6 +3494,7 @@ case "$cmd" in
             [ -S "$(sock_path)" ] && tmux -S "$(sock_path)" kill-session -t awb 2>/dev/null || true ;;
   run)      run "$@" ;;
   tui)      tui "$@" ;;
+  adopt)    adopt "$@" ;;
   start)
     [ $# -ge 1 ] || die "usage: $PROG start ID NAME [KIND] [GROUP]"
     init_dir; not_running "$1"
