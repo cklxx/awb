@@ -61,14 +61,19 @@ minutes), against 4 tasks sent with `awb send`.
   events and changes presentation by editing `awb` itself.
 - The main agent's messaging is also observed, without its help: each board round reads the
   new lines of the Claude transcripts of this board's agents only
-  (`~/.claude/projects/*/SESSION.jsonl`, read-only). A message an agent received from a session
+  (`DIR/projects/*/SESSION.jsonl` in the config dirs below, read-only). A message an agent received from a session
   that is not on the board is "out" (queued, delivered mid-turn or at idle: counted once), its
   own SendMessage to such a session is "in". Each is a `msg` event: time, direction, agent,
   the other session, the `[awb ID#KEY]` key and a message id, never the text. A new transcript
   is read from its last 24 hours. A reply with an open task's key does not close the task,
   since a progress report carries the key too; when the agent's session then sits idle for
   `AWB_REPLY_IDLE`, the board shows an anomaly until the main agent runs `awb reply`. The transcript format is Claude Code's own and unversioned;
-  `AWB_OBSERVE=0` turns this off.
+  `AWB_OBSERVE=0` turns this off. Registry and transcript searches use the colon-separated
+  `AWB_CLAUDE_DIRS`, then `CLAUDE_CONFIG_DIR` if set, then `$HOME/.claude`, deduplicated in
+  that order; observation uses the first matching transcript. It also discovers
+  `CLAUDE_CONFIG_DIR` from processes under agent panes (up to 32 ancestors), using one
+  process-tree snapshot per round and one bulk `ps -E` environment snapshot on macOS.
+  Unreadable process environments are silently skipped.
 - An agent's own `done` is a claim. `awb check` runs a check the main agent chose; only a
   passing check marks the milestone verified (`⊢`), and a rejected check blocks `done`
   until a later check passes.
@@ -188,6 +193,9 @@ nobody updated that long (default 21600), `AWB_FROZEN=SECS`
 flags a running agent whose git working tree is unchanged that long (default 900).
 
 Keep acceptance files outside the agent's working directory so the agent cannot edit them.
+Rejected checks use the last case-insensitive `AWB_WHY_RE` match as their reason (default
+`error|fail|assert|not found|no such|uncommitted|refused|denied|expect:|stale:`), otherwise the
+last non-empty line, otherwise the exit code. Lines starting `awb: recorded in ` are ignored.
 
 Each check shows on the board under 验收 as it runs: `build → sorry → types → axioms` for
 Lean (one `cmd` step otherwise), with a timer on the running step and the reason under a
@@ -267,8 +275,12 @@ non-git directories are skipped.
   or codex pane is never retried.
 - A rejected `awb check` tells the agent the reason automatically, unless the agent ran the
   check from its own pane (`AWB_NOTIFY=0` turns this off).
-- The board reads each Claude agent's live session state from `~/.claude/sessions` (read
-  only) and does not trust the self-report over it. A session on a permission dialog shows as
+- The board reads each Claude agent's live session state from `DIR/sessions` (read only):
+  the colon-separated `AWB_CLAUDE_DIRS`, then `CLAUDE_CONFIG_DIR` if set, then `$HOME/.claude`,
+  with duplicate dirs removed. Config dirs are also discovered from each agent pane's
+  process environments (`ps -E` on macOS, `/proc/PID/environ` on Linux), so separate Claude
+  configurations need no board setup when readable. It does not trust the self-report over
+  the registry. A session on a permission dialog shows as
   `▲ 待批准` with the dialog kind and its age, and `awb peers` prints its status as `waiting`,
   whatever the agent last reported; `tell` and `nudge` refuse to type into it, since typed
   text plus Enter would answer the dialog. tell reads the registry again before the paste and
@@ -278,14 +290,22 @@ non-git directories are skipped.
   while the session has been idle for `AWB_STALE` seconds. The dialog's own text is often
   scrolled off the pane by queued messages, so the registry state is used, not the screen.
 - For Claude agents, `peers` maps each agent to its Claude Code session name via
-  `~/.claude/sessions`. A main agent that is itself a Claude session can then message them with
+  `DIR/sessions` in the config dirs above. A main agent that is itself a Claude session can then message them with
   its `SendMessage` tool, which goes over Claude's own per-session socket and reaches the agent
   even mid-turn. awb does not speak that socket protocol itself: it is internal, versioned and
   authenticated. MCP channels, the documented push route, are unavailable with a custom
   `ANTHROPIC_BASE_URL`.
 - Agents started outside awb (existing sessions) are mapped in `.awb/panes`, one
   `ID PANE` per line (an optional third column overrides the working directory used for
-  change detection); it overrides panes from start events.
+  change detection); it overrides panes from start events. A pane token `%N@default`
+  selects the default tmux server (with `TMUX` unset), and `%N@/absolute/socket/path`
+  selects that socket. Bare `%N` keeps using the board's server. Pane ids are unique only
+  within a server; `peers`, session discovery and pane commands preserve that pair even
+  when the board has its own server. Use `awb adopt ID NAME TMUX-TARGET [GROUP]` to
+  register an existing session or `session:window.pane` target: it resolves the default
+  server first, then the board server, records the pane's current directory and prints
+  `ID PANE SESSION` (`-` without a Claude registry match). Repeating it replaces the
+  mapping without adding another start event; the process is never restarted.
 
 ## Contributing and releases
 
