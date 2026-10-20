@@ -1674,23 +1674,25 @@ claude_dirs() {
   { printf '%s\n' "${AWB_CLAUDE_DIRS:-}" | tr ':' '\n'
     printf '%s\n' "${CLAUDE_CONFIG_DIR:-}" "$HOME/.claude"
     # Read only descendants of agent panes; one process-tree snapshot for all panes.
-    jq -nr --arg ps "$_cd_ps" --arg panes "$_cd_panes" --arg ag "$(agent_panes)" '
+    _cd_pids=$(jq -nr --arg ps "$_cd_ps" --arg panes "$_cd_panes" --arg ag "$(agent_panes)" '
       ($ps | split("\n") | map([splits(" +")] | map(select(. != "")) | select(length == 2)
          | {key:.[0], value:.[1]}) | from_entries) as $pp
       | ($panes | split("\n") | map(select(. != "") | split(" ") | {key:.[0], value:.[1]}) | from_entries) as $pid
       | [$ag | split("\n")[] | split(" ") | $pid[.[1]] // empty] as $roots
       | def up($p; $n): if $n == 0 or $p == null or $p == "0" or $p == "1" then empty else $p, up($pp[$p]; $n - 1) end;
-        $pp | keys[] as $p | select(any(up($p; 32); . as $x | $roots | index($x))) | $p' \
-    | while IFS= read -r _cd_pid; do
-        if [ -r "/proc/$_cd_pid/environ" ]; then
-          { tr '\000' '\n' < "/proc/$_cd_pid/environ"; } 2>/dev/null \
-            | awk 'index($0, "CLAUDE_CONFIG_DIR=") == 1 {print substr($0, 19)}'
-        else
-          ps -E -o command= -p "$_cd_pid" 2>/dev/null \
-            | awk 'match($0, /(^| )CLAUDE_CONFIG_DIR=/) {
-                v = substr($0, RSTART + RLENGTH); sub(/ [A-Za-z_][A-Za-z0-9_]*=.*/, "", v); print v }'
-        fi
-      done; } | awk 'NF && !seen[$0]++'
+        $pp | keys[] as $p | select(any(up($p; 32); . as $x | $roots | index($x))) | $p')
+    if [ -d /proc/self ]; then
+      printf '%s\n' "$_cd_pids" | while IFS= read -r _cd_pid; do
+        [ -n "$_cd_pid" ] && [ -r "/proc/$_cd_pid/environ" ] || continue
+        { tr '\000' '\n' < "/proc/$_cd_pid/environ"; } 2>/dev/null \
+          | awk 'index($0, "CLAUDE_CONFIG_DIR=") == 1 {print substr($0, 19)}'
+      done
+    else
+      ps -E -Ao pid=,command= 2>/dev/null | _CD_PIDS=$_cd_pids awk '
+        BEGIN {n = split(ENVIRON["_CD_PIDS"], p, "\n"); for (i = 1; i <= n; i++) wanted[p[i]] = 1}
+        ($1 in wanted) && match($0, /(^| )CLAUDE_CONFIG_DIR=/) {
+          v = substr($0, RSTART + RLENGTH); sub(/ [A-Za-z_][A-Za-z0-9_]*=.*/, "", v); print v }'
+    fi; } | awk 'NF && !seen[$0]++'
 }
 
 # Claude Code sessions of awb agents, read from claude_dirs/sessions (never written):
@@ -2740,22 +2742,29 @@ FT
     HOME=$t/home AWB_CLAUDE_DIRS= CLAUDE_CONFIG_DIR=$t/cfgA "$BIN" peers | grep -Eq "^z1 $zp zz-1 idle" \
       || die "selftest: CLAUDE_CONFIG_DIR was not read"
     # Discover a config dir from a pane process without configuring awb itself.
-    mkdir -p "$t/cfgB/sessions" "$t/env-board"
-    ep=$(tmux -L "$S" new-window -d -P -F '#{pane_id}' "env CLAUDE_CONFIG_DIR=$(q "$t/cfgB") sleep 300")
-    epid=$(tmux -L "$S" display-message -p -t "$ep" '#{pane_pid}')
-    i=0; envok=
-    while [ $i -lt 20 ]; do
-      if { [ -r "/proc/$epid/environ" ] && tr '\000' '\n' < "/proc/$epid/environ" | grep -Fxq "CLAUDE_CONFIG_DIR=$t/cfgB"; } \
-        || ps -E -o command= -p "$epid" 2>/dev/null | grep -Fq "CLAUDE_CONFIG_DIR=$t/cfgB"; then envok=1; break; fi
-      sleep 0.1; i=$((i + 1))
+    # Apple platform binaries hide their env from ps -E; use a non-platform runtime.
+    envrun=
+    for envcmd in python3 node perl; do
+      envpath=$(command -v "$envcmd") || continue
+      envpath=$(realpath "$envpath")
+      case $envpath in /usr/bin/*|/bin/*) continue ;; esac
+      case $envcmd in
+        python3) envrun="$(q "$envpath") -c 'import time; time.sleep(300)'" ;;
+        node) envrun="$(q "$envpath") -e 'setTimeout(() => {}, 300000)'" ;;
+        perl) envrun="$(q "$envpath") -e 'sleep 300'" ;;
+      esac
+      break
     done
-    if [ -n "$envok" ]; then
+    if [ -n "$envrun" ]; then
+      mkdir -p "$t/cfgB/sessions" "$t/env-board"
+      ep=$(tmux -L "$S" new-window -d -P -F '#{pane_id}' "exec env CLAUDE_CONFIG_DIR=$(q "$t/cfgB") $envrun")
+      epid=$(tmux -L "$S" display-message -p -t "$ep" '#{pane_pid}')
       printf '{"pid":%s,"name":"env-session","status":"idle","statusUpdatedAt":1000}\n' "$epid" > "$t/cfgB/sessions/1.json"
       printf 'env1 %s\n' "$ep" > "$t/env-board/panes"
       HOME=$t/home AWB_DIR=$t/env-board AWB_CLAUDE_DIRS= CLAUDE_CONFIG_DIR= "$BIN" peers \
         | grep -Eq "^env1 $ep env-session idle" || die "selftest: pane config dir was not discovered"
+      tmux -L "$S" kill-window -t "$ep"
     else echo "selftest: skipped env discovery"; fi
-    tmux -L "$S" kill-window -t "$ep"
     mv "$t/cfgA/sessions/1.json" "$t/home/.claude/sessions/1.json"
     # a Claude of another board names the same "awb:@0.%N" but runs outside this pane
     RPID=$$ reg busy

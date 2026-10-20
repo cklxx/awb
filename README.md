@@ -72,7 +72,8 @@ minutes), against 4 tasks sent with `awb send`.
   `AWB_CLAUDE_DIRS`, then `CLAUDE_CONFIG_DIR` if set, then `$HOME/.claude`, deduplicated in
   that order; observation uses the first matching transcript. It also discovers
   `CLAUDE_CONFIG_DIR` from processes under agent panes (up to 32 ancestors), using one
-  process-tree snapshot per round. Unreadable process environments are silently skipped.
+  process-tree snapshot per round and one bulk `ps -E` environment snapshot on macOS.
+  Unreadable process environments are silently skipped.
 - An agent's own `done` is a claim. `awb check` runs a check the main agent chose; only a
   passing check marks the milestone verified (`⊢`), and a rejected check blocks `done`
   until a later check passes.
