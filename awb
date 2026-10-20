@@ -2032,7 +2032,17 @@ selftest() {
   # run from a worker pane, the selftest inherits its board's tmux; it must reach none of it
   unset AWB_TMUX_SOCKET AWB_TMUX_FOR TMUX TMUX_PANE
   mkdir -p "$t/guard"; printf '#!/bin/sh\necho "$*" >> %s/guard/calls\nexit 1\n' "$t" > "$t/guard/lark-cli"
-  chmod +x "$t/guard/lark-cli"; PATH=$t/guard:$PATH; export PATH
+  chmod +x "$t/guard/lark-cli"
+  # Fixtures type POSIX commands; neither the login shell nor tmux config may change them.
+  # Keep startup noise on purpose: pane assertions must not require a clean shell.
+  printf 'printf "Welcome to fish, the friendly interactive shell\\nType help for instructions on how to use fish\\n"\n' > "$t/shell-env"
+  if command -v tmux >/dev/null; then
+    printf 'set -g default-shell /bin/sh\nset -g default-command ""\n' > "$t/tmux.conf"
+    printf '#!/bin/sh\nexec %s -f %s "$@"\n' "$(q "$(command -v tmux)")" "$(q "$t/tmux.conf")" > "$t/guard/tmux"
+    chmod +x "$t/guard/tmux"
+  fi
+  SHELL=/bin/sh; ENV=$t/shell-env; export SHELL ENV
+  PATH=$t/guard:$PATH; export PATH
   unset AWB_LARK_CHAT
   # Failed release downloads must neither replace working binaries nor remove the skill.
   it=$t/installer; mkdir -p "$it/mock" "$it/bin" "$it/skills/awb-workbench"
@@ -3362,8 +3372,20 @@ CHK
     tmux -L "${S}s" kill-server 2>/dev/null || true
     printf '%s\n' "$top" | grep -q '还有 .* 行' || die "selftest: a board taller than the pane shows no scroll hint"
     printf '%s\n' "$end" | grep -q 'scroll row 30' || die "selftest: G does not scroll to the last line"
-    [ "$(printf '%s\n' "$two" | sed -n 2p)" = "$(printf '%s\n' "$top" | sed -n 4p)" ] \
-      || die "selftest: g j j does not scroll 2 lines from the top"
+    # Read the board's scroll hint, not absolute pane rows (a shell banner may precede it).
+    scroll_left() {
+      awk '$1 == "↓" && $2 == "还有" && $3 ~ /^[0-9]+$/ && $4 == "行" {n=$3}
+           END {if (n == "") exit 1; print n}'
+    }
+    scrolled_two() {
+      _st_top=$(printf '%s\n' "$1" | scroll_left) || return 1
+      _st_two=$(printf '%s\n' "$2" | scroll_left) || return 1
+      [ "$_st_top" -gt 2 ] && [ "$_st_two" -eq "$((_st_top - 2))" ]
+    }
+    scrolled_two "$top" "$two" || die "selftest: g j j does not scroll 2 lines from the top"
+    noisy=$(printf 'Welcome to fish, the friendly interactive shell\nType help for instructions on how to use fish\n%s\n' "$two")
+    scrolled_two "$top" "$noisy" || die "selftest: a shell greeting changed the scroll check"
+    ! scrolled_two "$top" "$top" || die "selftest: the scroll check accepted no movement"
     [ -z "$alive" ] || die "selftest: q does not quit the board"
     # a worker of a board (its socket exported with AWB_TMUX_FOR) that works on another AWB_DIR
     # cannot touch that board: awb down there leaves the parent session and its panes alive
