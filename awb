@@ -414,6 +414,17 @@ JQ_SNAP=$JQ_FOLD$JQ_DEFS'
       | {kind:"replied", text:"\($a.name) 回复了 #\($a.key)（\(($nowep - $r) | ago)前）后空闲；做完了就 awb reply \($a.id) \($a.key)"}),
      (if $quiet >= $silent and $nrun > 0
       then {kind:"board", text:"看板 \($quiet | ago)没有新事件，主控可能停了"} else empty end),
+     # Latest keyed news drives display-only alerts. Preserve the agent fold and audit.
+     # Expiry means the last reading is stale; it does not prove the remote job stopped.
+     ([$raw[] | select(type == "object" and .t == "news")
+        | select((.key | type) == "string" and .key != "")]
+      | group_by(.key)[] | last
+      | (if .warn == true then {kind:"fact", text:(.text | clip(80))} else empty end),
+        (if (.ttl | type) == "number" and (.ep | type) == "number" then
+           if .ttl > 0 and .ep > 0 and $nowep - .ep > .ttl then
+             {kind:"stale", text:"\(.key) \(($nowep - .ep) | ago)未刷新（有效期 \(.ttl)秒）：\(.text | clip(40))"}
+           else empty end
+         else empty end)),
      # a caller (a script, often with stderr thrown away) ran a command awb does not have: in the
      # last 24 hours, one line per command
      ([$raw[] | select(type == "object" and .t == "badcmd" and (.ep // 0) >= $nowep - 86400)]
@@ -1959,7 +1970,10 @@ One unit of work, the task. You talk to one Claude (the main agent); it keeps th
   $PROG metric [--at EPOCH] [--step N] [--by EPOCH] [--ref] NAME VALUE TARGET [NOTE]
                                     a reading of the goal's number; --by: deadline; --ref: a
                                     baseline series drawn by step beside it
-  $PROG news [--key KEY] TEXT       one progress line; one KEY = one fact, the latest shows
+  $PROG news [--key KEY [--ttl SECS] [--warn]] TEXT
+                                    one progress line; one KEY = one fact, the latest shows;
+                                    --warn: an anomaly until the next line of KEY; --ttl: an
+                                    anomaly when KEY is not rewritten within SECS (a stale reading)
 
 Workers that are not Claude sessions report themselves (now/done not while a sent task is open):
   $PROG run [-g GROUP] ID NAME -- CMD...  a command in a pane; exit 0 -> done, else failed
@@ -2369,6 +2383,22 @@ LOCKRM
   nb "no key"; nb --key val@15000 "feed: val 1.888"; nb "other"; nb --key val@15000 "val 1.888, grad ok"; nb --key ck "saved"
   [ "$(AWB_DIR=$bd4 "$BIN" view --json | jq -c '[.news[].text]')" = '["no key","other","val 1.888, grad ok","saved"]' ] \
     || die "selftest: news with one key not shown once: $(AWB_DIR=$bd4 "$BIN" view --json | jq -c '[.news[].text]')"
+  # Keyed warnings clear on replacement; TTL marks stale readings. Both need --key.
+  bnews=$t/news-alerts; mkdir -p "$bnews"; nw() { AWB_DIR=$bnews "$BIN" news "$@"; }
+  nw --key health --warn "node0 exited"
+  AWB_DIR=$bnews "$BIN" view --json | jq -e 'any(.anomalies[]; .kind == "fact" and .text == "node0 exited")' >/dev/null \
+    || die "selftest: a --warn fact is not an anomaly"
+  nw --key health "node0 ok"
+  AWB_DIR=$bnews "$BIN" view --json | jq -e '(any(.anomalies[]; .kind == "fact") | not) and ([.news[].text] == ["node0 ok"])' >/dev/null \
+    || die "selftest: a clean line did not clear the --warn fact"
+  nw --key step --ttl 600 "step 100"
+  AWB_DIR=$bnews "$BIN" view --json | jq -e 'any(.anomalies[]; .kind == "stale") | not' >/dev/null \
+    || die "selftest: a fresh --ttl fact is stale"
+  AWB_DIR=$bnews AWB_NOW=$(($(date +%s) + 900)) "$BIN" view --json \
+    | jq -e 'any(.anomalies[]; .kind == "stale" and (.text | startswith("step ")))' >/dev/null \
+    || die "selftest: an expired --ttl fact is not stale"
+  ! nw --ttl 60 "no key" 2>/dev/null || die "selftest: --ttl without --key accepted"
+  ! nw --key k --ttl x "bad" 2>/dev/null || die "selftest: a non-integer --ttl accepted"
   # an estimate past the deadline (--by, given once) is replaced by "misses it"; a far deadline keeps it
   bd3=$t/brief3; mkdir -p "$bd3"
   AWB_DIR=$bd3 "$BIN" metric --at $((bn - 86400)) --by $((bn + 3600)) he 1 30
@@ -3510,11 +3540,26 @@ case "$cmd" in
               --arg id "$1" --arg st "$2" --arg text "${3:-}" --arg par "${4:-}" --arg own "${5:-}" ;;
   nudge)    init_dir; if [ "${1:-}" = "--once" ]; then nudge_round
             else while :; do nudge_round; sleep "${AWB_NUDGE_POLL:-60}"; done; fi ;;
-  news)     _nk=; if [ "${1:-}" = --key ]; then _nk=${2:-}; shift 2 || die "--key needs a key"; fi
-            [ $# -ge 1 ] || die "usage: $PROG news [--key KEY] TEXT"
-            case $1 in --*) die "unknown option: $1" ;; esac
-            append '{t:"news",time:$time,ep:$ep,text:$text} + (if $k == "" then {} else {key:$k} end)' \
-              --arg text "$*" --arg k "$_nk" ;;
+  news)     _nk=; _nt=; _nw=false
+            while [ $# -gt 0 ]; do
+              case $1 in
+                --key)  [ $# -ge 2 ] || die "--key needs a key"
+                        case $2 in ''|--*) die "--key needs a nonempty key" ;; esac
+                        _nk=$2; shift 2 ;;
+                --ttl)  [ $# -ge 2 ] || die "--ttl needs seconds"
+                        jq -en --arg v "$2" '$v | if test("^[1-9][0-9]{0,9}$") then tonumber <= 2147483647 else false end' >/dev/null \
+                          || die "--ttl must be integer seconds from 1 to 2147483647"
+                        _nt=$2; shift 2 ;;
+                --warn) _nw=true; shift ;;
+                --*)    die "unknown option: $1" ;;
+                *)      break ;;
+              esac
+            done
+            [ $# -ge 1 ] || die "usage: $PROG news [--key KEY [--ttl SECS] [--warn]] TEXT"
+            [ -n "$_nk" ] || { [ -z "$_nt" ] && [ "$_nw" = false ]; } || die "--ttl and --warn need --key"
+            append '{t:"news",time:$time,ep:$ep,text:$text} + (if $k == "" then {} else {key:$k} end)
+                    + (if $ttl == "" then {} else {ttl:($ttl | tonumber)} end) + (if $w == "true" then {warn:true} else {} end)' \
+              --arg text "$*" --arg k "$_nk" --arg ttl "$_nt" --arg w "$_nw" ;;
   goal)     [ $# -ge 1 ] || die "usage: $PROG goal TEXT"
             case $1 in --*) die "unknown option: $1" ;; esac
             append '{t:"goal",time:$time,ep:$ep,text:$text}' --arg text "$*" ;;
