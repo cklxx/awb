@@ -878,11 +878,13 @@ nudge_round() {
 # again. AWB_OBSERVE=0 turns it off.
 observe_once() {
   [ "${AWB_OBSERVE:-1}" != 0 ] && [ -s "$EV" ] || return 0
-  _dirs=$(claude_dirs)
+  _obs_ps=$(ps -Ao pid=,ppid=)
+  _obs_panes=$(tm list-panes -a -F '#{pane_id} #{pane_pid}' 2>/dev/null || true)
+  _dirs=$(claude_dirs "$_obs_ps" "$_obs_panes")
   _reg=$(printf '%s\n' "$_dirs" | while IFS= read -r _dir; do
            awk 1 "$_dir"/sessions/*.json 2>/dev/null || true
          done | jq -Rsc '[split("\n")[] | fromjson? | select(type == "object")]') || return 0
-  _ag=$(sessions_json | jq -c 'to_entries | map({key:.value.name, value:.key}) | from_entries')
+  _ag=$(sessions_json "$_obs_ps" "$_obs_panes" | jq -c 'to_entries | map({key:.value.name, value:.key}) | from_entries')
   [ "$_ag" != '{}' ] || return 0
   lock obs     # one round at a time: two open boards of one .awb would record a message twice
   _of=$AWB_DIR/obs; touch "$_of"; _nf=$(mktemp "$_of.XXXXXX"); _new=$(mktemp "$_of.XXXXXX")
@@ -1667,8 +1669,28 @@ tell() {
 
 # Search explicit config dirs first; preserve order so transcript selection is predictable.
 claude_dirs() {
+  _cd_ps=${1-$(ps -Ao pid=,ppid=)}
+  _cd_panes=${2-$(tm list-panes -a -F '#{pane_id} #{pane_pid}' 2>/dev/null || true)}
   { printf '%s\n' "${AWB_CLAUDE_DIRS:-}" | tr ':' '\n'
-    printf '%s\n' "${CLAUDE_CONFIG_DIR:-}" "$HOME/.claude"; } | awk 'NF && !seen[$0]++'
+    printf '%s\n' "${CLAUDE_CONFIG_DIR:-}" "$HOME/.claude"
+    # Read only descendants of agent panes; one process-tree snapshot for all panes.
+    jq -nr --arg ps "$_cd_ps" --arg panes "$_cd_panes" --arg ag "$(agent_panes)" '
+      ($ps | split("\n") | map([splits(" +")] | map(select(. != "")) | select(length == 2)
+         | {key:.[0], value:.[1]}) | from_entries) as $pp
+      | ($panes | split("\n") | map(select(. != "") | split(" ") | {key:.[0], value:.[1]}) | from_entries) as $pid
+      | [$ag | split("\n")[] | split(" ") | $pid[.[1]] // empty] as $roots
+      | def up($p; $n): if $n == 0 or $p == null or $p == "0" or $p == "1" then empty else $p, up($pp[$p]; $n - 1) end;
+        $pp | keys[] as $p | select(any(up($p; 32); . as $x | $roots | index($x))) | $p' \
+    | while IFS= read -r _cd_pid; do
+        if [ -r "/proc/$_cd_pid/environ" ]; then
+          { tr '\000' '\n' < "/proc/$_cd_pid/environ"; } 2>/dev/null \
+            | awk 'index($0, "CLAUDE_CONFIG_DIR=") == 1 {print substr($0, 19)}'
+        else
+          ps -E -o command= -p "$_cd_pid" 2>/dev/null \
+            | awk 'match($0, /(^| )CLAUDE_CONFIG_DIR=/) {
+                v = substr($0, RSTART + RLENGTH); sub(/ [A-Za-z_][A-Za-z0-9_]*=.*/, "", v); print v }'
+        fi
+      done; } | awk 'NF && !seen[$0]++'
 }
 
 # Claude Code sessions of awb agents, read from claude_dirs/sessions (never written):
@@ -1678,11 +1700,13 @@ claude_dirs() {
 # server, and every awb board runs its own server with a session "awb" and panes from %0,
 # so matching on it gave one board's agent another board's Claude. Always prints JSON.
 sessions_json() {
-  _panes=$(tm list-panes -a -F '#{pane_id} #{pane_pid}' 2>/dev/null) || { echo '{}'; return 0; }
-  claude_dirs | while IFS= read -r _dir; do
+  _panes=${2-$(tm list-panes -a -F '#{pane_id} #{pane_pid}' 2>/dev/null || true)}
+  [ -n "$_panes" ] || { echo '{}'; return 0; }
+  _ps=${1-$(ps -Ao pid=,ppid=)}
+  claude_dirs "$_ps" "$_panes" | while IFS= read -r _dir; do
     awk 1 "$_dir"/sessions/*.json 2>/dev/null || true
   done | jq -Rnc \
-    --arg ag "$(agent_panes)" --arg panes "$_panes" --arg ps "$(ps -Ao pid=,ppid=)" '
+    --arg ag "$(agent_panes)" --arg panes "$_panes" --arg ps "$_ps" '
     ($ps | split("\n") | map([splits(" +")] | map(select(. != "")) | select(length == 2)
        | {key:.[0], value:.[1]}) | from_entries) as $pp
     | def up($p; $n): if $n == 0 or $p == null or $p == "0" or $p == "1" then empty else $p, up($pp[$p]; $n - 1) end;
@@ -2715,6 +2739,23 @@ FT
       || die "selftest: an unconfigured registry was read"
     HOME=$t/home AWB_CLAUDE_DIRS= CLAUDE_CONFIG_DIR=$t/cfgA "$BIN" peers | grep -Eq "^z1 $zp zz-1 idle" \
       || die "selftest: CLAUDE_CONFIG_DIR was not read"
+    # Discover a config dir from a pane process without configuring awb itself.
+    mkdir -p "$t/cfgB/sessions" "$t/env-board"
+    ep=$(tmux -L "$S" new-window -d -P -F '#{pane_id}' "env CLAUDE_CONFIG_DIR=$(q "$t/cfgB") sleep 300")
+    epid=$(tmux -L "$S" display-message -p -t "$ep" '#{pane_pid}')
+    i=0; envok=
+    while [ $i -lt 20 ]; do
+      if { [ -r "/proc/$epid/environ" ] && tr '\000' '\n' < "/proc/$epid/environ" | grep -Fxq "CLAUDE_CONFIG_DIR=$t/cfgB"; } \
+        || ps -E -o command= -p "$epid" 2>/dev/null | grep -Fq "CLAUDE_CONFIG_DIR=$t/cfgB"; then envok=1; break; fi
+      sleep 0.1; i=$((i + 1))
+    done
+    if [ -n "$envok" ]; then
+      printf '{"pid":%s,"name":"env-session","status":"idle","statusUpdatedAt":1000}\n' "$epid" > "$t/cfgB/sessions/1.json"
+      printf 'env1 %s\n' "$ep" > "$t/env-board/panes"
+      HOME=$t/home AWB_DIR=$t/env-board AWB_CLAUDE_DIRS= CLAUDE_CONFIG_DIR= "$BIN" peers \
+        | grep -Eq "^env1 $ep env-session idle" || die "selftest: pane config dir was not discovered"
+    else echo "selftest: skipped env discovery"; fi
+    tmux -L "$S" kill-window -t "$ep"
     mv "$t/cfgA/sessions/1.json" "$t/home/.claude/sessions/1.json"
     # a Claude of another board names the same "awb:@0.%N" but runs outside this pane
     RPID=$$ reg busy

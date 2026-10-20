@@ -70,7 +70,9 @@ minutes), against 4 tasks sent with `awb send`.
   `AWB_REPLY_IDLE`, the board shows an anomaly until the main agent runs `awb reply`. The transcript format is Claude Code's own and unversioned;
   `AWB_OBSERVE=0` turns this off. Registry and transcript searches use the colon-separated
   `AWB_CLAUDE_DIRS`, then `CLAUDE_CONFIG_DIR` if set, then `$HOME/.claude`, deduplicated in
-  that order; observation uses the first matching transcript.
+  that order; observation uses the first matching transcript. It also discovers
+  `CLAUDE_CONFIG_DIR` from processes under agent panes (up to 32 ancestors), using one
+  process-tree snapshot per round. Unreadable process environments are silently skipped.
 - An agent's own `done` is a claim. `awb check` runs a check the main agent chose; only a
   passing check marks the milestone verified (`⊢`), and a rejected check blocks `done`
   until a later check passes.
@@ -258,7 +260,10 @@ non-git directories are skipped.
   check from its own pane (`AWB_NOTIFY=0` turns this off).
 - The board reads each Claude agent's live session state from `DIR/sessions` (read only):
   the colon-separated `AWB_CLAUDE_DIRS`, then `CLAUDE_CONFIG_DIR` if set, then `$HOME/.claude`,
-  with duplicate dirs removed. It does not trust the self-report over it. A session on a permission dialog shows as
+  with duplicate dirs removed. Config dirs are also discovered from each agent pane's
+  process environments (`ps -E` on macOS, `/proc/PID/environ` on Linux), so separate Claude
+  configurations need no board setup when readable. It does not trust the self-report over
+  the registry. A session on a permission dialog shows as
   `▲ 待批准` with the dialog kind and its age, and `awb peers` prints its status as `waiting`,
   whatever the agent last reported; `tell` and `nudge` refuse to type into it, since typed
   text plus Enter would answer the dialog. tell reads the registry again before the paste and
