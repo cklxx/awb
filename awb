@@ -267,7 +267,7 @@ JQ_SNAP=$JQ_FOLD$JQ_DEFS'
       then .status = "dead" | .reason = "pane closed" | .endEp = .lastEp
       else . end)
 
-# live Claude session state ($sess, from ~/.claude/sessions, not the proven fold): a
+# live Claude session state ($sess, from claude_dirs registries, not the proven fold): a
 # permission dialog overrides the self-report; a self-report the session contradicts is flagged
 | .agents |= with_entries(($sess[.key] // null) as $x
     | if $x == null then .
@@ -868,7 +868,7 @@ nudge_round() {
 }
 
 # the main agent's messaging, observed read-only in the Claude Code transcripts of this
-# board's agents (~/.claude/projects/*/SESSION.jsonl, never written; no other session is read):
+# board's agents (first claude_dirs/projects/*/SESSION.jsonl, never written; no other session is read):
 # a peer message an agent received from a session that is not one of this board's agents is
 # "out" (the main agent to it), its own SendMessage to such a session is "in" (its reply). Only
 # metadata is kept: time, direction, agent, the other session, the [awb ID#KEY] key and the
@@ -878,8 +878,10 @@ nudge_round() {
 # again. AWB_OBSERVE=0 turns it off.
 observe_once() {
   [ "${AWB_OBSERVE:-1}" != 0 ] && [ -s "$EV" ] || return 0
-  _reg=$({ awk 1 "$HOME"/.claude/sessions/*.json 2>/dev/null || true; } \
-         | jq -Rsc '[split("\n")[] | fromjson? | select(type == "object")]') || return 0
+  _dirs=$(claude_dirs)
+  _reg=$(printf '%s\n' "$_dirs" | while IFS= read -r _dir; do
+           awk 1 "$_dir"/sessions/*.json 2>/dev/null || true
+         done | jq -Rsc '[split("\n")[] | fromjson? | select(type == "object")]') || return 0
   _ag=$(sessions_json | jq -c 'to_entries | map({key:.value.name, value:.key}) | from_entries')
   [ "$_ag" != '{}' ] || return 0
   lock obs     # one round at a time: two open boards of one .awb would record a message twice
@@ -887,7 +889,11 @@ observe_once() {
   _since=$(($(date +%s) - 86400))
   printf '%s' "$_reg" | jq -r --argjson ag "$_ag" '.[] | select($ag[.name // ""] != null and (.sessionId // "") != "")
     | "\(.sessionId) \($ag[.name])"' | while read -r sid id; do
-    f=$(ls "$HOME"/.claude/projects/*/"$sid.jsonl" 2>/dev/null | head -1); [ -n "$f" ] || continue
+    f=$(printf '%s\n' "$_dirs" | while IFS= read -r _dir; do
+          for _file in "$_dir"/projects/*/"$sid.jsonl"; do
+            [ ! -f "$_file" ] || { printf '%s\n' "$_file"; break; }
+          done
+        done | head -1); [ -n "$f" ] || continue
     sz=$(wc -c < "$f" | tr -d ' ')
     off=$(awk -v p="$f" '{o = $1; sub(/^[^ ]+ /, "")} $0 == p {print o}' "$_of")
     # ponytail: at most 50 MB per transcript per round; a longer gap is not replayed whole
@@ -1241,7 +1247,7 @@ $(q "$BIN") _enter; $tui_cmd; exec $(q "$SHELL")"
   # first line = the task; the main agent keeps the board from the worker's replies
   prompt="${task:-待命，等主控派任务}
 （你是 awb 工作台上的 worker ${id}，组 ${group}，请用中文。任务会由主控发来；每个任务做完用一句话汇报结果，主控据此更新看板。完整规则：awb skill）"
-  # Claude registers its pane in ~/.claude/sessions once it is ready, i.e. after startup
+  # Claude registers its pane in a claude_dirs session registry once ready, after startup
   # prompts such as folder trust, which awb leaves to the user. Then the first message goes
   # in, and the main agent messages the worker by that session name (SendMessage).
   i=0; sess=; warned=
@@ -1659,7 +1665,13 @@ tell() {
   unlock "tell-$_p"
 }
 
-# Claude Code sessions of awb agents, read from ~/.claude/sessions (never written):
+# Search explicit config dirs first; preserve order so transcript selection is predictable.
+claude_dirs() {
+  { printf '%s\n' "${AWB_CLAUDE_DIRS:-}" | tr ':' '\n'
+    printf '%s\n' "${CLAUDE_CONFIG_DIR:-}" "$HOME/.claude"; } | awk 'NF && !seen[$0]++'
+}
+
+# Claude Code sessions of awb agents, read from claude_dirs/sessions (never written):
 # {ID: {name, status, waiting, since}}, status busy|idle|waiting|shell. One pass over the
 # registry; an entry being rewritten or of a dead pid is skipped. A session belongs to the
 # pane whose process it descends from: the registry's tmux field ("awb:@0.%2") names no
@@ -1667,7 +1679,9 @@ tell() {
 # so matching on it gave one board's agent another board's Claude. Always prints JSON.
 sessions_json() {
   _panes=$(tm list-panes -a -F '#{pane_id} #{pane_pid}' 2>/dev/null) || { echo '{}'; return 0; }
-  { awk 1 "$HOME"/.claude/sessions/*.json 2>/dev/null || true; } | jq -Rnc \
+  claude_dirs | while IFS= read -r _dir; do
+    awk 1 "$_dir"/sessions/*.json 2>/dev/null || true
+  done | jq -Rnc \
     --arg ag "$(agent_panes)" --arg panes "$_panes" --arg ps "$(ps -Ao pid=,ppid=)" '
     ($ps | split("\n") | map([splits(" +")] | map(select(. != "")) | select(length == 2)
        | {key:.[0], value:.[1]}) | from_entries) as $pp
@@ -1851,6 +1865,7 @@ Coordination and reading:
   $PROG down | reset                end this board's session | clear the log (keeps a .bak)
   $PROG skill | version | selftest
   AWB_STALE=SECS nudge after (600); AWB_SILENT=SECS silence is an anomaly after (3600).
+  AWB_CLAUDE_DIRS=DIR:DIR session/transcript dirs, then \$CLAUDE_CONFIG_DIR, then \$HOME/.claude.
   Several boards: one .awb per project directory (made by '$PROG up'), or \$AWB_DIR. Without
   AWB_DIR a command needs ./.awb; a write says which board it went to (stderr).
 EOF
@@ -2691,6 +2706,16 @@ FT
     reg() { printf '{"pid":%s,"name":"zz-1","sessionId":"%s","status":"%s","waitingFor":"%s","startedAt":1,"statusUpdatedAt":%s000,"tmux":"%s:@0.%s"}\n' \
               "${RPID:-$zpid}" "${SID:-}" "$1" "${2-}" "$(($(date +%s) - ${3:-0}))" "$zs" "$zp" > "$t/home/.claude/sessions/1.json"; }
     ht() { HOME=$t/home "$BIN" "$@"; }
+    # Explicit config dirs work without a default registry and preserve the caller fallback.
+    mkdir -p "$t/cfgA/sessions"
+    reg idle; mv "$t/home/.claude/sessions/1.json" "$t/cfgA/sessions/1.json"
+    HOME=$t/home AWB_CLAUDE_DIRS=$t/cfgA CLAUDE_CONFIG_DIR= "$BIN" peers | grep -Eq "^z1 $zp zz-1 idle" \
+      || die "selftest: an explicit Claude config dir was not read"
+    HOME=$t/home AWB_CLAUDE_DIRS= CLAUDE_CONFIG_DIR= "$BIN" peers | grep -Eq "^z1 $zp - not-claude" \
+      || die "selftest: an unconfigured registry was read"
+    HOME=$t/home AWB_CLAUDE_DIRS= CLAUDE_CONFIG_DIR=$t/cfgA "$BIN" peers | grep -Eq "^z1 $zp zz-1 idle" \
+      || die "selftest: CLAUDE_CONFIG_DIR was not read"
+    mv "$t/cfgA/sessions/1.json" "$t/home/.claude/sessions/1.json"
     # a Claude of another board names the same "awb:@0.%N" but runs outside this pane
     RPID=$$ reg busy
     ht peers | grep -Eq "^z1 $zp - not-claude$" || die "selftest: another server's session with the same pane id matched"
@@ -2824,7 +2849,10 @@ FT
     in_() { jq -cn --arg ts "$(ts_ "$1")" --arg n "$2" --arg b "$3" \
       '{type:"user", timestamp:$ts, origin:{kind:"peer", name:$n, msg_id:("m" + $ts), body:$b}}'; }
     no=$(date +%s); { in_ $((no - 90000)) main-x "yesterday"; in_ $((no - 5000)) main-x "recent"; } > "$tr_"
-    SID=s-zz reg idle; ht _observe
+    SID=s-zz reg idle
+    mkdir -p "$t/cfgA/projects"; mv "$t/home/.claude/projects/p" "$t/cfgA/projects/p"
+    AWB_CLAUDE_DIRS=$t/cfgA ht _observe
+    mv "$t/cfgA/projects/p" "$t/home/.claude/projects/p"
     [ "$(jq -sc '[.[] | select(.t == "msg") | .id + " " + .dir + " " + .via]' "$EV")" = '["z1 out main-x"]' ] \
       || die "selftest: a new transcript is not read from its last 24 hours: $(jq -sc '[.[] | select(.t == "msg")]' "$EV")"
     ok_=$("$BIN" send z1 "observed task" 2>/dev/null | sed -n '1s/^\[awb z1#\([0-9]*\)\].*/\1/p')
