@@ -26,6 +26,8 @@ jobs:
           cd model
           lake build
           ../model/accept.sh . Accept.lean
+      - name: Keyed fact alert tests
+        run: python3 tests/news_alerts.py
       - name: Runtime selftest
         run: ./awb selftest
       - name: TLA models

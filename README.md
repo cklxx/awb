@@ -151,6 +151,9 @@ awb now a1 "event log"; awb done a1; awb finish a1 "shipped"
 # progress feed
 awb news "API merged"                        # board shows the last 3
 awb news --key val@15000 "val loss 1.888"    # one key = one fact: a later line replaces it
+awb news --key health --ttl 600 "worker ok" # mark this reading stale after 600 seconds
+awb news --key health --ttl 600 --warn "worker exited" # show an anomaly now
+awb news --key health --ttl 600 "worker ok" # clear the warning and renew the reading
 awb metric tps 32 40 "V100 target"      # brief: one value/target bar under GOAL
 
 # acceptance
@@ -166,6 +169,16 @@ awb view --once                                     # the board drawn once, work
 awb reset                                           # clear all events
 awb down                                            # kill the session
 ```
+
+`news --warn` puts the latest keyed fact in the anomaly section.
+The next clean record for that key clears the warning.
+`--ttl SECS` sets the time to live, in integer seconds from 1 to 2147483647.
+A reading becomes stale when its age exceeds this limit; equality is still fresh.
+Both flags require a nonempty `--key`. Repeat `--ttl` on each reading to renew it.
+A replacement without `--ttl` removes the expiry check for that key.
+The terminal and Lark card use these snapshot anomalies. Lark still needs a working sync process.
+Expiry indicates a stale reading, not proof that the remote job stopped.
+AWB does not collect remote facts or restart workloads.
 
 Board knobs: `AWB_STALE=SECS` lists agents silent
 that long are nudged (default 600), `AWB_INTERVAL` refresh seconds (default 1), `AWB_METRIC_STALE=SECS` shows the latest reading's
