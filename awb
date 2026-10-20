@@ -1409,7 +1409,12 @@ send() {
   unlock "send"
   printf '[awb %s#%s] %s\n做完后回复一行：以 [awb %s#%s] 开头，写结果（做不了也照此格式说明原因）。\n' "$id" "$k" "$*" "$id" "$k"
   # the task is only recorded here; the text above still has to reach the worker
-  echo "$PROG: recorded $id #$k; deliver the text above with SendMessage (or: $PROG tell $id \"\$msg\")" >&2
+  _dir=$(sessions_json | jq -r --arg id "$id" '.[$id].dir // ""')
+  if [ -n "$_dir" ] && [ "$_dir" != "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" ]; then
+    echo "$PROG: $id is in another Claude config dir ($_dir); SendMessage cannot reach it, deliver with: $PROG tell $id \"\$msg\"" >&2
+  else
+    echo "$PROG: recorded $id #$k; deliver the text above with SendMessage (or: $PROG tell $id \"\$msg\")" >&2
+  fi
 }
 reply() {
   [ $# -ge 2 ] || die "usage: $PROG reply ID KEY [RESULT]"
@@ -1741,7 +1746,8 @@ sessions_json() {
   [ -n "$_panes" ] || { echo '{}'; return 0; }
   _ps=${1-$(ps -Ao pid=,ppid=)}
   claude_dirs "$_ps" "$_panes" | while IFS= read -r _dir; do
-    awk 1 "$_dir"/sessions/*.json 2>/dev/null || true
+    { awk 1 "$_dir"/sessions/*.json 2>/dev/null || true; } |
+      jq -Rc --arg dir "$_dir" 'fromjson? | select(type == "object") | .dir = $dir'
   done | jq -Rnc \
     --arg ag "$(agent_panes)" --arg panes "$_panes" --arg ps "$_ps" '
     ($ps | split("\n") | map([splits(" +")] | map(select(. != "")) | select(length == 2)
@@ -1753,7 +1759,7 @@ sessions_json() {
         | select($root != null)
         | ([$reg[] | select(any(up("\(.pid)"; 32); . == $root))] | max_by(.startedAt // 0)) as $r
         | select($r != null)
-        | {key:$id, value:{name:$r.name, status:$r.status, waiting:($r.waitingFor // ""),
+        | {key:$id, value:{name:$r.name, dir:$r.dir, status:$r.status, waiting:($r.waitingFor // ""),
                            since:((($r.statusUpdatedAt // 0) / 1000) | floor)}} ]
     | from_entries' 2>/dev/null || echo '{}'
 }
@@ -2806,6 +2812,20 @@ FT
       || die "selftest: an unconfigured registry was read"
     HOME=$t/home AWB_CLAUDE_DIRS= CLAUDE_CONFIG_DIR=$t/cfgA "$BIN" peers | grep -Eq "^z1 $zp zz-1 idle" \
       || die "selftest: CLAUDE_CONFIG_DIR was not read"
+    # send must not suggest a peer message across config-dir namespaces.
+    mkdir -p "$t/cfgB/sessions" "$t/send-board"
+    HOME=$t/home AWB_DIR=$t/send-board "$BIN" start sw worker >/dev/null
+    printf 'sw %s\n' "$zp" > "$t/send-board/panes"
+    mv "$t/cfgA/sessions/1.json" "$t/cfgB/sessions/1.json"
+    HOME=$t/home AWB_DIR=$t/send-board AWB_CLAUDE_DIRS=$t/cfgB CLAUDE_CONFIG_DIR=$t/cfgA \
+      "$BIN" send sw task >"$t/send-msg" 2>"$t/send-err"
+    grep -Fq 'SendMessage cannot reach it, deliver with: awb tell sw' "$t/send-err" \
+      || die "selftest: cross-config send did not warn"
+    HOME=$t/home AWB_DIR=$t/send-board "$BIN" reply sw "$(sed -n 's/^\[awb sw#\([^]]*\)\].*/\1/p' "$t/send-msg" | head -1)" done >/dev/null
+    mv "$t/cfgB/sessions/1.json" "$t/cfgA/sessions/1.json"
+    HOME=$t/home AWB_DIR=$t/send-board AWB_CLAUDE_DIRS= CLAUDE_CONFIG_DIR=$t/cfgA \
+      "$BIN" send sw task >/dev/null 2>"$t/send-err"
+    ! grep -Fq 'cannot reach it' "$t/send-err" || die "selftest: same-config send warned"
     # Discover a config dir from a pane process without configuring awb itself.
     # Apple platform binaries hide their env from ps -E; use a non-platform runtime.
     envrun=
