@@ -281,7 +281,11 @@ non-git directories are skipped.
   `ANTHROPIC_BASE_URL`.
 - Agents started outside awb (existing sessions) are mapped in `.awb/panes`, one
   `ID PANE` per line (an optional third column overrides the working directory used for
-  change detection); it overrides panes from start events.
+  change detection); it overrides panes from start events. A pane token `%N@default`
+  selects the default tmux server (with `TMUX` unset), and `%N@/absolute/socket/path`
+  selects that socket. Bare `%N` keeps using the board's server. Pane ids are unique only
+  within a server; `peers`, session discovery and pane commands preserve that pair even
+  when the board has its own server.
 
 ## Contributing and releases
 
