@@ -799,9 +799,14 @@ replay() {
 
 # the brief view of a snapshot on stdin (awb view --json | awb _view renders the same board)
 brief_view() {
+  _g="${ESC}[32m"; _cy="${ESC}[36m"; _y="${ESC}[33m"
+  _r="${ESC}[31m"; _dm="${ESC}[2m"; _rs="${ESC}[0m"
+  if [ "${AWB_COLOR:-}" != 1 ] && { [ ! -t 1 ] || [ "${NO_COLOR+x}" = x ]; }; then
+    _g=; _cy=; _y=; _r=; _dm=; _rs=
+  fi
   jq -r --argjson w "$1" --argjson h "$(( $2 < 12 ? 12 : $2 ))" \
-    --arg g  "${ESC}[32m"  --arg cy "${ESC}[36m" --arg y "${ESC}[33m" \
-    --arg r  "${ESC}[31m"  --arg dm "${ESC}[2m"  --arg rs "${ESC}[0m" \
+    --arg g "$_g" --arg cy "$_cy" --arg y "$_y" \
+    --arg r "$_r" --arg dm "$_dm" --arg rs "$_rs" \
     "$JQ_BRIEF"
 }
 
@@ -2423,6 +2428,12 @@ LOCKRM
     "news":[{"text":"n-old","time":"10:00:00"},{"text":"n-new","time":"11:00:00"}],
     "checks":[{"id":"a","name":"alpha","what":"selftest","startEp":1,"ok":false,"fail":true,
       "steps":[{"s":"cmd","state":"fail","el":5,"note":"exit 1"}]}],"violations":[]}'
+  plain=$(unset AWB_COLOR NO_COLOR; printf '%s' "$fx" | brief_view 80 60)
+  ! printf '%s' "$plain" | grep -q "$ESC" || die "selftest: piped brief view contains escapes"
+  nocolor=$(printf '%s' "$fx" | NO_COLOR= AWB_COLOR= brief_view 80 60)
+  ! printf '%s' "$nocolor" | grep -q "$ESC" || die "selftest: NO_COLOR brief view contains escapes"
+  forced=$(printf '%s' "$fx" | NO_COLOR=1 AWB_COLOR=1 brief_view 80 60)
+  printf '%s' "$forced" | grep -q "$ESC" || die "selftest: AWB_COLOR did not force escapes"
   got=$(printf '%s' "$fx" | brief_view 80 60 | sed 's/\x1b\[[0-9;]*m//g')
   want=$(cat <<'GOLD'
 ╭─ G ─────────────────────────────────────────────────────────────────────────
