@@ -517,7 +517,10 @@ JQ_SNAP=$JQ_FOLD$JQ_DEFS'
        anomalies:$anom, next:$next, holds:$holds,
        agents:$act, idle:$idl, tasks:$trees, tasks_old:$nold, talk:$talk, observe:$obs,
        news:$news, refs:$refs,
-       checks:[$s.checks[] | {id, name:(($s.agents[.id].name) // .id), what, startEp,
+       checks:[$raw | map(select(.t == "chk" or .t == "probe")) | group_by(.id)[]
+         | . as $events | (last.t == "probe") as $probe
+         | ($events | map(.t = "chk") | fold).checks[]
+         | {id, name:(($s.agents[.id].name) // .id), probe:$probe, what, startEp,
          ok:(all(.steps[]; .state == "ok")), fail:any(.steps[]; .state == "fail"),
          steps:[.steps[] | {s, state, el:((.ep1 // $nowep) - .ep0), note}]}],
        violations:[$vs[] | {id:.[0], name:(($s.agents[.[0]].name) // .[0]), kind:.[1]}]} | tojson
@@ -601,7 +604,7 @@ JQ_BRIEF=$JQ_DEFS'
 | (($S.checks | sort_by(-.startEp) | .[:3]) as $cks
    | (if ($cks | length) == 0 then [] else ["", $g + "验收" + $rs]
       + [ $cks[] | .steps as $ss
-          | (if .fail then ["✗",$r] elif any($ss[]; .state == "run") then ["◔",$cy] else ["⊢",$g] end) as $ov
+          | (if .probe then ["探",$cy] elif .fail then ["✗",$r] elif any($ss[]; .state == "run") then ["◔",$cy] else ["⊢",$g] end) as $ov
           | ([ $ss[] | ({"ok":"✓","fail":"✗","run":"◔"}[.state] // "·") as $i
                | .s + " " + $i + (if .state == "run" and ($ss | length) > 1 then " " + (.el | sdur) else "" end) ]
              | join(" → ")) as $chain
@@ -1810,21 +1813,24 @@ peers() {
 
 # one acceptance step for the board: step NAME run|ok|fail [NOTE]
 step() {
-  append '{t:"chk",time:$time,ep:$ep,id:$id,run:$run,what:$what,step:$s,state:$st,note:$n}' \
-    --arg id "$CHK_ID" --arg run "$CHK_RUN" --arg what "$CHK_WHAT" --arg s "$1" --arg st "$2" --arg n "${3:-}"
+  append '{t:$t,time:$time,ep:$ep,id:$id,run:$run,what:$what,step:$s,state:$st,note:$n}' \
+    --arg t "${CHK_TYPE:-chk}" --arg id "$CHK_ID" --arg run "$CHK_RUN" --arg what "$CHK_WHAT" --arg s "$1" --arg st "$2" --arg n "${3:-}"
 }
 
 # run a step: stage NAME CMD... ; its output goes to the check log
 stage() {
   _n=$1; shift; step "$_n" run
-  if "$@"; then step "$_n" ok; else step "$_n" fail "$(tail -1 "$CHK_LOG" | cut -c1-80)"; return 1; fi
+  if "$@"; then step "$_n" ok
+  else _stage_rc=$?; step "$_n" fail "$(tail -1 "$CHK_LOG" | cut -c1-80)"; return "$_stage_rc"; fi
 }
 
 # acceptance gate: the check the main agent chose decides done, not the agent's claim
 check() {
-  _u="usage: $PROG check ID [--expect REGEX] -- CMD...  (a Lean 4 gate: -- model/accept.sh DIR [ACCEPT.lean])"
+  _u="usage: $PROG check ID [--probe] [--expect REGEX] -- CMD...  (a Lean 4 gate: -- model/accept.sh DIR [ACCEPT.lean])"
+  _probe=; if [ "${1:-}" = --probe ]; then _probe=probe; shift; fi
   [ $# -ge 1 ] || die "$_u"
-  id=$1; shift; _exp=
+  id=$1; shift; _exp=; CHK_TYPE=${_probe:-chk}
+  if [ "${1:-}" = --probe ]; then CHK_TYPE=probe; shift; fi
   if [ "${1:-}" = --expect ]; then [ $# -ge 2 ] || die "$_u"; _exp=$2; shift 2; fi
   [ $# -ge 2 ] && [ "$1" = -- ] || die "$_u"
   shift; need_agent "$id"
@@ -1833,14 +1839,19 @@ check() {
   lock "gate-$id"     # one check or pr per agent at a time (model/tla/AwbCheck.tla)
   ms=$(open_ms "$id")
   CHK_ID=$id CHK_RUN=$(date +%s)$$ CHK_WHAT=$what CHK_LOG=$AWB_DIR/check-$id.log
-  export CHK_ID CHK_RUN CHK_WHAT CHK_LOG
+  export CHK_ID CHK_RUN CHK_WHAT CHK_LOG CHK_TYPE
   rc=0; "$@" >"$CHK_LOG" 2>&1 || rc=$?
+  _cmd_rc=$rc
   # exit 0 alone is weak: a pipe, tail or remote shell can drop the real status (Meshy: zsh on
   # the far side had no PIPESTATUS, and "3 failed, 4 passed" exited 0). With --expect a line
   # of the output must match too; a bad regex rejects
   if [ "$rc" = 0 ] && [ -n "$_exp" ] \
      && ! jq -Rne --arg re "$_exp" 'any(inputs; test($re))' <"$CHK_LOG" >/dev/null 2>&1; then
     rc=98; echo "expect: no output line matches $_exp" >> "$CHK_LOG"
+  fi
+  if [ "$CHK_TYPE" = probe ]; then
+    tail -40 "$CHK_LOG"; echo "probe (探): $what (exit $_cmd_rc; full log: $CHK_LOG)"
+    return "$_cmd_rc"
   fi
   # a pass verifies the milestone it started on; if the agent moved on meanwhile, it is stale
   lock send
@@ -1912,6 +1923,7 @@ One unit of work, the task. You talk to one Claude (the main agent); it keeps th
   $PROG block ID REASON / unblock ID  the worker waits on something (#N: a PR or an issue) / not any more
   $PROG check ID -- CMD...          acceptance: CMD exit 0 verifies the worker's work (⊢), else ✗
   $PROG check ID --expect RE -- CMD  also a line of the output must match RE (jq regex)
+  $PROG check ID --probe -- CMD...  nonjudging run (探), preserves state and CMD exit code
                                     (Lean 4: -- model/accept.sh DIR [ACCEPT.lean])
   $PROG pr ID [gh args...] -- CMD...  run the acceptance here, then push and open a PR on a pass
   $PROG merge PR [--watch]          merge only when the newest verdict on the current head approves
@@ -2607,6 +2619,27 @@ EOF
   ! wt check why -- false >/dev/null || die "selftest: empty reason check accepted"
   wt view --json | jq -e '.need | any(.id == "why" and (.text | endswith("exit 1")))' >/dev/null \
     || die "selftest: rejection did not fall back to exit code"
+  # Probes are display-only events: failures cannot reject or verify an agent.
+  pb=$t/probe; mkdir -p "$pb"
+  pt() { AWB_DIR=$pb "$BIN" "$@"; }
+  pt start px probe >/dev/null; pt now px milestone >/dev/null
+  ps0=$(pt _state); pf0=$(jq -s "$JQ_FOLD fold" "$pb/events.jsonl")
+  prc=0; pt check px --probe -- false >/dev/null || prc=$?
+  [ "$prc" = 1 ] || die "selftest: failed probe exit code lost"
+  prc=0; pt check --probe px -- sh -c 'exit 7' >/dev/null || prc=$?
+  [ "$prc" = 7 ] || die "selftest: non-1 probe exit code lost"
+  pt view --json | jq -e '.need | all(.id != "px")' >/dev/null || die "selftest: probe created a need"
+  pt view --json | jq -e '.checks | length == 1 and .[0].probe and .[0].fail' >/dev/null \
+    || die "selftest: latest probe missing from checks"
+  pt view --once | grep -Fq 探 || die "selftest: probe not marked on board"
+  pt check px --probe --expect '^ok$' -- sh -c 'echo ok' >/dev/null
+  pt check px --probe --expect '^missing$' -- true >"$t/probe-expect"
+  grep -Fq 'expect: no output line matches' "$t/probe-expect" || die "selftest: probe ignored --expect"
+  [ "$(pt _state)" = "$ps0" ] && [ "$(jq -s "$JQ_FOLD fold" "$pb/events.jsonl")" = "$pf0" ] \
+    || die "selftest: probe events reached the fold"
+  pt check px -- true >/dev/null
+  pt view --json | jq -e '.verified == {v:1,n:1} and (.checks | length == 1 and (.[0].probe | not))' >/dev/null \
+    || die "selftest: real check after probe did not verify or replace the probe"
   # verified vs self-reported milestones: a1 has one done, none verified yet
   "$BIN" view --json | jq -e '.verified == {v:0, n:1}' >/dev/null || die "selftest: milestone verified/self-reported count wrong"
 
